@@ -1,3 +1,7 @@
+import contextlib
+import importlib.machinery
+import importlib.util
+import io
 import json
 import os
 import stat
@@ -6,11 +10,16 @@ import tempfile
 import unittest
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from unittest import mock
 
 
 TEST_FILE = Path(__file__).resolve()
 ROOT = TEST_FILE.parent.parent if TEST_FILE.parent.name == "tests" else TEST_FILE.parents[2]
 CLI = ROOT / "bin" / "pycharm-project-trust"
+LOADER = importlib.machinery.SourceFileLoader("pycharm_project_trust", str(CLI))
+SPEC = importlib.util.spec_from_loader(LOADER.name, LOADER)
+TRUST = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(TRUST)
 
 
 class PyCharmProjectTrustTests(unittest.TestCase):
@@ -22,6 +31,8 @@ class PyCharmProjectTrustTests(unittest.TestCase):
         self.other = self.base / "other"
         self.other.mkdir()
         self.registry = self.base / "options" / "trusted-paths.xml"
+        self.registry.parent.mkdir()
+        self.registry.write_text("<application/>")
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -52,7 +63,6 @@ class PyCharmProjectTrustTests(unittest.TestCase):
 
     def test_allow_preserves_unrelated_entries_and_is_idempotent(self):
         repo = self.git_repo(self.allowed / "repo")
-        self.registry.parent.mkdir()
         fixture = b'<application><component name="Other"><option name="x" value="y"/></component><component name="Trusted.Paths"><option name="TRUSTED_PATHS"><map><entry key="/unrelated" value="true"/></map></option></component></application>'
         self.registry.write_bytes(fixture)
         self.assertEqual(0, self.run_cli("allow", repo))
@@ -67,7 +77,6 @@ class PyCharmProjectTrustTests(unittest.TestCase):
 
     def test_malformed_xml_is_not_replaced(self):
         repo = self.git_repo(self.allowed / "repo")
-        self.registry.parent.mkdir()
         original = b"<application>"
         self.registry.write_bytes(original)
         self.assertEqual(2, self.run_cli("allow", repo))
@@ -75,7 +84,6 @@ class PyCharmProjectTrustTests(unittest.TestCase):
 
     def test_audit_reports_documents_as_broad_without_removing_it(self):
         repo = self.git_repo(self.allowed / "repo")
-        self.registry.parent.mkdir()
         self.registry.write_text('<application><component name="Trusted.Paths"><option name="TRUSTED_PATHS"><map><entry key="' + str(self.allowed) + '" value="true"/></map></option></component></application>')
         original = self.registry.read_bytes()
         output = self.run_cli("audit", capture=True)
@@ -126,11 +134,75 @@ class PyCharmProjectTrustTests(unittest.TestCase):
 
     def test_multiple_writes_create_distinct_backups(self):
         first, second = self.git_repo(self.allowed / "one"), self.git_repo(self.allowed / "two")
-        self.registry.parent.mkdir()
         self.registry.write_text('<application><component name="Trusted.Paths"><option name="TRUSTED_PATHS"><map/></option></component></application>')
         self.assertEqual(0, self.run_cli("allow", first))
         self.assertEqual(0, self.run_cli("allow", second))
         self.assertEqual(2, len(list(self.registry.parent.glob("trusted-paths.xml.bak-*"))))
+
+    def test_ambiguous_default_registries_fail_closed(self):
+        live_home = self.base / "ambiguous-home"
+        for version in ("PyCharm2098.1", "PyCharm2099.1"):
+            registry = live_home / "Library/Application Support/JetBrains" / version / "options/trusted-paths.xml"
+            registry.parent.mkdir(parents=True)
+            registry.write_text("<application/>")
+        result = subprocess.run([str(CLI), "audit"], env=os.environ | {"HOME": str(live_home)})
+        self.assertEqual(2, result.returncode)
+
+    def test_missing_live_and_isolated_registries_fail_closed(self):
+        isolated = self.base / "missing" / "trusted-paths.xml"
+        repo = self.git_repo(self.allowed / "missing-state")
+        self.assertEqual(2, self.run_cli("allow", repo, env_extra={"PYCHARM_TRUST_CONFIG_FILE": str(isolated)}))
+        self.assertFalse(isolated.exists())
+
+        live_home = self.base / "missing-live-home"
+        live = live_home / "Library/Application Support/JetBrains/PyCharm2099.1/options/trusted-paths.xml"
+        result = subprocess.run(
+            [str(CLI), "audit"],
+            env=os.environ | {"HOME": str(live_home), "PYCHARM_TRUST_CONFIG_FILE": str(live)},
+        )
+        self.assertEqual(2, result.returncode)
+        self.assertFalse(live.exists())
+
+    def test_missing_audit_override_is_unavailable(self):
+        self.registry.unlink()
+        result = subprocess.run(
+            [str(CLI), "audit"],
+            env=os.environ | {"PYCHARM_TRUST_CONFIG_FILE": str(self.registry), "PYCHARM_TRUST_ALLOWED_ROOTS": str(self.allowed)},
+            text=True,
+            stdout=subprocess.PIPE,
+        )
+        self.assertEqual(2, result.returncode)
+        self.assertTrue(json.loads(result.stdout)["malformed"])
+
+    def test_registry_disappearance_before_write_fails_closed(self):
+        repo = self.git_repo(self.allowed / "vanishing")
+        original_load = TRUST.load_entries
+
+        def load_then_remove(path):
+            result = original_load(path)
+            path.unlink()
+            return result
+
+        with mock.patch.object(TRUST, "load_entries", side_effect=load_then_remove):
+            with self.assertRaises(OSError):
+                TRUST.allow(repo.resolve(), self.registry)
+        self.assertFalse(self.registry.exists())
+
+    def test_allow_preserves_unrelated_comments(self):
+        repo = self.git_repo(self.allowed / "commented")
+        self.registry.write_text('<application><!-- keep this --><component name="Other" marker="yes"/></application>')
+        self.assertEqual(0, self.run_cli("allow", repo))
+        self.assertIn("<!-- keep this -->", self.registry.read_text())
+        tree = ET.parse(self.registry)
+        self.assertEqual("yes", tree.find('.//component[@name="Other"]').get("marker"))
+
+    def test_audit_is_evaluated_once(self):
+        payload = {"exact": [], "broad": [], "outsideAllowed": [], "malformed": False}
+        environment = {"PYCHARM_TRUST_CONFIG_FILE": str(self.registry), "PYCHARM_TRUST_ALLOWED_ROOTS": str(self.allowed)}
+        with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(TRUST, "audit", return_value=payload) as audit_call:
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(0, TRUST.main(["audit"]))
+        audit_call.assert_called_once()
 
 
 if __name__ == "__main__":

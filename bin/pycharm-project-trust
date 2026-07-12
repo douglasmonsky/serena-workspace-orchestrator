@@ -40,14 +40,6 @@ def canonical_git_root(value: str, allowed: tuple[Path, ...]) -> Path:
     raise ValueError("root is outside allowed parents")
 
 
-def _empty_tree() -> ET.ElementTree:
-    root = ET.Element("application")
-    component = ET.SubElement(root, "component", {"name": "Trusted.Paths"})
-    option = ET.SubElement(component, "option", {"name": "TRUSTED_PATHS"})
-    ET.SubElement(option, "map")
-    return ET.ElementTree(root)
-
-
 def _trust_map(tree: ET.ElementTree) -> ET.Element:
     for component in tree.getroot().findall(".//component"):
         if component.get("name") == "Trusted.Paths":
@@ -63,10 +55,9 @@ def _trust_map(tree: ET.ElementTree) -> ET.Element:
 
 
 def load_entries(path: Path) -> tuple[ET.ElementTree, dict[str, bool]]:
-    """Read a registry without mutating it; a missing registry is an empty one."""
-    if not path.exists():
-        return _empty_tree(), {}
-    tree = ET.parse(path)
+    """Read an existing registry without discarding unrelated comments."""
+    parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))
+    tree = ET.parse(path, parser=parser)
     entries: dict[str, bool] = {}
     for entry in _trust_map(tree).findall("entry"):
         key = entry.get("key")
@@ -126,9 +117,9 @@ def _config() -> Path:
     if raw:
         return Path(raw).expanduser()
     candidates = sorted((Path.home() / "Library/Application Support/JetBrains").glob("PyCharm*/options/trusted-paths.xml"))
-    if not candidates:
-        raise RuntimeError("no PyCharm trusted-paths.xml registry found")
-    return candidates[-1]
+    if len(candidates) != 1:
+        raise RuntimeError("expected exactly one PyCharm trusted-paths.xml registry")
+    return candidates[0]
 
 
 def _timeout() -> float:
@@ -139,7 +130,8 @@ def _timeout() -> float:
 
 
 def allow(root: Path, config: Path) -> None:
-    config.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if not config.is_file():
+        raise FileNotFoundError(config)
     lock_path = config.with_name(config.name + ".lock")
     with lock_path.open("a+") as lock:
         deadline = time.monotonic() + _timeout()
@@ -153,6 +145,8 @@ def allow(root: Path, config: Path) -> None:
                 time.sleep(0.02)
         try:
             tree, entries = load_entries(config)
+            if not config.is_file():
+                raise FileNotFoundError(config)
             key = encode_path(root)
             if entries.get(key) is True:
                 return
@@ -162,16 +156,15 @@ def allow(root: Path, config: Path) -> None:
                 ET.SubElement(trust_map, "entry", {"key": key, "value": "true"})
             else:
                 entry.set("value", "true")
-            if config.exists():
-                backup_fd, backup_name = tempfile.mkstemp(
-                    prefix=config.name + ".bak-" + time.strftime("%Y%m%d%H%M%S") + ".",
-                    dir=config.parent,
-                )
-                with os.fdopen(backup_fd, "wb") as backup:
-                    os.fchmod(backup.fileno(), 0o600)
-                    backup.write(config.read_bytes())
-                    backup.flush()
-                    os.fsync(backup.fileno())
+            backup_fd, backup_name = tempfile.mkstemp(
+                prefix=config.name + ".bak-" + time.strftime("%Y%m%d%H%M%S") + ".",
+                dir=config.parent,
+            )
+            with os.fdopen(backup_fd, "wb") as backup:
+                os.fchmod(backup.fileno(), 0o600)
+                backup.write(config.read_bytes())
+                backup.flush()
+                os.fsync(backup.fileno())
             fd, temporary = tempfile.mkstemp(prefix=config.name + ".", dir=config.parent)
             try:
                 os.fchmod(fd, 0o600)
@@ -179,6 +172,8 @@ def allow(root: Path, config: Path) -> None:
                     tree.write(handle, encoding="utf-8", xml_declaration=True)
                     handle.flush()
                     os.fsync(handle.fileno())
+                if not config.is_file():
+                    raise FileNotFoundError(config)
                 os.replace(temporary, config)
                 os.chmod(config, 0o600)
             finally:
@@ -226,8 +221,9 @@ def main(argv: list[str]) -> int:
         config = _config()
         allowed = _allowed(config)
         if argv[0] == "audit":
-            print(json.dumps(audit(config, allowed), sort_keys=True))
-            return 2 if audit(config, allowed)["malformed"] else 0
+            result = audit(config, allowed)
+            print(json.dumps(result, sort_keys=True))
+            return 2 if result["malformed"] else 0
         root = canonical_git_root(argv[1], allowed)
         tree, entries = load_entries(config)
         if argv[0] == "status":
