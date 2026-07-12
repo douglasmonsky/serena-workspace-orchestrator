@@ -19,6 +19,7 @@ CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
 CODEX_TASK = Path(os.environ.get("CODEX_TASK", CODEX_HOME / "bin/codex-task"))
 PRUNED_DIRECTORIES = {".git", ".idea", ".serena", ".venv", "venv", "node_modules", "target", "build", "dist", "vendor", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
 STATE_VERSION = 1
+SUPPORTED_LANGUAGES = {"python", "rust", "go", "java", "kotlin", "typescript", "svelte", "vue", "angular", "csharp", "php", "ruby", "swift"}
 
 
 @dataclass(frozen=True)
@@ -112,9 +113,10 @@ def _read_state(path: Path) -> dict[str, object]:
     if not isinstance(data, dict) or set(data) != {"version", "decisions"} or data["version"] != STATE_VERSION or not isinstance(data["decisions"], dict): raise ValueError("invalid bootstrap state")
     allowed = {"language": {"enable", "ignore"}, "tracking": {"shared", "local"}, "command": {"approve", "reject"}}
     for key, item in data["decisions"].items():
-        if not isinstance(key, str) or ":" not in key or not isinstance(item, dict) or set(item) != {"decision", "evidence"}: raise ValueError("invalid bootstrap decision")
-        category = key.split(":", 1)[0]
-        if category not in allowed or item["decision"] not in allowed[category] or not isinstance(item["evidence"], str) or not item["evidence"]: raise ValueError("invalid bootstrap decision")
+        if not isinstance(key, str) or ":" not in key or not isinstance(item, dict) or set(item) != {"decision", "evidence", "digest"}: raise ValueError("invalid bootstrap decision")
+        category, subject = key.split(":", 1)
+        if category not in allowed or not isinstance(item["decision"], str) or not isinstance(item["evidence"], str) or not isinstance(item["digest"], str) or item["decision"] not in allowed[category] or not item["evidence"] or not item["digest"]: raise ValueError("invalid bootstrap decision")
+        if (category == "tracking" and subject != "serena-files") or (category == "command" and subject != "current") or (category == "language" and subject not in SUPPORTED_LANGUAGES): raise ValueError("invalid bootstrap decision")
     return data
 
 
@@ -145,10 +147,13 @@ def language_decision(root: Path, language: str) -> str | None:
 
 def _decision_subject(root: Path, category: str, subject: str) -> str:
     if category == "language":
-        if subject not in {"python", "rust", "go", "java", "kotlin", "typescript", "svelte", "vue", "angular", "csharp", "php", "ruby", "swift"}: raise ValueError("unknown language")
+        if subject not in SUPPORTED_LANGUAGES: raise ValueError("unknown language")
         return language_evidence(root, subject)
-    if category == "tracking": return "tracking"
+    if category == "tracking":
+        if subject != "serena-files": raise ValueError("tracking subject must be serena-files")
+        return "tracking"
     if category == "command":
+        if subject != "current": raise ValueError("command subject must be current")
         plans = plan_repository(root)["plans"]
         command = next((p for p in plans if p["source"] == "command"), None)
         if command is None: raise ValueError("no current custom command")
@@ -166,7 +171,7 @@ def record_decision(root: Path, category: str, subject: str, decision: str) -> d
     with lock_path.open("a+") as lock:
         os.chmod(lock_path, 0o600); fcntl.flock(lock, fcntl.LOCK_EX)
         state = _read_state(path); decisions = state["decisions"]
-        decisions[f"{category}:{subject}"] = {"decision": decision, "evidence": key}
+        decisions[f"{category}:{subject}"] = {"decision": decision, "evidence": key, "digest": key}
         _write_state(path, state)
     return {"repository": repository_identity(root), "category": category, "subject": subject, "decision": decision}
 

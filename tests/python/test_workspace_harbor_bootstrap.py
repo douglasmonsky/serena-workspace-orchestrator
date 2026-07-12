@@ -159,10 +159,10 @@ class BootstrapPlansTests(unittest.TestCase):
         state = Path(self.tmp.name) / "state"; self.write("setup.lock", "v1")
         self.write(".serena/codex-integration.yml", "bootstrap:\n  command: {argv: [tool, setup], inputs: [setup.lock]}\n")
         with patch.dict(os.environ, {"WORKSPACE_HARBOR_BOOTSTRAP_STATE_DIR": str(state)}, clear=False):
-            bootstrap.record_decision(self.root, "tracking", "current", "shared")
+            bootstrap.record_decision(self.root, "tracking", "serena-files", "shared")
             bootstrap.record_decision(self.root, "command", "current", "approve")
             decisions = bootstrap.repository_decisions(self.root)
-            self.assertEqual("shared", decisions["tracking:current"]["decision"])
+            self.assertEqual("shared", decisions["tracking:serena-files"]["decision"])
             self.assertEqual("approve", decisions["command:current"]["decision"])
             next((state / "repositories").glob("*.json")).write_text("bad")
             with self.assertRaises(ValueError): bootstrap.repository_decisions(self.root)
@@ -173,8 +173,8 @@ class BootstrapPlansTests(unittest.TestCase):
         state = Path(self.tmp.name) / "state"
         def git_common(command, **_): return type("Done", (), {"returncode": 0, "stdout": str(common) + "\n"})()
         with patch.object(bootstrap.subprocess, "run", side_effect=git_common), patch.dict(os.environ, {"WORKSPACE_HARBOR_BOOTSTRAP_STATE_DIR": str(state)}, clear=False):
-            bootstrap.record_decision(self.root, "tracking", "current", "local")
-            self.assertEqual("local", bootstrap.repository_decisions(sibling)["tracking:current"]["decision"])
+            bootstrap.record_decision(self.root, "tracking", "serena-files", "local")
+            self.assertEqual("local", bootstrap.repository_decisions(sibling)["tracking:serena-files"]["decision"])
 
     def test_language_decision_expires_when_evidence_changes_and_state_records_are_strict(self):
         state = Path(self.tmp.name) / "state"; self.write("src/main.rs", "fn main() {}")
@@ -183,7 +183,16 @@ class BootstrapPlansTests(unittest.TestCase):
             self.assertEqual("ignore", bootstrap.language_decision(self.root, "rust"))
             self.write("Cargo.toml", ""); self.write("Cargo.lock", "")
             self.assertIsNone(bootstrap.language_decision(self.root, "rust"))
-            record = next((state / "repositories").glob("*.json")); record.write_text('{"version":1,"decisions":{"language:rust":{"decision":"bad","evidence":"x"}}}')
+            record = next((state / "repositories").glob("*.json")); record.write_text('{"version":1,"decisions":{"language:rust":{"decision":[],"evidence":{},"digest":[]}}}')
+            with self.assertRaises(ValueError): bootstrap.repository_decisions(self.root)
+
+    def test_decision_subjects_are_constrained_on_write_and_read(self):
+        state = Path(self.tmp.name) / "state"
+        with patch.dict(os.environ, {"WORKSPACE_HARBOR_BOOTSTRAP_STATE_DIR": str(state)}, clear=False):
+            for category, subject, decision in (("tracking", "current", "local"), ("command", "other", "approve"), ("language", "madeup", "enable")):
+                with self.subTest(category=category), self.assertRaises(ValueError): bootstrap.record_decision(self.root, category, subject, decision)
+            path = state / "repositories" / (bootstrap.repository_identity(self.root) + ".json")
+            path.parent.mkdir(parents=True); path.write_text('{"version":1,"decisions":{"tracking:current":{"decision":"local","evidence":"x","digest":"x"}}}')
             with self.assertRaises(ValueError): bootstrap.repository_decisions(self.root)
 
     def test_command_approval_digest_covers_declared_inputs_and_markers_and_lock_is_separate(self):
