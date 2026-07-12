@@ -12,6 +12,7 @@ opener_state_dir="${INTELLIJ_OPENER_STATE_DIR:-$HOME/.codex/state/intellij-proje
 opener_lock_dir="$opener_state_dir/opener.lock"
 opener_lock_timeout="${INTELLIJ_OPENER_LOCK_TIMEOUT:-30}"
 reaper_command="${INTELLIJ_PROJECT_REAPER_COMMAND:-$HOME/.codex/bin/intellij-project-reaper}"
+model_ready_command="${INTELLIJ_MODEL_READY_COMMAND:-$reaper_command}"
 project_trust_command="${INTELLIJ_PROJECT_TRUST_COMMAND:-$HOME/.codex/bin/intellij-project-trust}"
 
 usage() {
@@ -29,6 +30,19 @@ is_open_in_intellij() {
   local dir="$1"
 
   "$HOME/.codex/bin/serena-codex" jetbrains-service-status "$dir" >/dev/null 2>&1
+}
+
+is_model_ready() {
+  local dir="$1"
+
+  [[ -x "$model_ready_command" ]] || return 1
+  "$model_ready_command" model-ready "$dir" >/dev/null 2>&1
+}
+
+is_ready_in_intellij() {
+  local dir="$1"
+
+  is_open_in_intellij "$dir" && is_model_ready "$dir"
 }
 
 ensure_project_trusted() {
@@ -94,8 +108,8 @@ wait_for_serena_service() {
   zmodload zsh/datetime
   deadline=$(( EPOCHREALTIME + ready_timeout ))
   while (( EPOCHREALTIME < deadline )); do
-    if is_open_in_intellij "$dir"; then
-      print "open-codex-project-in-intellij: Serena service ready: $dir"
+    if is_ready_in_intellij "$dir"; then
+      print "open-codex-project-in-intellij: Serena service and native project model ready: $dir"
       return 0
     fi
     sleep "$ready_interval"
@@ -184,7 +198,7 @@ if [[ "$require_github" == true ]] && ! has_github_remote "$project_dir"; then
   exit 0
 fi
 
-if is_open_in_intellij "$project_dir"; then
+if is_ready_in_intellij "$project_dir"; then
   print "open-codex-project-in-intellij: already open in IntelliJ: $project_dir"
   update_reaper_registry touch "$project_dir" || exit 1
   exit 0
@@ -192,7 +206,7 @@ fi
 
 acquire_opener_lock || exit 2
 
-if is_open_in_intellij "$project_dir"; then
+if is_ready_in_intellij "$project_dir"; then
   print "open-codex-project-in-intellij: already open in IntelliJ: $project_dir"
   update_reaper_registry touch "$project_dir" || exit 1
   exit 0

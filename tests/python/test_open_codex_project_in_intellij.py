@@ -14,6 +14,10 @@ DEFAULT_TRUST_COMMAND = Path(tempfile.gettempdir()) / "open-codex-project-in-int
 DEFAULT_TRUST_COMMAND.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
 DEFAULT_TRUST_COMMAND.chmod(0o755)
 os.environ.setdefault("INTELLIJ_PROJECT_TRUST_COMMAND", str(DEFAULT_TRUST_COMMAND))
+DEFAULT_MODEL_READY_COMMAND = Path(tempfile.gettempdir()) / "open-codex-project-in-intellij-test-model-ready"
+DEFAULT_MODEL_READY_COMMAND.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+DEFAULT_MODEL_READY_COMMAND.chmod(0o755)
+os.environ.setdefault("INTELLIJ_MODEL_READY_COMMAND", str(DEFAULT_MODEL_READY_COMMAND))
 
 
 class OpenCodexProjectInIntellijTests(unittest.TestCase):
@@ -23,6 +27,7 @@ class OpenCodexProjectInIntellijTests(unittest.TestCase):
         self.assertNotIn("command -v charm", script)
         self.assertNotIn("command -v intellij", script)
         self.assertNotIn(":-/Applications/IntelliJ IDEA.app", script)
+        self.assertIn('"$model_ready_command" model-ready "$dir"', script)
 
     def test_registers_only_after_new_open_is_ready_and_fails_actionably(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -35,6 +40,30 @@ class OpenCodexProjectInIntellijTests(unittest.TestCase):
             env = os.environ | {"HOME": str(home), "INTELLIJ_APP_PATH": str(app), "INTELLIJ_OPEN_COMMAND": str(opener), "INTELLIJ_SERENA_READY_INTERVAL": "0.01", "INTELLIJ_SERENA_READY_TIMEOUT": "1"}
             result = subprocess.run([str(HELPER), str(project)], capture_output=True, text=True, env=env, check=False)
             self.assertEqual(0, result.returncode, result.stderr); self.assertEqual(f"is-open {project.resolve()}\nregister {project.resolve()}\n", log.read_text())
+
+    def test_registration_waits_for_native_model_after_serena_is_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory); project = root / "project"; project.mkdir()
+            app = root / "IntelliJ IDEA.app"; app.mkdir(); home = root / "home"
+            bin_dir = home / ".codex/bin"; bin_dir.mkdir(parents=True)
+            count = root / "model-count"
+            (bin_dir / "serena-codex").write_text("#!/bin/sh\nexit 0\n"); (bin_dir / "serena-codex").chmod(0o755)
+            (bin_dir / "intellij-project-reaper").write_text("#!/bin/sh\nexit 0\n"); (bin_dir / "intellij-project-reaper").chmod(0o755)
+            model = root / "model-ready"
+            model.write_text(
+                "#!/bin/sh\n"
+                f"n=$(cat '{count}' 2>/dev/null || echo 0)\n"
+                "n=$((n + 1))\n"
+                f"printf '%s' \"$n\" > '{count}'\n"
+                "[ \"$n\" -ge 3 ]\n"
+            ); model.chmod(0o755)
+            opener = root / "open"; opener.write_text("#!/bin/sh\nexit 0\n"); opener.chmod(0o755)
+            env = os.environ | {"HOME": str(home), "INTELLIJ_APP_PATH": str(app),
+                "INTELLIJ_OPEN_COMMAND": str(opener), "INTELLIJ_MODEL_READY_COMMAND": str(model),
+                "INTELLIJ_SERENA_READY_INTERVAL": "0.01", "INTELLIJ_SERENA_READY_TIMEOUT": "1"}
+            result = subprocess.run([str(HELPER), str(project)], capture_output=True, text=True, env=env, check=False)
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertGreaterEqual(int(count.read_text()), 3)
 
     def test_initially_ready_root_only_touches_and_unmanaged_touch_is_allowed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -99,7 +128,7 @@ class OpenCodexProjectInIntellijTests(unittest.TestCase):
             )
 
             self.assertEqual(0, result.returncode, result.stderr)
-            self.assertIn("Serena service ready", result.stdout)
+            self.assertIn("Serena service and native project model ready", result.stdout)
             self.assertGreaterEqual(int(state_file.read_text()), 3)
             self.assertEqual(
                 ["-a", str(fake_app), str(project.resolve())],

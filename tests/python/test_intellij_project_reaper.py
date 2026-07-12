@@ -54,12 +54,44 @@ class RegistryTests(unittest.TestCase):
         second = Path(self.tmp.name) / "second"; second.mkdir()
         reaper.register_root(str(first), self.state, now="2026-01-01T00:00:00Z")
         reaper.register_root(str(second), self.state, now="2026-01-01T00:00:00Z")
+        first.rmdir()
         config = {"state": self.state, "runtime": self.state.parent / "runtime.json",
                   "broker": self.state.parent / "broker", "idle": 1800, "cap": 4}
-        with patch.object(reaper, "environment", return_value=config):
+        with patch.object(reaper, "environment", return_value=config), \
+                patch.object(reaper, "runtime_client", return_value={"token": "t"}), \
+                patch.object(reaper, "plugin_inventory", return_value={}), \
+                patch.object(reaper, "broker_live_roots", return_value=set()):
             self.assertEqual(0, reaper.main_with_environment(["unregister", str(first)]))
         projects = json.loads(self.state.read_text())["projects"]
         self.assertEqual([str(second.resolve())], [item["root"] for item in projects])
+
+    def test_unregister_fails_closed_for_live_existing_or_unknown_roots(self):
+        root = Path(self.tmp.name) / "live"; root.mkdir()
+        reaper.register_root(str(root), self.state, now="2026-01-01T00:00:00Z")
+        config = {"state": self.state, "runtime": self.state.parent / "runtime.json",
+                  "broker": self.state.parent / "broker", "idle": 1800, "cap": 4}
+        with patch.object(reaper, "environment", return_value=config), \
+                patch.object(reaper, "runtime_client", return_value={"token": "t"}), \
+                patch.object(reaper, "plugin_inventory", return_value={}), \
+                patch.object(reaper, "broker_live_roots", return_value=set()):
+            self.assertEqual(2, reaper.main_with_environment(["unregister", str(root)]))
+        self.assertEqual(1, len(json.loads(self.state.read_text())["projects"]))
+
+    def test_unregister_rejects_unknown_inventory_and_active_lease(self):
+        root = Path(self.tmp.name) / "removed"; root.mkdir()
+        reaper.register_root(str(root), self.state, now="2026-01-01T00:00:00Z")
+        root.rmdir(); canonical = str(root.resolve())
+        config = {"state": self.state, "runtime": self.state.parent / "runtime.json",
+                  "broker": self.state.parent / "broker", "idle": 1800, "cap": 4}
+        cases = [(None, set()), ({canonical: {"safe": True}}, set()), ({}, None), ({}, {canonical})]
+        for plugins, leases in cases:
+            with self.subTest(plugins=plugins, leases=leases), \
+                    patch.object(reaper, "environment", return_value=config), \
+                    patch.object(reaper, "runtime_client", return_value={"token": "t"}), \
+                    patch.object(reaper, "plugin_inventory", return_value=plugins), \
+                    patch.object(reaper, "broker_live_roots", return_value=leases):
+                self.assertEqual(2, reaper.main_with_environment(["unregister", canonical]))
+        self.assertEqual(1, len(json.loads(self.state.read_text())["projects"]))
 
     def test_python39_cleanup_quarantines_malformed_isolated_registry(self):
         self.state.write_text("not json")
@@ -211,6 +243,15 @@ class PolicyTests(unittest.TestCase):
 
 
 class ClientTests(unittest.TestCase):
+    def test_model_ready_is_authenticated_and_fail_closed(self):
+        runtime = {"token": "t"}
+        with patch.object(reaper, "http_request", return_value=(200, {"ready": True})) as request:
+            self.assertTrue(reaper.model_ready("/workspace", runtime))
+            request.assert_called_once_with("GET", "/v1/projects/model", runtime, "/workspace")
+        for response in ((202, {"ready": False}), (200, {"ready": "yes"}), (500, {})):
+            with self.subTest(response=response), patch.object(reaper, "http_request", return_value=response):
+                self.assertFalse(reaper.model_ready("/workspace", runtime))
+
     def test_is_open_uses_authenticated_status_inventory_and_fails_closed(self):
         root = reaper.canonical("/open")
         item = {"root": root, "safeToClose": True, "reasons": [], "known": {"unsavedDocuments": True, "indexing": True, "run": True, "terminal": True, "debugger": True, "modal": True, "closing": True}, "counts": {"unsavedDocuments": 0, "run": 0, "terminal": 0, "debugger": 0}, "active": {"indexing": False, "modal": False, "closing": False}}

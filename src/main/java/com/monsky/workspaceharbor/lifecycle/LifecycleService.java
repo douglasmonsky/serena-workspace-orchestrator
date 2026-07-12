@@ -86,6 +86,11 @@ public final class LifecycleService implements Disposable, LifecycleHttpServer.A
         return trusted[0];
     }
 
+    @Override public boolean modelReady(String root) {
+        Project project = findOpenProject(root);
+        return project != null && GradleModelProvisioner.isReady(project);
+    }
+
     private Project findOpenProject(String root) {
         for (Project project : ProjectManager.getInstance().getOpenProjects()) {
             SafetySnapshot status = ProjectStatusReader.readWithDeadline(project);

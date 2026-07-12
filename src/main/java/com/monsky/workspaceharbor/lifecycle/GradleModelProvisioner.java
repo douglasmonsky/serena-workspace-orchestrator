@@ -5,15 +5,19 @@ import com.intellij.openapi.externalSystem.service.execution.ProgressExecutionMo
 import com.intellij.openapi.externalSystem.importing.ImportSpecBuilder;
 import com.intellij.openapi.externalSystem.util.ExternalSystemUtil;
 import com.intellij.openapi.project.Project;
+import com.intellij.openapi.util.Key;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import org.jetbrains.plugins.gradle.settings.GradleProjectSettings;
 import org.jetbrains.plugins.gradle.settings.GradleSettings;
 import org.jetbrains.plugins.gradle.util.GradleConstants;
 
 /** Ensures native Gradle import uses IntelliJ's bundled runtime without a download prompt. */
 final class GradleModelProvisioner {
+    private static final Key<CompletableFuture<Boolean>> MODEL_READY =
+            Key.create("workspace.harbor.gradle.model.ready");
     private static final List<String> MARKERS = List.of(
             "settings.gradle", "settings.gradle.kts", "build.gradle", "build.gradle.kts");
 
@@ -24,6 +28,9 @@ final class GradleModelProvisioner {
         if (basePath == null) return;
         Path root = Path.of(basePath).toAbsolutePath().normalize();
         if (MARKERS.stream().noneMatch(marker -> Files.isRegularFile(root.resolve(marker)))) return;
+
+        CompletableFuture<Boolean> readiness = new CompletableFuture<>();
+        project.putUserData(MODEL_READY, readiness);
 
         GradleSettings settings = GradleSettings.getInstance(project);
         GradleProjectSettings linked = settings.getLinkedProjectSettings(root.toString());
@@ -38,6 +45,12 @@ final class GradleModelProvisioner {
         ExternalSystemUtil.refreshProject(
                 root.toString(),
                 new ImportSpecBuilder(project, GradleConstants.SYSTEM_ID)
-                        .use(ProgressExecutionMode.IN_BACKGROUND_ASYNC));
+                        .use(ProgressExecutionMode.IN_BACKGROUND_ASYNC)
+                        .withCallback(readiness::complete));
+    }
+
+    static boolean isReady(Project project) {
+        CompletableFuture<Boolean> readiness = project.getUserData(MODEL_READY);
+        return readiness == null || Boolean.TRUE.equals(readiness.getNow(false));
     }
 }

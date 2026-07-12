@@ -146,6 +146,12 @@ def http_request(method, path, runtime, root=None):
     if root is not None: url += "?root=" + quote(canonical(root), safe="")
     request = Request(url, method=method, headers={"Authorization": "Bearer " + runtime["token"]})
     with urlopen(request, timeout=2) as response: return response.status, json.loads(response.read() or b"{}")
+def model_ready(root, runtime):
+    try:
+        status, body = http_request("GET", "/v1/projects/model", runtime, canonical(root))
+        return status == 200 and isinstance(body, dict) and body.get("ready") is True
+    except Exception:
+        return False
 def project_roots(body):
     if not isinstance(body, dict) or not isinstance(body.get("projects"), list): raise ValueError("malformed project response")
     roots = body["projects"]
@@ -238,7 +244,7 @@ def main_with_environment(argv=None):
     config = environment()
     if config is None: return 2
     parser = argparse.ArgumentParser(); sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("register", "touch", "unregister"):
+    for name in ("register", "touch", "unregister", "model-ready"):
         p = sub.add_parser(name); p.add_argument("root")
     status = sub.add_parser("status"); status.add_argument("--json", action="store_true")
     is_open = sub.add_parser("is-open"); is_open.add_argument("root")
@@ -246,9 +252,17 @@ def main_with_environment(argv=None):
     args = parser.parse_args(argv)
     if args.command == "register": return 0 if register_root(args.root, config["state"]) else 1
     if args.command == "touch": return 0 if touch_root(args.root, config["state"]) else 1
-    if args.command == "unregister": return 0 if remove_root(args.root, config["state"]) else 1
     runtime = runtime_client(config["runtime"])
+    if args.command == "model-ready":
+        if runtime is None: return 2
+        return 0 if model_ready(args.root, runtime) else 1
     plugins = plugin_inventory(runtime)
+    if args.command == "unregister":
+        root = canonical(args.root)
+        leases = broker_live_roots(config["broker"])
+        if Path(root).exists() or plugins is None or root in plugins or leases is None or root in leases:
+            return 2
+        return 0 if remove_root(root, config["state"]) else 1
     if args.command == "is-open":
         if plugins is None: return 2
         return 0 if canonical(args.root) in plugins else 1

@@ -18,7 +18,7 @@ class IntelliJPluginTargetTests(unittest.TestCase):
         self.assertIn('environmentVariable("INTELLIJ_APP_PATH")', build)
         self.assertIn("Applications/IntelliJ IDEA.app", build)
         self.assertNotIn("/Applications/PyCharm.app", build)
-        self.assertIn('version = "0.1.5"', build)
+        self.assertIn('version = "0.1.6"', build)
 
     def test_java_sources_live_in_product_neutral_package(self):
         expected_main = ROOT / "src/main/java/com/monsky/workspaceharbor/lifecycle"
@@ -47,6 +47,7 @@ class IntelliJPluginTargetTests(unittest.TestCase):
         self.assertTrue(runtime.is_file())
         self.assertIn("ExternalSystemJdkUtil.USE_INTERNAL_JAVA", provisioner.read_text())
         self.assertIn("ExternalSystemUtil.refreshProject", provisioner.read_text())
+        self.assertIn("withCallback", provisioner.read_text())
         self.assertIn("System.getProperty(\"java.home\")", runtime.read_text())
         self.assertIn("IntelliJRuntimeProvisioner.configure(project)", startup)
         self.assertIn("GradleModelProvisioner.configure(project)", startup)
