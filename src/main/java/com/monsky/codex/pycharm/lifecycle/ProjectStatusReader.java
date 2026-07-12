@@ -5,7 +5,6 @@ import com.intellij.openapi.fileEditor.FileDocumentManager;
 import com.intellij.openapi.project.DumbService;
 import com.intellij.openapi.project.Project;
 import com.intellij.openapi.roots.ProjectFileIndex;
-import com.intellij.openapi.vfs.VirtualFile;
 import com.intellij.xdebugger.XDebuggerManager;
 import java.io.IOException;
 import java.nio.file.Path;
@@ -50,9 +49,9 @@ public final class ProjectStatusReader {
     }
 
     private static String canonicalRoot(Project project) {
-        VirtualFile baseDir = project.getBaseDir();
-        if (baseDir == null) return null;
-        try { return Path.of(baseDir.getPath()).toRealPath().toString(); } catch (IOException | RuntimeException exception) { return null; }
+        String basePath = project.getBasePath();
+        if (basePath == null) return null;
+        try { return Path.of(basePath).toRealPath().toString(); } catch (IOException | RuntimeException exception) { return null; }
     }
     static SafetySnapshot unknown(String root) { return new SafetySnapshot(root, 0, false, false, false, 0, false, 0, false, 0, false, false, false, false, false); }
 }

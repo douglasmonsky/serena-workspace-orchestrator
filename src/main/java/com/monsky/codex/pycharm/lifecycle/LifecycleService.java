@@ -50,14 +50,18 @@ public final class LifecycleService implements Disposable, LifecycleHttpServer.A
                 : SafetyDecision.evaluate(ProjectStatusReader.readWithDeadline(project));
     }
 
-    @Override public void close(String root) {
+    @Override public boolean close(String root) {
         Project project = findOpenProject(root);
-        if (project == null) return;
-        SafetyDecision decision = SafetyDecision.evaluate(ProjectStatusReader.readWithDeadline(project));
-        if (!decision.safeToClose()) return;
+        if (project == null) return false;
+        final boolean[] accepted = {false};
         ApplicationManager.getApplication().invokeAndWait(() -> {
-            if (!project.isDisposed()) ProjectManager.getInstance().closeAndDispose(project);
+            if (project.isDisposed()) return;
+            SafetyDecision decision = SafetyDecision.evaluate(ProjectStatusReader.read(project));
+            if (!decision.safeToClose()) return;
+            ProjectManager.getInstance().closeAndDispose(project);
+            accepted[0] = true;
         });
+        return accepted[0];
     }
 
     private Project findOpenProject(String root) {
@@ -88,7 +92,7 @@ public final class LifecycleService implements Disposable, LifecycleHttpServer.A
     }
     private static String newToken() { byte[] bytes = new byte[32]; new SecureRandom().nextBytes(bytes); return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes); }
     private static String pluginVersion() {
-        var descriptor = PluginManagerCore.getPlugin(PluginId.getId("com.monsky.codex.pycharm.lifecycle"));
+        var descriptor = PluginManagerCore.getPlugin(PluginId.getId("com.monsky.workspaceharbor"));
         return descriptor == null ? "unknown" : descriptor.getVersion();
     }
     @Override public synchronized void dispose() {

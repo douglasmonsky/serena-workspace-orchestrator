@@ -7,6 +7,11 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
@@ -39,6 +44,28 @@ class LifecycleHttpServerTest {
         assertEquals(404, post("/v1/projects/close?root=%2Fother").statusCode());
     }
 
+    @Test void refuses_when_final_close_safety_check_changes() throws Exception {
+        start();
+        adapter.closeAccepted = false;
+
+        assertEquals(409, post("/v1/projects/close?root=%2Fworkspace").statusCode());
+        assertEquals(1, adapter.closeCalls);
+        assertEquals(409, post("/v1/projects/close?root=%2Fworkspace").statusCode());
+    }
+
+    @Test void concurrent_same_root_close_attempts_share_one_close_and_result() throws Exception {
+        start();
+        adapter.concurrentDecisionBarrier = new CountDownLatch(2);
+        try (ExecutorService requests = Executors.newFixedThreadPool(2)) {
+            Future<HttpResponse<String>> first = requests.submit(() -> post("/v1/projects/close?root=%2Fworkspace"));
+            Future<HttpResponse<String>> second = requests.submit(() -> post("/v1/projects/close?root=%2Fworkspace"));
+
+            assertEquals(202, first.get().statusCode());
+            assertEquals(202, second.get().statusCode());
+        }
+        assertEquals(1, adapter.closeCalls);
+    }
+
     private void start() throws Exception { server = new LifecycleHttpServer(adapter, "token"); server.start(); }
     private HttpResponse<String> get(String path, String token) throws Exception {
         HttpRequest.Builder builder = HttpRequest.newBuilder(server.uri(path)).GET();
@@ -53,9 +80,18 @@ class LifecycleHttpServerTest {
     private static final class FakeAdapter implements LifecycleHttpServer.Adapter {
         boolean open = true;
         boolean safe = true;
+        boolean closeAccepted = true;
+        int closeCalls;
+        CountDownLatch concurrentDecisionBarrier;
         @Override public List<SafetySnapshot> openProjects() { return open ? List.of(snapshot()) : List.of(); }
-        @Override public SafetyDecision freshDecision(String root) { return safe ? new SafetyDecision(true, List.of()) : new SafetyDecision(false, List.of("unsaved-documents")); }
-        @Override public void close(String root) { open = false; }
+        @Override public SafetyDecision freshDecision(String root) {
+            if (concurrentDecisionBarrier != null) {
+                concurrentDecisionBarrier.countDown();
+                try { concurrentDecisionBarrier.await(1, TimeUnit.SECONDS); } catch (InterruptedException exception) { Thread.currentThread().interrupt(); throw new RuntimeException(exception); }
+            }
+            return safe ? new SafetyDecision(true, List.of()) : new SafetyDecision(false, List.of("unsaved-documents"));
+        }
+        @Override public boolean close(String root) { closeCalls++; if (closeAccepted) open = false; return closeAccepted; }
         private SafetySnapshot snapshot() { return new SafetySnapshot("/workspace", 0, true, false, true, 0, true, 0, true, 0, true, false, true, false, true); }
     }
 }
