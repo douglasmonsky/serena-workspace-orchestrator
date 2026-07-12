@@ -54,8 +54,7 @@ def load_policy(root: Path) -> dict[str, object]:
     global_config = CODEX_HOME / "serena-integration.yml"
     for path in (global_config, root / ".serena/codex-integration.yml"):
         data = _mapping(path)
-        for key, value in data.items():
-            policy[key] = {**policy.get(key, {}), **value} if isinstance(policy.get(key), dict) and isinstance(value, dict) else value
+        policy = _deep_merge(policy, data)
     bootstrap = policy.get("bootstrap", {})
     if not isinstance(bootstrap, dict): raise ValueError("bootstrap must be a mapping")
     if "task" in bootstrap and "command" in bootstrap: raise ValueError("bootstrap task and command are mutually exclusive")
@@ -75,6 +74,14 @@ def load_policy(root: Path) -> dict[str, object]:
     for value in boundaries.values():
         if not isinstance(value, list): raise ValueError("boundary values must be lists")
     return policy
+
+
+def _deep_merge(base: dict[str, object], override: dict[str, object]) -> dict[str, object]:
+    result = dict(base)
+    for key, value in override.items():
+        old = result.get(key)
+        result[key] = _deep_merge(old, value) if isinstance(old, dict) and isinstance(value, dict) else value
+    return result
 
 
 def repository_identity(root: Path) -> str:
@@ -115,6 +122,7 @@ def language_evidence(root: Path, language: str) -> str:
 
 
 def _plan(source: str, ecosystem: str, cwd: Path, argv: list[str], inputs: list[Path], markers: list[str] | None = None) -> BootstrapPlan:
+    # Stable structural identity; Task 2 hashes every declared input for execution freshness.
     digest = hashlib.sha256((source + ecosystem + str(cwd) + "\0".join(argv)).encode()).hexdigest()[:16]
     return BootstrapPlan(digest, source, ecosystem, str(cwd), tuple(argv), tuple(str(p) for p in inputs), tuple(markers or ()))
 
@@ -137,6 +145,7 @@ def _builtin(boundary: Path) -> tuple[list[BootstrapPlan], list[dict[str, str]]]
         lock = js[0]
         try: package = json.loads((boundary / "package.json").read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError): return [], [{"code": "invalid-package-json", "path": str(boundary)}]
+        if not isinstance(package, dict): return [], [{"code": "invalid-package-json", "path": str(boundary)}]
         if lock == "package-lock.json": argv, eco = ["npm", "ci"], "npm"
         elif lock == "pnpm-lock.yaml": argv, eco = ["pnpm", "install", "--frozen-lockfile"], "pnpm"
         elif lock.startswith("bun"): argv, eco = ["bun", "install", "--frozen-lockfile"], "bun"
@@ -154,6 +163,7 @@ def _builtin(boundary: Path) -> tuple[list[BootstrapPlan], list[dict[str, str]]]
 def _task_plan(root: Path, name: str) -> BootstrapPlan | None:
     try: result = subprocess.run([str(CODEX_TASK), "list", "--json"], cwd=root, capture_output=True, text=True, timeout=5, check=False)
     except (OSError, subprocess.SubprocessError): return None
+    if result.returncode != 0: return None
     try: data = json.loads(result.stdout)
     except json.JSONDecodeError: return None
     names = data if isinstance(data, list) else data.get("tasks", []) if isinstance(data, dict) else []

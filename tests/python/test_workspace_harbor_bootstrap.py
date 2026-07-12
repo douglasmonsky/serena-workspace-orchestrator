@@ -92,6 +92,31 @@ class BootstrapPlansTests(unittest.TestCase):
         self.write("examples/demo/package.json", "{}"); self.write("examples/demo/package-lock.json", "{}")
         self.write(".serena/codex-integration.yml", "bootstrap:\n  boundaries:\n    include: [examples/demo]\n    ignore: [examples/demo]\n")
         self.assertEqual("not-needed", bootstrap.plan_repository(self.root)["status"])
+
+    def test_task_discovery_requires_success_and_carries_taskfile_input(self):
+        self.write(".codex/tasks.toml", "[tasks.bootstrap]\ncommand = 'true'\n")
+        done = type("Done", (), {"returncode": 0, "stdout": '{"tasks":["bootstrap"]}'})()
+        with patch.object(bootstrap.subprocess, "run", return_value=done):
+            plan = bootstrap._task_plan(self.root, "bootstrap")
+        self.assertIsNotNone(plan); self.assertIn(str(self.root / ".codex/tasks.toml"), plan.inputs)
+        failed = type("Done", (), {"returncode": 1, "stdout": '{"tasks":["bootstrap"]}'})()
+        with patch.object(bootstrap.subprocess, "run", return_value=failed): self.assertIsNone(bootstrap._task_plan(self.root, "bootstrap"))
+
+    def test_invalid_package_json_is_a_decision_not_an_exception(self):
+        self.write("package.json", "[]"); self.write("package-lock.json", "{}")
+        result = bootstrap.plan_repository(self.root)
+        self.assertEqual("needs-decision", result["status"])
+        self.assertEqual("invalid-package-json", result["decisions"][0]["code"])
+
+    def test_policy_deep_merges_nested_global_and_project_mappings(self):
+        global_config = self.root / "global.yml"
+        global_config.write_text("bootstrap:\n  boundaries:\n    include: [frontend]\n  enabled: true\n")
+        self.write("frontend/package.json", "{}"); self.write("frontend/package-lock.json", "{}")
+        self.write(".serena/codex-integration.yml", "bootstrap:\n  boundaries:\n    ignore: [frontend]\n")
+        with patch.object(bootstrap, "CODEX_HOME", global_config.parent), patch.object(bootstrap, "_mapping", side_effect=lambda path: bootstrap.yaml.safe_load(global_config.read_text()) if path == global_config.parent / "serena-integration.yml" else bootstrap.yaml.safe_load(path.read_text()) if path.is_file() else {}):
+            policy = bootstrap.load_policy(self.root)
+        self.assertEqual(["frontend"], policy["bootstrap"]["boundaries"]["include"])
+        self.assertEqual(["frontend"], policy["bootstrap"]["boundaries"]["ignore"])
         (self.root / "outside").mkdir()
         self.write(".serena/codex-integration.yml", "bootstrap:\n  boundaries:\n    include: [missing]\n")
         self.assertEqual("needs-decision", bootstrap.plan_repository(self.root)["status"])
