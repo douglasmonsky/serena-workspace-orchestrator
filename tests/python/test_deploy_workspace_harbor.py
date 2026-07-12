@@ -35,10 +35,13 @@ class DeployWorkspaceHarborTests(unittest.TestCase):
         for name in (*EXECUTABLES, *MODULES):
             (self.bin_source / name).write_text(f"#!/usr/bin/env python3\n# {name}\n", encoding="utf-8")
         self.codex_home = self.base / "codex"
+        self.serena_python = self.base / "serena-python"
+        self.serena_python.write_text("fixture\n", encoding="utf-8")
+        self.serena_python.chmod(0o755)
         self.environment = os.environ | {
             "CODEX_HOME": str(self.codex_home),
             "WORKSPACE_HARBOR_SOURCE_ROOT": str(self.source),
-            "WORKSPACE_HARBOR_SERENA_PYTHON": str(self.base / "missing-python"),
+            "WORKSPACE_HARBOR_SERENA_PYTHON": str(self.serena_python),
         }
 
     def tearDown(self) -> None:
@@ -82,6 +85,10 @@ class DeployWorkspaceHarborTests(unittest.TestCase):
         expected_shebang = "#!/usr/bin/env python3"
         self.assertEqual(expected_shebang, (destination / "serena-project-doctor").read_text().splitlines()[0])
         self.assertEqual(expected_shebang, (destination / "workspace-harbor-bootstrap").read_text().splitlines()[0])
+        self.assertEqual(
+            f"#!{self.serena_python.resolve()}",
+            (destination / "serena-codex").read_text().splitlines()[0],
+        )
 
     def test_missing_source_fails_before_destination_mutation(self) -> None:
         destination = self.codex_home / "bin"
