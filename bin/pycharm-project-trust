@@ -3,6 +3,7 @@
 import fcntl
 import json
 import os
+import pwd
 import subprocess
 import sys
 import tempfile
@@ -14,6 +15,11 @@ DEFAULT_ALLOWED_ROOTS = (
     Path("/Users/Monsky/Documents/Codex"),
     Path("/Users/Monsky/.codex/src"),
 )
+
+
+def _account_home() -> Path:
+    """Return the authenticated OS account home, ignoring caller environment."""
+    return Path(pwd.getpwuid(os.getuid()).pw_dir)
 
 
 def canonical_git_root(value: str, allowed: tuple[Path, ...]) -> Path:
@@ -56,7 +62,7 @@ def _trust_map(tree: ET.ElementTree) -> ET.Element:
 
 def load_entries(path: Path) -> tuple[ET.ElementTree, dict[str, bool]]:
     """Read an existing registry without discarding unrelated comments."""
-    parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))
+    parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True, insert_pis=True))
     tree = ET.parse(path, parser=parser)
     entries: dict[str, bool] = {}
     for entry in _trust_map(tree).findall("entry"):
@@ -68,7 +74,7 @@ def load_entries(path: Path) -> tuple[ET.ElementTree, dict[str, bool]]:
 
 def encode_path(path: Path, home: Path | None = None) -> str:
     path = path.resolve()
-    home = (home or Path.home()).resolve()
+    home = (home or _account_home()).resolve()
     try:
         suffix = path.relative_to(home)
     except ValueError:
@@ -94,7 +100,7 @@ def _is_live_registry(config: Path) -> bool:
     """Whether config is a native PyCharm registry under this user's home."""
     try:
         relative = config.expanduser().resolve(strict=False).relative_to(
-            (Path.home() / "Library/Application Support/JetBrains").resolve(strict=False)
+            (_account_home() / "Library/Application Support/JetBrains").resolve(strict=False)
         )
     except ValueError:
         return False
@@ -116,7 +122,7 @@ def _config() -> Path:
     raw = os.environ.get("PYCHARM_TRUST_CONFIG_FILE")
     if raw:
         return Path(raw).expanduser()
-    candidates = sorted((Path.home() / "Library/Application Support/JetBrains").glob("PyCharm*/options/trusted-paths.xml"))
+    candidates = sorted((_account_home() / "Library/Application Support/JetBrains").glob("PyCharm*/options/trusted-paths.xml"))
     if len(candidates) != 1:
         raise RuntimeError("expected exactly one PyCharm trusted-paths.xml registry")
     return candidates[0]
@@ -192,7 +198,7 @@ def audit(config: Path, allowed: tuple[Path, ...]) -> dict[str, list[str] | bool
     for value, enabled in entries.items():
         if not enabled:
             continue
-        decoded = _decode_path(value, Path.home())
+        decoded = _decode_path(value, _account_home())
         if decoded is None:
             result["outsideAllowed"].append(value)  # type: ignore[index]
             continue

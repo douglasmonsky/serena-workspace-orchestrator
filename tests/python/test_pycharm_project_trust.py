@@ -4,6 +4,7 @@ import importlib.util
 import io
 import json
 import os
+import pwd
 import stat
 import subprocess
 import tempfile
@@ -103,29 +104,23 @@ class PyCharmProjectTrustTests(unittest.TestCase):
         live_home = self.base / "home"
         live_registry = live_home / "Library/Application Support/JetBrains/PyCharm2099.1/options/trusted-paths.xml"
         live_registry.parent.mkdir(parents=True)
-        original = b'<application><component name="Trusted.Paths"><option name="TRUSTED_PATHS"><map/></option></component></application>'
-        live_registry.write_bytes(original)
-        arbitrary = self.git_repo(self.other / "arbitrary")
-        result = subprocess.run(
-            [str(CLI), "allow", str(arbitrary)],
-            env=os.environ | {"HOME": str(live_home), "PYCHARM_TRUST_CONFIG_FILE": str(live_registry), "PYCHARM_TRUST_ALLOWED_ROOTS": str(self.other)},
-        )
-        self.assertNotEqual(0, result.returncode)
-        self.assertEqual(original, live_registry.read_bytes())
+        live_registry.write_text("<application/>")
+        with mock.patch.object(TRUST, "_account_home", return_value=live_home), mock.patch.dict(
+            os.environ, {"PYCHARM_TRUST_CONFIG_FILE": str(live_registry), "PYCHARM_TRUST_ALLOWED_ROOTS": str(self.other)}, clear=False
+        ):
+            self.assertTrue(TRUST._is_live_registry(live_registry))
+            self.assertEqual(TRUST.DEFAULT_ALLOWED_ROOTS, TRUST._allowed(live_registry))
 
     def test_allowed_override_cannot_target_default_registry(self):
         live_home = self.base / "default-home"
         live_registry = live_home / "Library/Application Support/JetBrains/PyCharm2099.1/options/trusted-paths.xml"
         live_registry.parent.mkdir(parents=True)
-        original = b'<application><component name="Trusted.Paths"><option name="TRUSTED_PATHS"><map/></option></component></application>'
-        live_registry.write_bytes(original)
-        arbitrary = self.git_repo(self.other / "default-arbitrary")
-        result = subprocess.run(
-            [str(CLI), "allow", str(arbitrary)],
-            env=os.environ | {"HOME": str(live_home), "PYCHARM_TRUST_ALLOWED_ROOTS": str(self.other)},
-        )
-        self.assertNotEqual(0, result.returncode)
-        self.assertEqual(original, live_registry.read_bytes())
+        live_registry.write_text("<application/>")
+        with mock.patch.object(TRUST, "_account_home", return_value=live_home), mock.patch.dict(
+            os.environ, {"PYCHARM_TRUST_ALLOWED_ROOTS": str(self.other)}, clear=False
+        ):
+            self.assertEqual(live_registry, TRUST._config())
+            self.assertEqual(TRUST.DEFAULT_ALLOWED_ROOTS, TRUST._allowed(live_registry))
 
     def test_isolated_config_can_use_allowed_override(self):
         repo = self.git_repo(self.other / "isolated")
@@ -145,8 +140,11 @@ class PyCharmProjectTrustTests(unittest.TestCase):
             registry = live_home / "Library/Application Support/JetBrains" / version / "options/trusted-paths.xml"
             registry.parent.mkdir(parents=True)
             registry.write_text("<application/>")
-        result = subprocess.run([str(CLI), "audit"], env=os.environ | {"HOME": str(live_home)})
-        self.assertEqual(2, result.returncode)
+        with mock.patch.object(TRUST, "_account_home", return_value=live_home), mock.patch.dict(
+            os.environ, {}, clear=True
+        ):
+            with self.assertRaises(RuntimeError):
+                TRUST._config()
 
     def test_missing_live_and_isolated_registries_fail_closed(self):
         isolated = self.base / "missing" / "trusted-paths.xml"
@@ -195,6 +193,19 @@ class PyCharmProjectTrustTests(unittest.TestCase):
         self.assertIn("<!-- keep this -->", self.registry.read_text())
         tree = ET.parse(self.registry)
         self.assertEqual("yes", tree.find('.//component[@name="Other"]').get("marker"))
+
+    def test_allow_preserves_processing_instructions(self):
+        repo = self.git_repo(self.allowed / "processing-instruction")
+        self.registry.write_text('<application><?keep this-value?><component name="Other"/></application>')
+        self.assertEqual(0, self.run_cli("allow", repo))
+        self.assertIn("<?keep this-value?>", self.registry.read_text())
+
+    def test_spoofed_home_cannot_make_live_registry_honor_override(self):
+        account_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        live = account_home / "Library/Application Support/JetBrains/PyCharm2099.1/options/trusted-paths.xml"
+        with mock.patch.dict(os.environ, {"HOME": str(self.base / "spoofed-home"), "PYCHARM_TRUST_ALLOWED_ROOTS": str(self.other)}):
+            self.assertTrue(TRUST._is_live_registry(live))
+            self.assertEqual(TRUST.DEFAULT_ALLOWED_ROOTS, TRUST._allowed(live))
 
     def test_audit_is_evaluated_once(self):
         payload = {"exact": [], "broad": [], "outsideAllowed": [], "malformed": False}
