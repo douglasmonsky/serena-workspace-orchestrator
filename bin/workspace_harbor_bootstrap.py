@@ -193,8 +193,17 @@ def _version(argv: list[str]) -> str:
     except (OSError, subprocess.SubprocessError): return "unavailable"
 
 
-def _tool_identity(executable: str) -> dict[str, object]:
-    path = Path(executable) if Path(executable).is_absolute() else (Path(shutil.which(executable)) if shutil.which(executable) else None)
+def _tool_identity(executable: str, cwd: Path | None = None) -> dict[str, object]:
+    cwd = cwd or Path.cwd()
+    if Path(executable).is_absolute(): path = Path(executable)
+    elif "/" in executable: path = (cwd / executable).resolve(strict=False)
+    else:
+        path = None
+        for entry in os.environ.get("PATH", "").split(os.pathsep):
+            candidate = (Path(entry) / executable) if Path(entry).is_absolute() else (cwd / entry / executable)
+            if candidate.is_file():
+                path = candidate.resolve(strict=False)
+                break
     return {"path": str(path) if path and path.is_file() else None, "version": _version([str(path)]) if path and path.is_file() else "unavailable"}
 
 
@@ -208,7 +217,7 @@ def bootstrap_fingerprint(root: Path, plans: list[dict[str, object]]) -> str:
     material: dict[str, object] = {"root": str(resolve_root(root)), "recipe_version": RECIPE_VERSION, "plans": []}
     for plan in sorted(plans, key=lambda p: p["plan_id"]):
         executable = plan["argv"][0] if plan["argv"] else "ide-managed"
-        material["plans"].append({"plan": plan, "inputs": [(value, _sha256(Path(value))) for value in plan["inputs"]], "tool": _tool_identity(executable) if executable != "ide-managed" else {"path": "native", "version": "native"}, "markers": [str(p) for p in _markers(plan)]})
+        material["plans"].append({"plan": plan, "inputs": [(value, _sha256(Path(value))) for value in plan["inputs"]], "tool": _tool_identity(executable, Path(plan["cwd"])) if executable != "ide-managed" else {"path": "native", "version": "native"}, "markers": [str(p) for p in _markers(plan)]})
     for config in (CODEX_HOME / "serena-integration.yml", resolve_root(root) / ".serena/codex-integration.yml", resolve_root(root) / ".codex/tasks.toml"):
         material.setdefault("config", []).append((str(config), _sha256(config)))
     material["runtime"] = {"python": os.sys.version, "platform": os.sys.platform}
@@ -240,7 +249,7 @@ def bootstrap_status(root: Path) -> dict[str, object]:
     fingerprint = bootstrap_fingerprint(root, plans)
     record = _read_worktree_success(root)
     markers_ready = all(marker.exists() for plan in plans for marker in _markers(plan))
-    tools_ready = all(plan["argv"] == [] or _tool_identity(plan["argv"][0])["path"] is not None for plan in plans)
+    tools_ready = all(plan["argv"] == [] or _tool_identity(plan["argv"][0], Path(plan["cwd"]))["path"] is not None for plan in plans)
     return {**planned, "status": "ready" if record and record["fingerprint"] == fingerprint and markers_ready and tools_ready else "pending", "fingerprint": fingerprint, "cache": "hit" if record and record["fingerprint"] == fingerprint and markers_ready and tools_ready else "miss"}
 
 

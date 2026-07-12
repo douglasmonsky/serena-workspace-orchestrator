@@ -226,7 +226,7 @@ class BootstrapPlansTests(unittest.TestCase):
         state = Path(self.tmp.name) / "state"; codex = Path(self.tmp.name) / "codex"; codex.mkdir()
         self.write("package.json", "{}"); self.write("package-lock.json", ""); (self.root / "node_modules").mkdir()
         identities = [{"path": "/tools/npm-a", "version": "v1"}, {"path": "/tools/npm-b", "version": "v1"}]
-        with patch.dict(os.environ, {"WORKSPACE_HARBOR_BOOTSTRAP_STATE_DIR": str(state)}, clear=False), patch.object(bootstrap, "CODEX_HOME", codex), patch.object(bootstrap, "_tool_identity", side_effect=lambda _: identities[0]):
+        with patch.dict(os.environ, {"WORKSPACE_HARBOR_BOOTSTRAP_STATE_DIR": str(state)}, clear=False), patch.object(bootstrap, "CODEX_HOME", codex), patch.object(bootstrap, "_tool_identity", side_effect=lambda *_: identities[0]):
             first = bootstrap.bootstrap_status(self.root); bootstrap.write_worktree_success(self.root, first["fingerprint"])
             self.assertEqual("ready", bootstrap.bootstrap_status(self.root)["status"])
             (codex / "serena-integration.yml").write_text("bootstrap: {}\n")
@@ -240,6 +240,14 @@ class BootstrapPlansTests(unittest.TestCase):
         with patch.dict(os.environ, {"WORKSPACE_HARBOR_BOOTSTRAP_STATE_DIR": str(state)}, clear=False), patch.object(bootstrap, "_tool_identity", return_value={"path": None, "version": "unavailable"}):
             result = bootstrap.bootstrap_status(self.root); bootstrap.write_worktree_success(self.root, result["fingerprint"])
             self.assertEqual("pending", bootstrap.bootstrap_status(self.root)["status"])
+
+    def test_tool_identity_resolves_relative_cwd_and_relative_path_entries(self):
+        frontend = self.root / "frontend"; frontend.mkdir()
+        setup = frontend / "setup"; setup.write_text("#!/bin/sh\n"); setup.chmod(0o755)
+        self.assertEqual(str(setup.resolve()), bootstrap._tool_identity("./setup", frontend)["path"])
+        tools = frontend / "tools"; tools.mkdir(); tool = tools / "runner"; tool.write_text("#!/bin/sh\n"); tool.chmod(0o755)
+        with patch.dict(os.environ, {"PATH": "tools"}, clear=False):
+            self.assertEqual(str(tool.resolve()), bootstrap._tool_identity("runner", frontend)["path"])
 
     def test_command_approval_digest_covers_declared_inputs_and_markers_and_lock_is_separate(self):
         state = Path(self.tmp.name) / "state"; self.write("setup.lock", "one")
