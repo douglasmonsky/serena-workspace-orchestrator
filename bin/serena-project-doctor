@@ -328,16 +328,31 @@ def _semantic_probe_file(root: Path) -> str | None:
         if tracked.returncode == 0:
             candidates.extend(tracked.stdout.splitlines())
     if not candidates:
-        for current_text, directory_names, file_names in os.walk(root):
-            directory_names[:] = [
-                name for name in directory_names if name not in PRUNED_DIRECTORIES
-            ]
-            candidates.extend(
-                str((Path(current_text) / name).relative_to(root))
-                for name in file_names
-            )
+        for preferred in (root / "src/main", root / "src/test", root / "src"):
+            if not preferred.is_dir():
+                continue
+            for path in sorted(preferred.rglob("*")):
+                if path.is_file() and path.suffix.lower() in EXTENSION_LANGUAGES:
+                    candidates.append(str(path.relative_to(root)))
+                    if len(candidates) >= 500:
+                        break
             if len(candidates) >= 500:
                 break
+        if len(candidates) < 500:
+            for current_text, directory_names, file_names in os.walk(root):
+                directory_names[:] = sorted(
+                    (name for name in directory_names if name not in PRUNED_DIRECTORIES),
+                    key=lambda name: (name != "src", name),
+                )
+                for name in sorted(file_names):
+                    path = Path(current_text) / name
+                    if path.suffix.lower() not in EXTENSION_LANGUAGES:
+                        continue
+                    candidates.append(str(path.relative_to(root)))
+                    if len(candidates) >= 500:
+                        break
+                if len(candidates) >= 500:
+                    break
 
     analyzable: list[tuple[tuple[int, str], str]] = []
     seen: set[str] = set()

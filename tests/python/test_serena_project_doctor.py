@@ -188,6 +188,17 @@ class SerenaProjectDoctorTests(unittest.TestCase):
 
         self.assertEqual("src/main/java/example/App.java", doctor._semantic_probe_file(self.root))
 
+    def test_non_git_probe_finds_source_before_bounded_noise(self) -> None:
+        root = Path(self.temporary_directory.name) / "non-git"
+        root.mkdir()
+        for index in range(501):
+            (root / f"noise-{index:03d}.txt").write_text("noise\n", encoding="utf-8")
+        java = root / "src/main/java/example/App.java"
+        java.parent.mkdir(parents=True)
+        java.write_text("package example; public final class App {}\n", encoding="utf-8")
+
+        self.assertEqual("src/main/java/example/App.java", doctor._semantic_probe_file(root))
+
     def test_semantic_timeout_is_classified_as_stalled(self) -> None:
         class Client:
             _timeout = 300
