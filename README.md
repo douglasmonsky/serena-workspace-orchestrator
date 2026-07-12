@@ -1,5 +1,8 @@
 # Workspace Harbor
 
+An IntelliJ lifecycle and worktree orchestrator for Serena-powered coding
+agents.
+
 Workspace Harbor keeps IntelliJ IDEA project windows, Serena services, and
 Codex tasks from colliding. It opens and trusts exact Git worktree roots,
 reuses one IntelliJ application process, assigns logical ownership per task,
