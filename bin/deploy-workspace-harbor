@@ -23,9 +23,6 @@ EXECUTABLES = (
     "workspace-harbor-bootstrap",
 )
 MODULES = ("workspace_harbor_ide.py", "workspace_harbor_bootstrap.py")
-SERENA_PYTHON_COMMANDS = {"serena-project-doctor", "workspace-harbor-bootstrap"}
-
-
 def _source_root() -> Path:
     configured = os.environ.get("WORKSPACE_HARBOR_SOURCE_ROOT")
     return Path(configured).expanduser().resolve() if configured else Path(__file__).resolve().parent.parent
@@ -33,22 +30,6 @@ def _source_root() -> Path:
 
 def _codex_home() -> Path:
     return Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser().resolve()
-
-
-def _serena_python() -> Path:
-    configured = os.environ.get("WORKSPACE_HARBOR_SERENA_PYTHON")
-    default = Path.home() / ".local/share/uv/tools/serena-agent/bin/python"
-    return Path(configured).expanduser().resolve() if configured else default.resolve()
-
-
-def _expected_bytes(source: Path, name: str, serena_python: Path) -> bytes:
-    data = source.read_bytes()
-    if name not in SERENA_PYTHON_COMMANDS:
-        return data
-    lines = data.splitlines(keepends=True)
-    newline = b"\r\n" if lines and lines[0].endswith(b"\r\n") else b"\n"
-    shebang = f"#!{serena_python}".encode("utf-8") + newline
-    return shebang + b"".join(lines[1:])
 
 
 def _sha256(data: bytes) -> str:
@@ -60,20 +41,13 @@ def _install(dry_run: bool) -> int:
     source_bin = source_root / "bin"
     codex_home = _codex_home()
     destination = codex_home / "bin"
-    serena_python = _serena_python()
     names = (*EXECUTABLES, *MODULES)
     sources = {name: source_bin / name for name in names}
     missing = [str(path) for path in sources.values() if not path.is_file()]
     if missing:
         print("deploy-workspace-harbor: missing source file(s): " + ", ".join(missing), file=os.sys.stderr)
         return 2
-    if not serena_python.is_file() or not os.access(serena_python, os.X_OK):
-        print(f"deploy-workspace-harbor: Serena Python unavailable: {serena_python}", file=os.sys.stderr)
-        return 2
-    expected = {
-        name: _expected_bytes(path, name, serena_python)
-        for name, path in sources.items()
-    }
+    expected = {name: path.read_bytes() for name, path in sources.items()}
     if dry_run:
         print(f"Workspace Harbor deployment dry run: {source_root} -> {destination}")
         for name in names:
