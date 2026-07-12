@@ -349,8 +349,8 @@ git commit -m "refactor: target Workspace Harbor at IntelliJ"
 
 **Files:**
 - Modify: `README.md`
-- Modify: global `/Users/Monsky/.codex/AGENTS.md`
-- Deploy reviewed commands to: `/Users/Monsky/.codex/bin/`
+- Modify: global `$HOME/.codex/AGENTS.md`
+- Deploy reviewed commands to: `$HOME/.codex/bin/`
 - Deploy plugin to IntelliJ through the normal plugin installation flow
 - Remove obsolete deployed PyCharm helper commands after backup
 

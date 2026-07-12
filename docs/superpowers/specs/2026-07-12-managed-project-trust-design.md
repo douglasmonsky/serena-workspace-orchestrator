@@ -16,8 +16,8 @@ An automatically trusted root must satisfy every condition below:
 
 - It is an existing directory and a Git repository or worktree root.
 - `git rev-parse --show-toplevel` resolves to the same canonical path requested.
-- Its canonical path is beneath either `/Users/Monsky/Documents/Codex` or
-  `/Users/Monsky/.codex/src`.
+- Its canonical path is beneath either `$HOME/Documents/Codex` or
+  `$HOME/.codex/src`.
 - The path does not escape an allowed parent through a symlink.
 - The trust operation targets the exact root, never an ancestor or wildcard.
 
@@ -105,7 +105,7 @@ cover:
 - audit detection of the broad Documents entry.
 
 Controlled real scenarios then open one fresh repository under
-`/Users/Monsky/Documents/Codex`, confirm no trust prompt, confirm one PyCharm
+`$HOME/Documents/Codex`, confirm no trust prompt, confirm one PyCharm
 process, and verify unrelated projects and trust entries are unchanged. The
 broad-entry migration runs only after that scenario passes.
 

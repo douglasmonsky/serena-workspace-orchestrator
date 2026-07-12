@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- Automatically trust only exact Git/worktree roots beneath `/Users/Monsky/Documents/Codex` or `/Users/Monsky/.codex/src`.
+- Automatically trust only exact Git/worktree roots beneath `$HOME/Documents/Codex` or `$HOME/.codex/src`.
 - Reject symlink escapes, nested non-root paths, missing paths, non-Git directories, arbitrary parents, and wildcard trust.
 - Never disable PyCharm project security globally.
 - Preserve malformed or unrelated trust state and fail closed.
@@ -27,7 +27,7 @@
 - Create `tests/python/test_open_codex_project_in_pycharm.py`: source-controlled opener regression suite including trust ordering.
 - Modify `README.md`: public commands, safety boundary, installation and audit behavior.
 - Modify `.gitignore`: ignore Python bytecode/test caches if not already covered.
-- Deploy reviewed copies to `/Users/Monsky/.codex/bin` and `/Users/Monsky/.codex/tests` only after repository tests pass.
+- Deploy reviewed copies to `$HOME/.codex/bin` and `$HOME/.codex/tests` only after repository tests pass.
 
 ### Task 1: Exact-root trust helper
 
@@ -168,10 +168,10 @@ git commit -m "feat: trust managed projects before opening"
 
 **Files:**
 - Modify: `README.md`
-- Deploy copy: `/Users/Monsky/.codex/bin/pycharm-project-trust`
-- Deploy copy: `/Users/Monsky/.codex/bin/open-codex-project-in-pycharm`
-- Deploy copy: `/Users/Monsky/.codex/tests/test_pycharm_project_trust.py`
-- Deploy copy: `/Users/Monsky/.codex/tests/test_open_codex_project_in_pycharm.py`
+- Deploy copy: `$HOME/.codex/bin/pycharm-project-trust`
+- Deploy copy: `$HOME/.codex/bin/open-codex-project-in-pycharm`
+- Deploy copy: `$HOME/.codex/tests/test_pycharm_project_trust.py`
+- Deploy copy: `$HOME/.codex/tests/test_open_codex_project_in_pycharm.py`
 
 **Interfaces:**
 - Documents `allow`, `status`, `audit`, approved parents, and the separate broad-trust migration gate.
