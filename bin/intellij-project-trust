@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Safely manage exact Git roots in PyCharm's trusted-paths registry."""
+"""Safely manage exact Git roots in IntelliJ's trusted-paths registry."""
 from __future__ import annotations
 
 import fcntl
 import json
 import os
-import plistlib
 import pwd
 import re
 import subprocess
@@ -14,6 +13,11 @@ import tempfile
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
+
+BIN_DIR = Path(__file__).resolve().parent
+if str(BIN_DIR) not in sys.path:
+    sys.path.insert(0, str(BIN_DIR))
+import workspace_harbor_ide as ide
 
 def _account_home() -> Path:
     """Return the authenticated OS account home, ignoring caller environment."""
@@ -100,7 +104,7 @@ def _decode_path(value: str, home: Path) -> Path | None:
 
 
 def _is_live_registry(config: Path) -> bool:
-    """Whether config is a native PyCharm registry under this user's home."""
+    """Whether config is a native IntelliJ registry under this user's home."""
     try:
         relative = config.expanduser().resolve(strict=False).relative_to(
             (_account_home() / "Library/Application Support/JetBrains").resolve(strict=False)
@@ -109,49 +113,51 @@ def _is_live_registry(config: Path) -> bool:
         return False
     return (
         len(relative.parts) == 3
-        and relative.parts[0].startswith("PyCharm")
+        and re.fullmatch(r"IntelliJIdea\d{4}\.\d+", relative.parts[0]) is not None
         and relative.parts[1:] == ("options", "trusted-paths.xml")
     )
 
 
 def _allowed(config: Path) -> tuple[Path, ...]:
-    raw = os.environ.get("PYCHARM_TRUST_ALLOWED_ROOTS", "")
+    raw = os.environ.get("INTELLIJ_TRUST_ALLOWED_ROOTS", "")
     if _is_live_registry(config) or not raw:
         return _default_allowed_roots()
     return tuple(Path(item).expanduser() for item in raw.split(os.pathsep) if item)
 
 
 def _config() -> Path:
-    raw = os.environ.get("PYCHARM_TRUST_CONFIG_FILE")
+    raw = os.environ.get("INTELLIJ_TRUST_CONFIG_FILE")
     if raw:
         return Path(raw).expanduser()
-    app = Path(os.environ.get("PYCHARM_APP_PATH", "/Applications/PyCharm.app"))
+    app = Path(
+        os.environ.get(
+            "INTELLIJ_APP_PATH",
+            str(_account_home() / "Applications/IntelliJ IDEA.app"),
+        )
+    )
     try:
-        with (app / "Contents/Info.plist").open("rb") as handle:
-            version = plistlib.load(handle).get("CFBundleShortVersionString")
-    except (OSError, plistlib.InvalidFileException) as error:
-        raise RuntimeError("cannot identify configured PyCharm application") from error
-    if not isinstance(version, str):
-        raise RuntimeError("configured PyCharm application has no version")
-    match = re.fullmatch(r"(\d{4})\.(\d+)(?:\.\d+)*", version)
+        version = ide.app_version(app)
+    except ValueError as error:
+        raise RuntimeError("cannot identify configured IntelliJ application") from error
+    match = ide.VERSION_PATTERN.fullmatch(version)
     if match is None:
-        raise RuntimeError("configured PyCharm application has an invalid version")
+        raise RuntimeError("configured IntelliJ application has an invalid version")
     registry = (
         _account_home()
         / "Library/Application Support/JetBrains"
-        / ("PyCharm" + match.group(1) + "." + match.group(2))
+        / ("IntelliJIdea" + match.group(1) + "." + match.group(2))
         / "options/trusted-paths.xml"
     )
     if not registry.is_file():
-        raise RuntimeError("configured PyCharm registry is unavailable")
+        raise RuntimeError("configured IntelliJ registry is unavailable")
     return registry
 
 
 def _timeout() -> float:
     try:
-        return float(os.environ.get("PYCHARM_TRUST_LOCK_TIMEOUT", "5"))
+        return float(os.environ.get("INTELLIJ_TRUST_LOCK_TIMEOUT", "5"))
     except ValueError as error:
-        raise RuntimeError("invalid PYCHARM_TRUST_LOCK_TIMEOUT") from error
+        raise RuntimeError("invalid INTELLIJ_TRUST_LOCK_TIMEOUT") from error
 
 
 def allow(root: Path, config: Path) -> None:

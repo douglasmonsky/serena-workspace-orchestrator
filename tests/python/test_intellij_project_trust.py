@@ -17,14 +17,14 @@ from unittest import mock
 
 TEST_FILE = Path(__file__).resolve()
 ROOT = TEST_FILE.parent.parent if TEST_FILE.parent.name == "tests" else TEST_FILE.parents[2]
-CLI = ROOT / "bin" / "pycharm-project-trust"
-LOADER = importlib.machinery.SourceFileLoader("pycharm_project_trust", str(CLI))
+CLI = ROOT / "bin" / "intellij-project-trust"
+LOADER = importlib.machinery.SourceFileLoader("intellij_project_trust", str(CLI))
 SPEC = importlib.util.spec_from_loader(LOADER.name, LOADER)
 TRUST = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(TRUST)
 
 
-class PyCharmProjectTrustTests(unittest.TestCase):
+class IntelliJProjectTrustTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.base = Path(self.tmp.name)
@@ -45,7 +45,7 @@ class PyCharmProjectTrustTests(unittest.TestCase):
         return path
 
     def run_cli(self, *args, capture=False, env_extra=None):
-        env = os.environ | {"PYCHARM_TRUST_CONFIG_FILE": str(self.registry), "PYCHARM_TRUST_ALLOWED_ROOTS": str(self.allowed)} | (env_extra or {})
+        env = os.environ | {"INTELLIJ_TRUST_CONFIG_FILE": str(self.registry), "INTELLIJ_TRUST_ALLOWED_ROOTS": str(self.allowed)} | (env_extra or {})
         result = subprocess.run([str(CLI), *map(str, args)], env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         return result.stdout.strip() if capture else result.returncode
 
@@ -95,7 +95,7 @@ class PyCharmProjectTrustTests(unittest.TestCase):
 
     def test_concurrent_allows_preserve_both_entries(self):
         first, second = self.git_repo(self.allowed / "one"), self.git_repo(self.allowed / "two")
-        env = os.environ | {"PYCHARM_TRUST_CONFIG_FILE": str(self.registry), "PYCHARM_TRUST_ALLOWED_ROOTS": str(self.allowed)}
+        env = os.environ | {"INTELLIJ_TRUST_CONFIG_FILE": str(self.registry), "INTELLIJ_TRUST_ALLOWED_ROOTS": str(self.allowed)}
         processes = [subprocess.Popen([str(CLI), "allow", str(repo)], env=env) for repo in (first, second)]
         self.assertEqual([0, 0], [process.wait() for process in processes])
         entries = {node.get("key") for node in ET.parse(self.registry).findall(".//entry")}
@@ -103,27 +103,37 @@ class PyCharmProjectTrustTests(unittest.TestCase):
 
     def test_allowed_override_cannot_target_live_registry(self):
         live_home = self.base / "home"
-        live_registry = live_home / "Library/Application Support/JetBrains/PyCharm2099.1/options/trusted-paths.xml"
+        live_registry = live_home / "Library/Application Support/JetBrains/IntelliJIdea2099.1/options/trusted-paths.xml"
         live_registry.parent.mkdir(parents=True)
         live_registry.write_text("<application/>")
         with mock.patch.object(TRUST, "_account_home", return_value=live_home), mock.patch.dict(
-            os.environ, {"PYCHARM_TRUST_CONFIG_FILE": str(live_registry), "PYCHARM_TRUST_ALLOWED_ROOTS": str(self.other)}, clear=False
+            os.environ, {"INTELLIJ_TRUST_CONFIG_FILE": str(live_registry), "INTELLIJ_TRUST_ALLOWED_ROOTS": str(self.other)}, clear=False
         ):
             self.assertTrue(TRUST._is_live_registry(live_registry))
             self.assertEqual(TRUST._default_allowed_roots(), TRUST._allowed(live_registry))
 
+    def test_live_registry_rejects_pycharm_namespace(self):
+        pycharm = (
+            self.base
+            / "home/Library/Application Support/JetBrains/PyCharm2026.1/options/trusted-paths.xml"
+        )
+        pycharm.parent.mkdir(parents=True)
+        pycharm.write_text("<application/>")
+        with mock.patch.object(TRUST, "_account_home", return_value=self.base / "home"):
+            self.assertFalse(TRUST._is_live_registry(pycharm))
+
     def test_allowed_override_cannot_target_default_registry(self):
         live_home = self.base / "default-home"
-        live_registry = live_home / "Library/Application Support/JetBrains/PyCharm2099.1/options/trusted-paths.xml"
+        live_registry = live_home / "Library/Application Support/JetBrains/IntelliJIdea2099.1/options/trusted-paths.xml"
         live_registry.parent.mkdir(parents=True)
         live_registry.write_text("<application/>")
-        app = self.base / "DefaultPyCharm.app"
+        app = self.base / "DefaultIntelliJ IDEA.app"
         info = app / "Contents/Info.plist"
         info.parent.mkdir(parents=True)
         with info.open("wb") as handle:
             plistlib.dump({"CFBundleShortVersionString": "2099.1.2"}, handle)
         with mock.patch.object(TRUST, "_account_home", return_value=live_home), mock.patch.dict(
-            os.environ, {"PYCHARM_TRUST_ALLOWED_ROOTS": str(self.other), "PYCHARM_APP_PATH": str(app)}, clear=False
+            os.environ, {"INTELLIJ_TRUST_ALLOWED_ROOTS": str(self.other), "INTELLIJ_APP_PATH": str(app)}, clear=False
         ):
             self.assertEqual(live_registry, TRUST._config())
             self.assertEqual(TRUST._default_allowed_roots(), TRUST._allowed(live_registry))
@@ -140,8 +150,8 @@ class PyCharmProjectTrustTests(unittest.TestCase):
 
     def test_isolated_config_can_use_allowed_override(self):
         repo = self.git_repo(self.other / "isolated")
-        self.assertEqual(0, self.run_cli("allow", repo, env_extra={"PYCHARM_TRUST_ALLOWED_ROOTS": str(self.other)}))
-        self.assertEqual("trusted", self.run_cli("status", repo, capture=True, env_extra={"PYCHARM_TRUST_ALLOWED_ROOTS": str(self.other)}))
+        self.assertEqual(0, self.run_cli("allow", repo, env_extra={"INTELLIJ_TRUST_ALLOWED_ROOTS": str(self.other)}))
+        self.assertEqual("trusted", self.run_cli("status", repo, capture=True, env_extra={"INTELLIJ_TRUST_ALLOWED_ROOTS": str(self.other)}))
 
     def test_multiple_writes_create_distinct_backups(self):
         first, second = self.git_repo(self.allowed / "one"), self.git_repo(self.allowed / "two")
@@ -152,7 +162,7 @@ class PyCharmProjectTrustTests(unittest.TestCase):
 
     def test_unidentifiable_app_fails_closed_with_multiple_registries(self):
         live_home = self.base / "ambiguous-home"
-        for version in ("PyCharm2098.1", "PyCharm2099.1"):
+        for version in ("IntelliJIdea2098.1", "IntelliJIdea2099.1"):
             registry = live_home / "Library/Application Support/JetBrains" / version / "options/trusted-paths.xml"
             registry.parent.mkdir(parents=True)
             registry.write_text("<application/>")
@@ -166,31 +176,31 @@ class PyCharmProjectTrustTests(unittest.TestCase):
         live_home = self.base / "versioned-home"
         registries = {}
         for version in ("2024.3", "2025.1", "2026.1"):
-            registry = live_home / "Library/Application Support/JetBrains" / ("PyCharm" + version) / "options/trusted-paths.xml"
+            registry = live_home / "Library/Application Support/JetBrains" / ("IntelliJIdea" + version) / "options/trusted-paths.xml"
             registry.parent.mkdir(parents=True)
             registry.write_text("<application/>")
             registries[version] = registry
-        app = self.base / "PyCharm.app"
+        app = self.base / "IntelliJ IDEA.app"
         info = app / "Contents/Info.plist"
         info.parent.mkdir(parents=True)
         with info.open("wb") as handle:
             plistlib.dump({"CFBundleShortVersionString": "2026.1.4"}, handle)
         with mock.patch.object(TRUST, "_account_home", return_value=live_home), mock.patch.dict(
-            os.environ, {"PYCHARM_APP_PATH": str(app)}, clear=True
+            os.environ, {"INTELLIJ_APP_PATH": str(app)}, clear=True
         ):
             self.assertEqual(registries["2026.1"], TRUST._config())
 
     def test_invalid_app_metadata_or_missing_registry_fails_closed(self):
         live_home = self.base / "invalid-app-home"
-        registry = live_home / "Library/Application Support/JetBrains/PyCharm2026.1/options/trusted-paths.xml"
+        registry = live_home / "Library/Application Support/JetBrains/IntelliJIdea2026.1/options/trusted-paths.xml"
         registry.parent.mkdir(parents=True)
         registry.write_text("<application/>")
-        app = self.base / "InvalidPyCharm.app"
+        app = self.base / "InvalidIntelliJ IDEA.app"
         info = app / "Contents/Info.plist"
         info.parent.mkdir(parents=True)
 
         with mock.patch.object(TRUST, "_account_home", return_value=live_home), mock.patch.dict(
-            os.environ, {"PYCHARM_APP_PATH": str(app)}, clear=True
+            os.environ, {"INTELLIJ_APP_PATH": str(app)}, clear=True
         ):
             with info.open("wb") as handle:
                 plistlib.dump({"CFBundleShortVersionString": "2026.1evil"}, handle)
@@ -209,14 +219,14 @@ class PyCharmProjectTrustTests(unittest.TestCase):
     def test_missing_live_and_isolated_registries_fail_closed(self):
         isolated = self.base / "missing" / "trusted-paths.xml"
         repo = self.git_repo(self.allowed / "missing-state")
-        self.assertEqual(2, self.run_cli("allow", repo, env_extra={"PYCHARM_TRUST_CONFIG_FILE": str(isolated)}))
+        self.assertEqual(2, self.run_cli("allow", repo, env_extra={"INTELLIJ_TRUST_CONFIG_FILE": str(isolated)}))
         self.assertFalse(isolated.exists())
 
         live_home = self.base / "missing-live-home"
-        live = live_home / "Library/Application Support/JetBrains/PyCharm2099.1/options/trusted-paths.xml"
+        live = live_home / "Library/Application Support/JetBrains/IntelliJIdea2099.1/options/trusted-paths.xml"
         result = subprocess.run(
             [str(CLI), "audit"],
-            env=os.environ | {"HOME": str(live_home), "PYCHARM_TRUST_CONFIG_FILE": str(live)},
+            env=os.environ | {"HOME": str(live_home), "INTELLIJ_TRUST_CONFIG_FILE": str(live)},
         )
         self.assertEqual(2, result.returncode)
         self.assertFalse(live.exists())
@@ -225,7 +235,7 @@ class PyCharmProjectTrustTests(unittest.TestCase):
         self.registry.unlink()
         result = subprocess.run(
             [str(CLI), "audit"],
-            env=os.environ | {"PYCHARM_TRUST_CONFIG_FILE": str(self.registry), "PYCHARM_TRUST_ALLOWED_ROOTS": str(self.allowed)},
+            env=os.environ | {"INTELLIJ_TRUST_CONFIG_FILE": str(self.registry), "INTELLIJ_TRUST_ALLOWED_ROOTS": str(self.allowed)},
             text=True,
             stdout=subprocess.PIPE,
         )
@@ -262,14 +272,14 @@ class PyCharmProjectTrustTests(unittest.TestCase):
 
     def test_spoofed_home_cannot_make_live_registry_honor_override(self):
         account_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
-        live = account_home / "Library/Application Support/JetBrains/PyCharm2099.1/options/trusted-paths.xml"
-        with mock.patch.dict(os.environ, {"HOME": str(self.base / "spoofed-home"), "PYCHARM_TRUST_ALLOWED_ROOTS": str(self.other)}):
+        live = account_home / "Library/Application Support/JetBrains/IntelliJIdea2099.1/options/trusted-paths.xml"
+        with mock.patch.dict(os.environ, {"HOME": str(self.base / "spoofed-home"), "INTELLIJ_TRUST_ALLOWED_ROOTS": str(self.other)}):
             self.assertTrue(TRUST._is_live_registry(live))
             self.assertEqual(TRUST._default_allowed_roots(), TRUST._allowed(live))
 
     def test_audit_is_evaluated_once(self):
         payload = {"exact": [], "broad": [], "outsideAllowed": [], "malformed": False}
-        environment = {"PYCHARM_TRUST_CONFIG_FILE": str(self.registry), "PYCHARM_TRUST_ALLOWED_ROOTS": str(self.allowed)}
+        environment = {"INTELLIJ_TRUST_CONFIG_FILE": str(self.registry), "INTELLIJ_TRUST_ALLOWED_ROOTS": str(self.allowed)}
         with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(TRUST, "audit", return_value=payload) as audit_call:
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(0, TRUST.main(["audit"]))
