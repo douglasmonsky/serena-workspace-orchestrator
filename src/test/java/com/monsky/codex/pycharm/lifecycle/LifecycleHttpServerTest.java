@@ -27,6 +27,13 @@ class LifecycleHttpServerTest {
         assertEquals(401, get("/v1/projects", "wrong").statusCode());
     }
 
+    @Test void status_returns_canonical_root_complete_safety_contract() throws Exception {
+        start();
+        HttpResponse<String> response = get("/v1/projects/status", "token");
+        assertEquals(200, response.statusCode());
+        assertEquals("{\"projects\":[{\"root\":\"/workspace\",\"safeToClose\":true,\"reasons\":[],\"known\":{\"unsavedDocuments\":true,\"indexing\":true,\"run\":true,\"terminal\":true,\"debugger\":true,\"modal\":true,\"closing\":true},\"counts\":{\"unsavedDocuments\":0,\"run\":0,\"terminal\":0,\"debugger\":0},\"active\":{\"indexing\":false,\"modal\":false,\"closing\":false}}]}", response.body());
+    }
+
     @Test void rejects_missing_root_and_reports_unsafe_reasons() throws Exception {
         start();
         assertEquals(404, post("/v1/projects/close?root=%2Fmissing").statusCode());
