@@ -31,19 +31,25 @@ public final class LifecycleHttpServer implements AutoCloseable {
         CompletableFuture<Boolean> attempt = new CompletableFuture<>();
         CompletableFuture<Boolean> existing = closingRoots.putIfAbsent(root, attempt);
         if (existing != null) { replyCloseResult(x, existing.join()); return; }
-        if (adapter.openProjects().stream().map(SafetySnapshot::canonicalRoot).noneMatch(root::equals)) {
-            attempt.complete(false); closingRoots.remove(root, attempt); reply(x, 404, "{\"error\":\"not-found\"}"); return;
+        try {
+            if (adapter.openProjects().stream().map(SafetySnapshot::canonicalRoot).noneMatch(root::equals)) {
+                attempt.complete(false); closingRoots.remove(root, attempt); reply(x, 404, "{\"error\":\"not-found\"}"); return;
+            }
+            SafetyDecision decision = adapter.freshDecision(root);
+            if (!decision.safeToClose()) {
+                attempt.complete(false); closingRoots.remove(root, attempt);
+                String reasons = decision.reasons().stream().map(v -> "\"" + json(v) + "\"").reduce((a,b) -> a + "," + b).orElse("");
+                reply(x, 409, "{\"reasons\":[" + reasons + "]}"); return;
+            }
+            boolean accepted = adapter.close(root);
+            attempt.complete(accepted);
+            if (!accepted) closingRoots.remove(root, attempt);
+            replyCloseResult(x, accepted);
+        } catch (RuntimeException exception) {
+            attempt.complete(false);
+            closingRoots.remove(root, attempt);
+            throw exception;
         }
-        SafetyDecision decision = adapter.freshDecision(root);
-        if (!decision.safeToClose()) {
-            attempt.complete(false); closingRoots.remove(root, attempt);
-            String reasons = decision.reasons().stream().map(v -> "\"" + json(v) + "\"").reduce((a,b) -> a + "," + b).orElse("");
-            reply(x, 409, "{\"reasons\":[" + reasons + "]}"); return;
-        }
-        boolean accepted = adapter.close(root);
-        attempt.complete(accepted);
-        if (!accepted) closingRoots.remove(root, attempt);
-        replyCloseResult(x, accepted);
     }
     private static void replyCloseResult(HttpExchange x, boolean accepted) throws IOException { reply(x, accepted ? 202 : 409, accepted ? "{\"status\":\"closing\"}" : "{\"error\":\"protected\"}"); }
     private static String query(String q, String key) { if (q == null) return null; for (String pair : q.split("&")) { int i = pair.indexOf('='); if (i > 0 && key.equals(URLDecoder.decode(pair.substring(0, i), StandardCharsets.UTF_8))) return URLDecoder.decode(pair.substring(i + 1), StandardCharsets.UTF_8); } return null; }

@@ -66,6 +66,19 @@ class LifecycleHttpServerTest {
         assertEquals(1, adapter.closeCalls);
     }
 
+    @Test void releases_claim_when_close_throws_so_retry_does_not_block() throws Exception {
+        start();
+        adapter.throwOnClose = true;
+
+        assertEquals(409, post("/v1/projects/close?root=%2Fworkspace").statusCode());
+        adapter.throwOnClose = false;
+        try (ExecutorService requests = Executors.newSingleThreadExecutor()) {
+            Future<HttpResponse<String>> retry = requests.submit(() -> post("/v1/projects/close?root=%2Fworkspace"));
+            assertEquals(202, retry.get(2, TimeUnit.SECONDS).statusCode());
+        }
+        assertEquals(2, adapter.closeCalls);
+    }
+
     private void start() throws Exception { server = new LifecycleHttpServer(adapter, "token"); server.start(); }
     private HttpResponse<String> get(String path, String token) throws Exception {
         HttpRequest.Builder builder = HttpRequest.newBuilder(server.uri(path)).GET();
@@ -81,6 +94,7 @@ class LifecycleHttpServerTest {
         boolean open = true;
         boolean safe = true;
         boolean closeAccepted = true;
+        boolean throwOnClose;
         int closeCalls;
         CountDownLatch concurrentDecisionBarrier;
         @Override public List<SafetySnapshot> openProjects() { return open ? List.of(snapshot()) : List.of(); }
@@ -91,7 +105,7 @@ class LifecycleHttpServerTest {
             }
             return safe ? new SafetyDecision(true, List.of()) : new SafetyDecision(false, List.of("unsaved-documents"));
         }
-        @Override public boolean close(String root) { closeCalls++; if (closeAccepted) open = false; return closeAccepted; }
+        @Override public boolean close(String root) { closeCalls++; if (throwOnClose) throw new RuntimeException("close failed"); if (closeAccepted) open = false; return closeAccepted; }
         private SafetySnapshot snapshot() { return new SafetySnapshot("/workspace", 0, true, false, true, 0, true, 0, true, 0, true, false, true, false, true); }
     }
 }
