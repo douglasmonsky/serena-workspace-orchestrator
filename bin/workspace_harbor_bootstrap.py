@@ -2,25 +2,37 @@
 """Pure, fail-closed bootstrap evidence and deterministic plan selection."""
 from __future__ import annotations
 
+import argparse
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 import hashlib
 import json
 import os
 import fcntl
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import shutil
-from typing import Any
+import time
+from typing import Any, Iterator, Sequence
 
 import yaml
 
 RECIPE_VERSION = 1
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
-CODEX_TASK = Path(os.environ.get("CODEX_TASK", CODEX_HOME / "bin/codex-task"))
+CODEX_TASK = Path(os.environ.get("WORKSPACE_HARBOR_CODEX_TASK", CODEX_HOME / "bin/codex-task"))
 PRUNED_DIRECTORIES = {".git", ".idea", ".serena", ".venv", "venv", "node_modules", "target", "build", "dist", "vendor", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
 STATE_VERSION = 1
 SUPPORTED_LANGUAGES = {"python", "rust", "go", "java", "kotlin", "typescript", "svelte", "vue", "angular", "csharp", "php", "ruby", "swift"}
+ANSI_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?im)\b([A-Za-z0-9_-]*(?:token|password|secret|api[_-]?key|authorization)[A-Za-z0-9_-]*)"
+    r"\b([ \t]*[:=][ \t]*)([^\r\n]*)"
+)
+BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
+TOKEN_SHAPE_RE = re.compile(r"(?:sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16})")
+URL_CREDENTIAL_RE = re.compile(r"(?i)(https?://)[^/@\s:]+:[^/@\s]+@")
 
 
 @dataclass(frozen=True)
@@ -99,7 +111,12 @@ def repository_identity(root: Path) -> str:
 
 
 def _state_dir() -> Path:
-    return Path(os.environ.get("WORKSPACE_HARBOR_BOOTSTRAP_STATE_DIR", CODEX_HOME / "state/workspace-harbor-bootstrap"))
+    return Path(
+        os.environ.get(
+            "WORKSPACE_HARBOR_BOOTSTRAP_STATE_DIR",
+            CODEX_HOME / "state/workspace-harbor/bootstrap",
+        )
+    )
 
 
 def _repository_path(root: Path) -> Path:
@@ -252,6 +269,245 @@ def bootstrap_status(root: Path) -> dict[str, object]:
     markers_ready = all(marker.exists() for plan in plans for marker in _markers(plan))
     tools_ready = all(plan["argv"] == [] or _tool_identity(plan["argv"][0], Path(plan["cwd"]))["path"] is not None for plan in plans)
     return {**planned, "status": "ready" if record and record["fingerprint"] == fingerprint and markers_ready and tools_ready else "pending", "fingerprint": fingerprint, "cache": "hit" if record and record["fingerprint"] == fingerprint and markers_ready and tools_ready else "miss"}
+
+
+@contextmanager
+def _worktree_lock(root: Path) -> Iterator[None]:
+    key = hashlib.sha256(str(resolve_root(root)).encode()).hexdigest()
+    state_dir = _state_dir()
+    lock_dir = state_dir / "locks"
+    lock_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+    os.chmod(state_dir, 0o700)
+    os.chmod(lock_dir, 0o700)
+    path = lock_dir / f"worktree-{key}.lock"
+    with path.open("a+", encoding="utf-8") as lock:
+        os.chmod(path, 0o600)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def _remove_worktree_success(root: Path) -> None:
+    try:
+        _worktree_path(root).unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _sanitized_tail(value: object, max_lines: int = 60, max_bytes: int = 8192) -> str:
+    if isinstance(value, bytes):
+        text = value.decode("utf-8", errors="replace")
+    elif value is None:
+        text = ""
+    else:
+        text = str(value)
+    text = ANSI_RE.sub("", text)
+    text = SECRET_ASSIGNMENT_RE.sub(lambda match: f"{match.group(1)}{match.group(2)}[REDACTED]", text)
+    text = BEARER_RE.sub("Bearer [REDACTED]", text)
+    text = TOKEN_SHAPE_RE.sub("[REDACTED]", text)
+    text = URL_CREDENTIAL_RE.sub(r"\1[REDACTED]@", text)
+    lines = text.splitlines()[-max_lines:]
+    encoded = "\n".join(lines).encode("utf-8")[-max_bytes:]
+    return encoded.decode("utf-8", errors="replace")
+
+
+def _execution_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    for name in ("BASH_ENV", "ENV", "NODE_OPTIONS", "PERL5OPT", "PYTHONINSPECT", "RUBYOPT"):
+        environment.pop(name, None)
+    environment["CI"] = "true"
+    return environment
+
+
+def _timeout_seconds() -> int:
+    raw = os.environ.get("WORKSPACE_HARBOR_BOOTSTRAP_TIMEOUT_SECONDS", "1800")
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise ValueError("bootstrap timeout must be a positive integer") from error
+    if value <= 0:
+        raise ValueError("bootstrap timeout must be a positive integer")
+    return value
+
+
+def _execute(plan: dict[str, object]) -> tuple[int, str]:
+    argv_value = plan.get("argv")
+    cwd_value = plan.get("cwd")
+    if not isinstance(argv_value, list) or not all(isinstance(item, str) for item in argv_value):
+        return 2, "invalid bootstrap argv"
+    if not argv_value:
+        return 0, ""
+    if not isinstance(cwd_value, str):
+        return 2, "invalid bootstrap working directory"
+    cwd = Path(cwd_value)
+    identity = _tool_identity(argv_value[0], cwd)
+    executable = identity.get("path")
+    if not isinstance(executable, str):
+        return 127, f"command unavailable: {Path(argv_value[0]).name}"
+    argv = [executable, *argv_value[1:]]
+    try:
+        completed = subprocess.run(
+            argv,
+            cwd=cwd,
+            env=_execution_environment(),
+            capture_output=True,
+            text=True,
+            timeout=_timeout_seconds(),
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        output = "\n".join(part for part in (_sanitized_tail(error.stdout), _sanitized_tail(error.stderr)) if part)
+        return 124, output or "bootstrap command timed out"
+    except OSError as error:
+        return 127, _sanitized_tail(error)
+    output = "\n".join(part for part in (completed.stdout, completed.stderr) if part)
+    return completed.returncode, "" if completed.returncode == 0 else _sanitized_tail(output)
+
+
+def _failure_result(
+    status: dict[str, object],
+    *,
+    kind: str,
+    started: float,
+    plan: dict[str, object] | None = None,
+    exit_code: int | None = None,
+    context: str = "",
+) -> dict[str, object]:
+    result = {
+        **status,
+        "status": "failed",
+        "cache": "miss",
+        "failure_kind": kind,
+        "elapsed_ms": round((time.monotonic() - started) * 1000),
+    }
+    if plan is not None:
+        result["failed_plan"] = plan.get("plan_id")
+    if exit_code is not None:
+        result["exit_code"] = exit_code
+    if context:
+        result["failure_context"] = _sanitized_tail(context)
+    return result
+
+
+def run_bootstrap(root: Path, force: bool = False) -> dict[str, object]:
+    root = resolve_root(root)
+    with _worktree_lock(root):
+        status = bootstrap_status(root)
+        if status["status"] in {"disabled", "not-needed", "needs-decision"}:
+            return status
+        if status["status"] == "ready" and not force:
+            return status
+        started = time.monotonic()
+        plans = status.get("plans")
+        fingerprint = status.get("fingerprint")
+        if not isinstance(plans, list) or not isinstance(fingerprint, str):
+            return _failure_result(status, kind="invalid-plan", started=started)
+        _remove_worktree_success(root)
+        executed: list[str] = []
+        for plan in sorted(plans, key=lambda item: str(item.get("plan_id"))):
+            if not isinstance(plan, dict):
+                return _failure_result(status, kind="invalid-plan", started=started)
+            if not plan.get("argv"):
+                continue
+            return_code, output = _execute(plan)
+            if return_code != 0:
+                return _failure_result(
+                    status,
+                    kind="command-failed",
+                    started=started,
+                    plan=plan,
+                    exit_code=return_code,
+                    context=output,
+                )
+            executed.append(str(plan.get("plan_id")))
+        after = plan_repository(root)
+        if after.get("status") != "ready" or bootstrap_fingerprint(root, after["plans"]) != fingerprint:
+            return _failure_result(status, kind="inputs-changed", started=started)
+        missing_markers = [str(marker) for plan in plans for marker in _markers(plan) if not marker.exists()]
+        if missing_markers:
+            return _failure_result(
+                status,
+                kind="missing-marker",
+                started=started,
+                context="missing environment marker: " + ", ".join(missing_markers),
+            )
+        write_worktree_success(root, fingerprint)
+        return {
+            **status,
+            "status": "ready",
+            "cache": "executed",
+            "executed_plans": executed,
+            "elapsed_ms": round((time.monotonic() - started) * 1000),
+        }
+
+
+def _exit_status(result: dict[str, object]) -> int:
+    status = result.get("status")
+    if status in {"ready", "pending", "not-needed", "disabled"}:
+        return 0
+    if status == "failed":
+        return 1
+    if status == "needs-decision":
+        return 3
+    return 2
+
+
+def _print_result(result: dict[str, object], as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return
+    status = result.get("status", "invalid")
+    cache = result.get("cache")
+    suffix = f" ({cache})" if isinstance(cache, str) else ""
+    print(f"Workspace Harbor bootstrap: {status}{suffix}")
+    for decision in result.get("decisions", []):
+        if isinstance(decision, dict) and isinstance(decision.get("code"), str):
+            print(f"- decision required: {decision['code']}")
+    if isinstance(result.get("failure_context"), str):
+        print(f"- {result['failure_context']}")
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Prepare and cache one Workspace Harbor worktree")
+    commands = parser.add_subparsers(dest="command", required=True)
+    status = commands.add_parser("status")
+    status.add_argument("root")
+    status.add_argument("--json", action="store_true")
+    run = commands.add_parser("run")
+    run.add_argument("root")
+    run.add_argument("--json", action="store_true")
+    run.add_argument("--force", action="store_true")
+    decide = commands.add_parser("decide")
+    decide.add_argument("root")
+    decide.add_argument("category", choices=("language", "tracking", "command"))
+    decide.add_argument("values", nargs="+")
+    decide.add_argument("--json", action="store_true")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    try:
+        root = resolve_root(args.root)
+        if args.command == "status":
+            result = bootstrap_status(root)
+        elif args.command == "run":
+            result = run_bootstrap(root, force=args.force)
+        else:
+            values = list(args.values)
+            if args.category == "language" and len(values) == 2:
+                subject, decision = values
+            elif args.category == "tracking" and len(values) == 1:
+                subject, decision = "serena-files", values[0]
+            elif args.category == "command" and len(values) == 1:
+                subject, decision = "current", values[0]
+            else:
+                raise ValueError("invalid decision arguments")
+            result = record_decision(root, args.category, subject, decision)
+            result = {"status": "ready", **result}
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        result = {"status": "invalid", "error": _sanitized_tail(error)}
+    _print_result(result, args.json)
+    return _exit_status(result)
 
 
 def _contains_source(root: Path, suffixes: set[str]) -> bool:

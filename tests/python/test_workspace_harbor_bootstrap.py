@@ -1,6 +1,10 @@
 import importlib.machinery
 import importlib.util
+from contextlib import redirect_stdout
+import io
+import json
 import os
+import subprocess
 import tempfile
 import unittest
 import sys
@@ -29,6 +33,11 @@ class BootstrapPlansTests(unittest.TestCase):
         target = self.root / name
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text)
+
+    def make_go_fixture(self):
+        self.write("go.mod", "module fixture\n")
+        self.write("go.sum", "checksum\n")
+        self.write("main.go", "package fixture\n")
 
     def test_root_npm_and_uv_locks_select_two_deterministic_plans(self):
         self.write("package.json", '{"name":"fixture"}\n'); self.write("package-lock.json", "{}\n")
@@ -274,6 +283,117 @@ class BootstrapPlansTests(unittest.TestCase):
         (self.root / "outside").mkdir()
         self.write(".serena/codex-integration.yml", "bootstrap:\n  boundaries:\n    include: [missing]\n")
         self.assertEqual("needs-decision", bootstrap.plan_repository(self.root)["status"])
+
+    def test_run_executes_once_then_uses_cache_and_lock_change_reruns(self):
+        self.make_go_fixture()
+        state = Path(self.tmp.name) / "state"
+        calls = []
+        identity = {"path": "/tools/go", "version": "go1"}
+        with patch.dict(os.environ, {"WORKSPACE_HARBOR_BOOTSTRAP_STATE_DIR": str(state)}, clear=False), \
+             patch.object(bootstrap, "_tool_identity", return_value=identity), \
+             patch.object(bootstrap, "_execute", side_effect=lambda plan: calls.append(plan["plan_id"]) or (0, "")):
+            first = bootstrap.run_bootstrap(self.root)
+            second = bootstrap.run_bootstrap(self.root)
+            self.write("go.sum", "changed\n")
+            third = bootstrap.run_bootstrap(self.root)
+        self.assertEqual(("ready", "executed"), (first["status"], first["cache"]))
+        self.assertEqual(("ready", "hit"), (second["status"], second["cache"]))
+        self.assertEqual(("ready", "executed"), (third["status"], third["cache"]))
+        self.assertEqual(2, len(calls))
+
+    def test_force_reruns_and_failure_removes_success_record_with_redaction(self):
+        self.make_go_fixture()
+        state = Path(self.tmp.name) / "state"
+        identity = {"path": "/tools/go", "version": "go1"}
+        with patch.dict(os.environ, {"WORKSPACE_HARBOR_BOOTSTRAP_STATE_DIR": str(state)}, clear=False), \
+             patch.object(bootstrap, "_tool_identity", return_value=identity), \
+             patch.object(bootstrap, "_execute", return_value=(0, "")) as execute:
+            bootstrap.run_bootstrap(self.root)
+            forced = bootstrap.run_bootstrap(self.root, force=True)
+            self.assertEqual("executed", forced["cache"])
+            self.assertEqual(2, execute.call_count)
+        with patch.dict(os.environ, {"WORKSPACE_HARBOR_BOOTSTRAP_STATE_DIR": str(state)}, clear=False), \
+             patch.object(bootstrap, "_tool_identity", return_value=identity), \
+             patch.object(bootstrap, "_execute", return_value=(9, "api_key=supersecret\nAuthorization: Bearer abc.def")):
+            failed = bootstrap.run_bootstrap(self.root, force=True)
+        self.assertEqual("failed", failed["status"])
+        self.assertNotIn("supersecret", json.dumps(failed))
+        self.assertNotIn("abc.def", json.dumps(failed))
+        self.assertFalse(bootstrap._worktree_path(self.root).exists())
+
+    def test_input_mutation_and_missing_marker_never_write_success(self):
+        self.make_go_fixture()
+        state = Path(self.tmp.name) / "state"
+        identity = {"path": "/tools/go", "version": "go1"}
+
+        def mutate(_plan):
+            self.write("go.sum", "mutated\n")
+            return 0, ""
+
+        with patch.dict(os.environ, {"WORKSPACE_HARBOR_BOOTSTRAP_STATE_DIR": str(state)}, clear=False), \
+             patch.object(bootstrap, "_tool_identity", return_value=identity), \
+             patch.object(bootstrap, "_execute", side_effect=mutate):
+            changed = bootstrap.run_bootstrap(self.root)
+        self.assertEqual("inputs-changed", changed["failure_kind"])
+        self.assertFalse(bootstrap._worktree_path(self.root).exists())
+
+        other = Path(self.tmp.name) / "npm"; other.mkdir(); self.root = other
+        self.write("package.json", "{}\n"); self.write("package-lock.json", "{}\n")
+        with patch.dict(os.environ, {"WORKSPACE_HARBOR_BOOTSTRAP_STATE_DIR": str(state)}, clear=False), \
+             patch.object(bootstrap, "_tool_identity", return_value={"path": "/tools/npm", "version": "10"}), \
+             patch.object(bootstrap, "_execute", return_value=(0, "")):
+            missing = bootstrap.run_bootstrap(self.root)
+        self.assertEqual("missing-marker", missing["failure_kind"])
+        self.assertFalse(bootstrap._worktree_path(self.root).exists())
+
+    def test_cli_exit_codes_json_and_tracking_decision(self):
+        state = Path(self.tmp.name) / "state"
+        with patch.dict(os.environ, {"WORKSPACE_HARBOR_BOOTSTRAP_STATE_DIR": str(state)}, clear=False):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                status = bootstrap.main(["decide", str(self.root), "tracking", "local", "--json"])
+            self.assertEqual(0, status)
+            self.assertEqual("local", json.loads(output.getvalue())["decision"])
+
+            self.write("package.json", "{}\n"); self.write("package-lock.json", "{}\n"); self.write("pnpm-lock.yaml", "lockfileVersion: 9\n")
+            output = io.StringIO()
+            with redirect_stdout(output):
+                status = bootstrap.main(["status", str(self.root), "--json"])
+            self.assertEqual(3, status)
+            self.assertEqual("needs-decision", json.loads(output.getvalue())["status"])
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                status = bootstrap.main(["status", str(self.root / "missing"), "--json"])
+            self.assertEqual(2, status)
+            self.assertEqual("invalid", json.loads(output.getvalue())["status"])
+
+    def test_concurrent_cli_runs_execute_installer_once(self):
+        self.make_go_fixture()
+        home = Path(self.tmp.name) / "codex"; (home / "bin").mkdir(parents=True)
+        state = Path(self.tmp.name) / "state"; tools = Path(self.tmp.name) / "tools"; tools.mkdir()
+        log = Path(self.tmp.name) / "runs.log"
+        fake_go = tools / "go"
+        fake_go.write_text(
+            "#!/bin/sh\n"
+            "if [ \"$1\" = --version ]; then echo go1; exit 0; fi\n"
+            f"printf 'run\\n' >> '{log}'\n"
+            "sleep 0.3\n",
+            encoding="utf-8",
+        )
+        fake_go.chmod(0o755)
+        wrapper = ROOT / "bin/workspace-harbor-bootstrap"
+        environment = os.environ | {
+            "CODEX_HOME": str(home),
+            "WORKSPACE_HARBOR_BOOTSTRAP_STATE_DIR": str(state),
+            "PATH": str(tools) + os.pathsep + os.environ.get("PATH", ""),
+        }
+        commands = [[sys.executable, str(wrapper), "run", str(self.root), "--json"] for _ in range(2)]
+        processes = [subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=environment) for command in commands]
+        results = [process.communicate(timeout=10) + (process.returncode,) for process in processes]
+        self.assertEqual([0, 0], [result[2] for result in results], results)
+        self.assertEqual(1, len(log.read_text(encoding="utf-8").splitlines()))
+        self.assertEqual(["ready", "ready"], [json.loads(result[0])["status"] for result in results])
 
 
 if __name__ == "__main__": unittest.main()

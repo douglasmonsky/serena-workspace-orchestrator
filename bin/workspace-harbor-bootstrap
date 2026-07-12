@@ -1,0 +1,8 @@
+#!/usr/bin/env python3
+"""Workspace Harbor dependency bootstrap command."""
+
+from workspace_harbor_bootstrap import main
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
