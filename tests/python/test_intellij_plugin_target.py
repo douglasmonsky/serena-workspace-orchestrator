@@ -18,7 +18,7 @@ class IntelliJPluginTargetTests(unittest.TestCase):
         self.assertIn('environmentVariable("INTELLIJ_APP_PATH")', build)
         self.assertIn("Applications/IntelliJ IDEA.app", build)
         self.assertNotIn("/Applications/PyCharm.app", build)
-        self.assertIn('version = "0.1.2"', build)
+        self.assertIn('version = "0.1.3"', build)
 
     def test_java_sources_live_in_product_neutral_package(self):
         expected_main = ROOT / "src/main/java/com/monsky/workspaceharbor/lifecycle"
@@ -32,6 +32,17 @@ class IntelliJPluginTargetTests(unittest.TestCase):
         service = (ROOT / "src/main/java/com/monsky/workspaceharbor/lifecycle/LifecycleService.java").read_text()
         self.assertIn('"intellij-projects"', service)
         self.assertNotIn('"pycharm-projects"', service)
+
+    def test_gradle_projects_use_intellij_bundled_runtime_before_import(self):
+        build = (ROOT / "build.gradle.kts").read_text()
+        plugin_xml = (ROOT / "src/main/resources/META-INF/plugin.xml").read_text()
+        provisioner = ROOT / "src/main/java/com/monsky/workspaceharbor/lifecycle/GradleModelProvisioner.java"
+        startup = (ROOT / "src/main/java/com/monsky/workspaceharbor/lifecycle/LifecycleStartupActivity.java").read_text()
+        self.assertIn('bundledPlugin("com.intellij.gradle")', build)
+        self.assertIn("<depends>com.intellij.gradle</depends>", plugin_xml)
+        self.assertTrue(provisioner.is_file())
+        self.assertIn("ExternalSystemJdkUtil.USE_INTERNAL_JAVA", provisioner.read_text())
+        self.assertIn("GradleModelProvisioner.configure(project)", startup)
 
 
 if __name__ == "__main__":

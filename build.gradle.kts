@@ -5,7 +5,7 @@ plugins {
     id("org.jetbrains.intellij.platform") version "2.18.1"
 }
 
-version = "0.1.2"
+version = "0.1.3"
 
 val intellijAppPath = providers.environmentVariable("INTELLIJ_APP_PATH")
     .orElse("${System.getProperty("user.home")}/Applications/IntelliJ IDEA.app")
@@ -31,6 +31,7 @@ dependencies {
     intellijPlatform {
         local(intellijAppPath)
         bundledPlugin("org.jetbrains.plugins.terminal")
+        bundledPlugin("com.intellij.gradle")
     }
     testImplementation("org.junit.jupiter:junit-jupiter:5.13.4")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher:1.13.4")
