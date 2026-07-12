@@ -4,6 +4,12 @@ Safely manages idle IDE project windows using fail-closed lifecycle checks.
 
 Run tests with `JAVA_HOME=/Applications/PyCharm.app/Contents/jbr/Contents/Home ./gradlew test`.
 
+## Serena helper inventory
+
+- `bin/serena-codex` provides project discovery and JetBrains health checks.
+- `bin/serena-project-doctor` audits and repairs repository Serena configuration.
+- `bin/serena-worktree-broker` manages broker-owned Serena services per worktree.
+
 ## Idle-project reaper
 
 `bin/pycharm-project-reaper` owns the local managed-project registry and only

@@ -1,0 +1,713 @@
+#!/usr/bin/env python3
+"""Audit a repository's Serena configuration without modifying the repository."""
+
+from __future__ import annotations
+
+import argparse
+from collections import Counter
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from datetime import datetime, timezone
+import fcntl
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from typing import Any, Iterator, Sequence
+
+import yaml
+
+
+CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+SERENA = Path.home() / ".local" / "share" / "uv" / "tools" / "serena-agent" / "bin" / "serena"
+SERENA_CODEX = CODEX_HOME / "bin" / "serena-codex"
+BROKER = CODEX_HOME / "bin" / "serena-worktree-broker"
+INTEGRATION_CONFIG = CODEX_HOME / "serena-integration.yml"
+REPAIR_LOCK_DIR = CODEX_HOME / "state" / "serena-project-doctor"
+HISTORY_PATH = REPAIR_LOCK_DIR / "history.jsonl"
+MAX_FILES = 50_000
+PRUNED_DIRECTORIES = {
+    ".git",
+    ".idea",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".serena",
+    ".tox",
+    ".venv",
+    "__pycache__",
+    "build",
+    "coverage",
+    "dist",
+    "htmlcov",
+    "node_modules",
+    "target",
+    "vendor",
+    "venv",
+}
+EXTENSION_LANGUAGES = {
+    ".c": "cpp",
+    ".cc": "cpp",
+    ".cpp": "cpp",
+    ".cs": "csharp",
+    ".go": "go",
+    ".h": "cpp",
+    ".hpp": "cpp",
+    ".java": "java",
+    ".js": "typescript",
+    ".jsx": "typescript",
+    ".kt": "kotlin",
+    ".kts": "kotlin",
+    ".php": "php",
+    ".py": "python",
+    ".pyi": "python",
+    ".rb": "ruby",
+    ".rs": "rust",
+    ".svelte": "svelte",
+    ".swift": "swift",
+    ".ts": "typescript",
+    ".tsx": "typescript",
+    ".vue": "vue",
+}
+
+
+def _run(command: Sequence[str], cwd: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        list(command),
+        cwd=cwd,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+def _resolve_root(value: str | None) -> Path:
+    candidate = Path(value).expanduser() if value else Path.cwd()
+    candidate = candidate.resolve()
+    if not candidate.is_dir():
+        raise RuntimeError(f"not a directory: {candidate}")
+    result = _run(("git", "rev-parse", "--show-toplevel"), candidate)
+    if result.returncode == 0 and result.stdout.strip():
+        return Path(result.stdout.strip()).resolve()
+    return candidate
+
+
+def _detect_languages(root: Path) -> tuple[list[str], dict[str, int], bool]:
+    counts: Counter[str] = Counter()
+    visited = 0
+    truncated = False
+    for current_text, directory_names, file_names in os.walk(root, followlinks=False):
+        directory_names[:] = sorted(
+            name
+            for name in directory_names
+            if name not in PRUNED_DIRECTORIES and not (Path(current_text) / name).is_symlink()
+        )
+        for file_name in file_names:
+            visited += 1
+            if visited > MAX_FILES:
+                truncated = True
+                break
+            language = EXTENSION_LANGUAGES.get(Path(file_name).suffix.lower())
+            if language:
+                counts[language] += 1
+        if truncated:
+            break
+
+    if (root / "angular.json").is_file():
+        counts["angular"] = max(counts.get("typescript", 0), 1)
+        counts.pop("typescript", None)
+    detected = [language for language, _ in counts.most_common()]
+    return detected, dict(counts), truncated
+
+
+def _load_project_config(root: Path) -> tuple[Path, dict[str, Any] | None, str | None]:
+    path = root / ".serena" / "project.yml"
+    if not path.is_file():
+        return path, None, None
+    try:
+        loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as error:
+        return path, None, str(error)
+    if not isinstance(loaded, dict):
+        return path, None, "project.yml does not contain a mapping"
+    return path, loaded, None
+
+
+def _read_yaml_mapping(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    try:
+        loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as error:
+        raise RuntimeError(f"invalid integration config {path}: {error}") from error
+    if loaded is None:
+        return {}
+    if not isinstance(loaded, dict):
+        raise RuntimeError(f"integration config must contain a mapping: {path}")
+    return loaded
+
+
+def _auto_repair_setting(root: Path) -> tuple[bool, str]:
+    enabled = True
+    source = "default"
+    global_config = _read_yaml_mapping(INTEGRATION_CONFIG)
+    if "auto_repair_languages" in global_config:
+        value = global_config["auto_repair_languages"]
+        if not isinstance(value, bool):
+            raise RuntimeError(
+                f"auto_repair_languages must be true or false in {INTEGRATION_CONFIG}"
+            )
+        enabled = value
+        source = str(INTEGRATION_CONFIG)
+    project_config_path = root / ".serena" / "codex-integration.yml"
+    project_config = _read_yaml_mapping(project_config_path)
+    if "auto_repair_languages" in project_config:
+        value = project_config["auto_repair_languages"]
+        if not isinstance(value, bool):
+            raise RuntimeError(
+                f"auto_repair_languages must be true or false in {project_config_path}"
+            )
+        enabled = value
+        source = str(project_config_path)
+    return enabled, source
+
+
+@contextmanager
+def _repair_lock(root: Path) -> Iterator[None]:
+    REPAIR_LOCK_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(REPAIR_LOCK_DIR, 0o700)
+    key = hashlib.sha256(str(root.resolve()).encode("utf-8")).hexdigest()[:20]
+    lock_path = REPAIR_LOCK_DIR / f"{key}.lock"
+    with lock_path.open("a+", encoding="utf-8") as lock_handle:
+        os.chmod(lock_path, 0o600)
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+
+def _replace_languages_block(text: str, languages: Sequence[str]) -> str:
+    newline = "\r\n" if "\r\n" in text else "\n"
+    lines = text.splitlines(keepends=True)
+    language_index = next(
+        (index for index, line in enumerate(lines) if re.match(r"^languages\s*:", line)),
+        None,
+    )
+    replacement = [f"languages:{newline}", *(f"- {language}{newline}" for language in languages)]
+    if language_index is None:
+        prefix = text
+        if prefix and not prefix.endswith(("\n", "\r")):
+            prefix += newline
+        if prefix and not prefix.endswith(newline * 2):
+            prefix += newline
+        return prefix + "".join(replacement)
+
+    line = lines[language_index]
+    if not re.match(r"^languages\s*:\s*(?:\[[^\]]*\])?\s*(?:#.*)?(?:\r?\n)?$", line):
+        raise RuntimeError("languages uses an unsupported complex YAML form")
+    block_end = language_index + 1
+    while block_end < len(lines) and re.match(r"^\s*-\s+[^#\r\n]+", lines[block_end]):
+        block_end += 1
+    candidate = "".join(lines[:language_index] + replacement + lines[block_end:])
+    try:
+        parsed = yaml.safe_load(candidate)
+    except yaml.YAMLError as error:
+        raise RuntimeError(f"language repair would produce invalid YAML: {error}") from error
+    if not isinstance(parsed, dict) or parsed.get("languages") != list(languages):
+        raise RuntimeError("language repair failed validation")
+    return candidate
+
+
+def _atomic_write(path: Path, content: str) -> None:
+    original_mode = path.stat().st_mode & 0o777
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as temporary:
+        temporary.write(content)
+        temporary_path = Path(temporary.name)
+    try:
+        os.chmod(temporary_path, original_mode)
+        temporary_path.replace(path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def _create_project_config(root: Path, languages: Sequence[str]) -> None:
+    command = [str(SERENA), "project", "create", str(root)]
+    for language in languages:
+        command.extend(("--language", language))
+    result = _run(command, root)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "Serena project creation failed")
+
+
+def repair_languages(root: Path) -> dict[str, Any]:
+    enabled, setting_source = _auto_repair_setting(root)
+    detected, _, truncated = _detect_languages(root)
+    result: dict[str, Any] = {
+        "enabled": enabled,
+        "setting_source": setting_source,
+        "detected_languages": detected,
+        "changed": False,
+        "created_project_config": False,
+        "added_languages": [],
+        "scan_truncated": truncated,
+    }
+    if not enabled:
+        result["reason"] = "opted_out"
+        return result
+    if not detected:
+        result["reason"] = "no_supported_languages_detected"
+        return result
+
+    with _repair_lock(root):
+        project_path, config, config_error = _load_project_config(root)
+        if config_error:
+            raise RuntimeError(f"refusing to repair invalid {project_path}: {config_error}")
+        if config is None:
+            _create_project_config(root, detected)
+            project_path, config, config_error = _load_project_config(root)
+            if config is None or config_error:
+                raise RuntimeError(f"Serena did not create a valid {project_path}")
+            result["changed"] = True
+            result["created_project_config"] = True
+
+        configured = config.get("languages")
+        if not isinstance(configured, list) or not all(isinstance(item, str) for item in configured):
+            raise RuntimeError(f"languages must be a list of strings in {project_path}")
+        missing = [language for language in detected if language not in configured]
+        result["added_languages"] = missing
+        if missing:
+            original = project_path.read_text(encoding="utf-8")
+            updated_languages = [*configured, *missing]
+            updated = _replace_languages_block(original, updated_languages)
+            if project_path.read_text(encoding="utf-8") != original:
+                raise RuntimeError(f"project configuration changed concurrently: {project_path}")
+            _atomic_write(project_path, updated)
+            result["changed"] = True
+        result["configured_languages"] = [*configured, *missing]
+        result["reason"] = "updated" if missing else "already_current"
+    return result
+
+
+def _is_git_repo(root: Path) -> bool:
+    return _run(("git", "rev-parse", "--is-inside-work-tree"), root).returncode == 0
+
+
+def _is_tracked(root: Path, path: Path) -> bool:
+    relative = path.relative_to(root)
+    return _run(("git", "ls-files", "--error-unmatch", "--", str(relative)), root).returncode == 0
+
+
+def _jetbrains_ready(root: Path) -> bool:
+    if not SERENA_CODEX.is_file():
+        return False
+    return _run((str(SERENA_CODEX), "jetbrains-service-status", str(root)), root).returncode == 0
+
+
+def _semantic_probe_file(root: Path) -> str | None:
+    """Choose a small tracked source file, preferring current Git changes."""
+    candidates: list[str] = []
+    if _is_git_repo(root):
+        changed = _run(("git", "diff", "--name-only", "HEAD", "--"), root)
+        tracked = _run(("git", "ls-files"), root)
+        if changed.returncode == 0:
+            candidates.extend(changed.stdout.splitlines())
+        if tracked.returncode == 0:
+            candidates.extend(tracked.stdout.splitlines())
+    if not candidates:
+        for current_text, directory_names, file_names in os.walk(root):
+            directory_names[:] = [
+                name for name in directory_names if name not in PRUNED_DIRECTORIES
+            ]
+            candidates.extend(
+                str((Path(current_text) / name).relative_to(root))
+                for name in file_names
+            )
+            if len(candidates) >= 500:
+                break
+
+    seen: set[str] = set()
+    for relative_path in candidates:
+        if relative_path in seen:
+            continue
+        seen.add(relative_path)
+        path = root / relative_path
+        if path.suffix.lower() not in EXTENSION_LANGUAGES or not path.is_file():
+            continue
+        try:
+            if path.stat().st_size <= 2_000_000:
+                return relative_path
+        except OSError:
+            continue
+    return None
+
+
+def _probe_jetbrains_client(client: Any, relative_path: str) -> dict[str, Any]:
+    """Exercise refresh plus one semantic read without accepting a long stall."""
+    started = time.monotonic()
+    original_timeout = client._timeout
+    client._timeout = min(original_timeout, 10)
+    try:
+        client.refresh_file(relative_path)
+        response = client.get_symbols_overview(
+            relative_path,
+            depth=0,
+            include_file_documentation=False,
+        )
+        return {
+            "status": "healthy",
+            "file": relative_path,
+            "symbols": len(response.get("symbols", [])),
+            "elapsed_ms": round((time.monotonic() - started) * 1000),
+        }
+    except Exception as error:
+        message = str(error)
+        folded = message.casefold()
+        if "timed out" in folded or "timeout" in folded:
+            status = "stalled"
+        elif (
+            "badlocationexception" in folded
+            or "plugin side" in folded
+            or "status 500" in folded
+        ):
+            status = "plugin-error"
+        else:
+            status = "failed"
+        return {
+            "status": status,
+            "file": relative_path,
+            "error": message,
+            "elapsed_ms": round((time.monotonic() - started) * 1000),
+        }
+    finally:
+        client._timeout = original_timeout
+
+
+def _jetbrains_semantic_health(
+    root: Path,
+    service_ready: bool,
+    project_config_exists: bool,
+) -> dict[str, Any]:
+    if not service_ready:
+        return {"status": "missing"}
+    if not project_config_exists:
+        return {"status": "not-configured"}
+    relative_path = _semantic_probe_file(root)
+    if relative_path is None:
+        return {"status": "no-source-file"}
+
+    try:
+        from serena.config.serena_config import SerenaConfig
+        from serena.jetbrains.jetbrains_plugin_client import JetBrainsPluginClient
+        from serena.project import Project
+
+        captured_output = io.StringIO()
+        with redirect_stdout(captured_output), redirect_stderr(captured_output):
+            config = SerenaConfig.from_config_file()
+            config.web_dashboard = False
+            config.web_dashboard_open_on_launch = False
+            project = Project.load(root, serena_config=config, autogenerate=False)
+        with JetBrainsPluginClient.from_project(project) as client:
+            return _probe_jetbrains_client(client, relative_path)
+    except Exception as error:
+        return {
+            "status": "failed",
+            "file": relative_path,
+            "error": str(error),
+        }
+
+
+def _broker_services(root: Path) -> list[dict[str, Any]]:
+    if not BROKER.is_file():
+        return []
+    result = _run((str(BROKER), "status", "--json"), root)
+    if result.returncode != 0:
+        return []
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(payload, list):
+        return []
+    resolved = str(root.resolve())
+    return [item for item in payload if isinstance(item, dict) and item.get("project_root") == resolved]
+
+
+def _memory_check(root: Path, config_exists: bool) -> str | None:
+    if not config_exists or not SERENA.is_file():
+        return None
+    result = _run((str(SERENA), "memories", "check", str(root)), root)
+    message = (result.stdout or result.stderr).strip()
+    return message or None
+
+
+def _record_history(report: dict[str, Any]) -> None:
+    """Append a compact, non-source snapshot for stability monitoring."""
+    semantic = report.get("jetbrains_semantic_health", {})
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "root": report.get("root"),
+        "status": report.get("status"),
+        "semantic_status": semantic.get("status"),
+        "semantic_elapsed_ms": semantic.get("elapsed_ms"),
+        "finding_codes": [
+            item.get("code")
+            for item in report.get("findings", [])
+            if isinstance(item, dict)
+        ],
+    }
+    HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(HISTORY_PATH.parent, 0o700)
+    with HISTORY_PATH.open("a", encoding="utf-8") as history:
+        history.write(json.dumps(record, sort_keys=True) + "\n")
+    os.chmod(HISTORY_PATH, 0o600)
+
+
+def _history_summary() -> dict[str, Any]:
+    records: list[dict[str, Any]] = []
+    if HISTORY_PATH.is_file():
+        for line in HISTORY_PATH.read_text(encoding="utf-8").splitlines():
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(item, dict):
+                records.append(item)
+    counts = Counter(str(item.get("semantic_status") or "unknown") for item in records)
+    healthy = counts.get("healthy", 0)
+    return {
+        "runs": len(records),
+        "semantic_status_counts": dict(sorted(counts.items())),
+        "healthy_rate": round(healthy / len(records), 3) if records else None,
+        "latest": records[-1] if records else None,
+        "history_path": str(HISTORY_PATH),
+    }
+
+
+def audit(root: Path) -> dict[str, Any]:
+    project_path, config, config_error = _load_project_config(root)
+    detected, counts, truncated = _detect_languages(root)
+    configured = []
+    if config is not None and isinstance(config.get("languages"), list):
+        configured = [str(item) for item in config["languages"]]
+    missing_languages = [language for language in detected if language not in configured]
+    memories_dir = root / ".serena" / "memories"
+    memories = sorted(memories_dir.rglob("*.md")) if memories_dir.is_dir() else []
+    git_repo = _is_git_repo(root)
+    tracked_memories = [path for path in memories if git_repo and _is_tracked(root, path)]
+    findings: list[dict[str, str]] = []
+
+    if config is None:
+        findings.append(
+            {
+                "severity": "error",
+                "code": "missing_or_invalid_project_config",
+                "message": config_error or f"missing {project_path}",
+            }
+        )
+    if missing_languages:
+        findings.append(
+            {
+                "severity": "warning",
+                "code": "missing_languages",
+                "message": "Detected but not configured: " + ", ".join(missing_languages),
+            }
+        )
+    if not memories:
+        findings.append(
+            {
+                "severity": "warning",
+                "code": "no_project_memories",
+                "message": "No project memories exist; durable Serena knowledge is not being used.",
+            }
+        )
+    if config is not None and not str(config.get("initial_prompt") or "").strip():
+        findings.append(
+            {
+                "severity": "info",
+                "code": "empty_initial_prompt",
+                "message": "No project-specific activation prompt is configured.",
+            }
+        )
+    if git_repo and project_path.is_file() and not _is_tracked(root, project_path):
+        findings.append(
+            {
+                "severity": "warning",
+                "code": "untracked_project_config",
+                "message": ".serena/project.yml is not tracked by Git, so worktrees may drift.",
+            }
+        )
+    if git_repo and len(tracked_memories) < len(memories):
+        findings.append(
+            {
+                "severity": "warning",
+                "code": "untracked_memories",
+                "message": f"{len(memories) - len(tracked_memories)} Serena memory file(s) are not tracked by Git.",
+            }
+        )
+    if truncated:
+        findings.append(
+            {
+                "severity": "info",
+                "code": "scan_truncated",
+                "message": f"Language scan stopped after {MAX_FILES} files.",
+            }
+        )
+
+    jetbrains_ready = _jetbrains_ready(root)
+    semantic_health = _jetbrains_semantic_health(
+        root,
+        jetbrains_ready,
+        config is not None,
+    )
+    semantic_status = semantic_health["status"]
+    if jetbrains_ready and semantic_status not in {"healthy", "no-source-file"}:
+        findings.append(
+            {
+                "severity": "warning",
+                "code": "jetbrains_semantic_unhealthy",
+                "message": (
+                    f"JetBrains service is HTTP-alive but semantic probe is {semantic_status}: "
+                    f"{semantic_health.get('error', 'no further detail')}"
+                ),
+            }
+        )
+
+    blockers = [item for item in findings if item["severity"] == "error"]
+    warnings = [item for item in findings if item["severity"] == "warning"]
+    auto_repair_enabled, auto_repair_source = _auto_repair_setting(root)
+    if semantic_status == "healthy":
+        recommended_action = "Use Serena normally."
+    elif semantic_status == "missing":
+        recommended_action = (
+            f'Run open-codex-project-in-pycharm "{root}" once, then rerun the doctor once.'
+        )
+    elif semantic_status in {"stalled", "plugin-error"}:
+        recommended_action = (
+            "Do not retry Serena tools repeatedly. Save any IDE edits, recover the exact "
+            "PyCharm project service, then rerun the doctor once; use native diagnostics "
+            "if that bounded retry is not healthy."
+        )
+    else:
+        recommended_action = (
+            "Rerun the doctor once after the reported configuration issue is corrected."
+        )
+
+    return {
+        "root": str(root),
+        "status": "blocked" if blockers else "needs-attention" if warnings else "ready",
+        "project_config": str(project_path),
+        "project_name": config.get("project_name") if config else None,
+        "configured_languages": configured,
+        "detected_languages": detected,
+        "language_file_counts": counts,
+        "missing_languages": missing_languages,
+        "memory_count": len(memories),
+        "tracked_memory_count": len(tracked_memories),
+        "memory_check": _memory_check(root, config is not None),
+        "initial_prompt_configured": bool(config and str(config.get("initial_prompt") or "").strip()),
+        "project_config_tracked": bool(git_repo and project_path.is_file() and _is_tracked(root, project_path)),
+        "jetbrains_service_ready": jetbrains_ready,
+        "jetbrains_semantic_health": semantic_health,
+        "broker_services": _broker_services(root),
+        "auto_repair_languages": auto_repair_enabled,
+        "auto_repair_setting_source": auto_repair_source,
+        "recommended_action": recommended_action,
+        "findings": findings,
+    }
+
+
+def _print_text(report: dict[str, Any]) -> None:
+    print(f"Serena project doctor: {report['root']}")
+    print(f"Status: {report['status']}")
+    print("Configured languages: " + (", ".join(report["configured_languages"]) or "none"))
+    print("Detected languages: " + (", ".join(report["detected_languages"]) or "none"))
+    print(
+        f"Memories: {report['memory_count']} total, {report['tracked_memory_count']} tracked; "
+        f"initial prompt: {'yes' if report['initial_prompt_configured'] else 'no'}"
+    )
+    print(
+        f"JetBrains service: {'ready' if report['jetbrains_service_ready'] else 'not ready'}; "
+        f"semantics: {report['jetbrains_semantic_health']['status']}; "
+        f"broker services: {len(report['broker_services'])}"
+    )
+    print(
+        f"Language auto-repair: {'enabled' if report['auto_repair_languages'] else 'disabled'} "
+        f"({report['auto_repair_setting_source']})"
+    )
+    if report["findings"]:
+        print("Findings:")
+        for finding in report["findings"]:
+            print(f"- [{finding['severity']}] {finding['code']}: {finding['message']}")
+    else:
+        print("Findings: none")
+    print(f"Recommended action: {report['recommended_action']}")
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("project", nargs="?")
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--strict", action="store_true", help="exit nonzero for warnings or errors")
+    parser.add_argument(
+        "--history",
+        action="store_true",
+        help="summarize recorded doctor semantic-health outcomes",
+    )
+    parser.add_argument(
+        "--repair-languages",
+        action="store_true",
+        help="add detected supported languages unless project configuration opts out",
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    if args.history:
+        summary = _history_summary()
+        if args.json:
+            print(json.dumps(summary, indent=2, sort_keys=True))
+        else:
+            print(f"Serena doctor history: {summary['runs']} run(s)")
+            print(f"Semantic outcomes: {summary['semantic_status_counts']}")
+            print(f"Healthy rate: {summary['healthy_rate']}")
+            print(f"History: {summary['history_path']}")
+        return 0
+    try:
+        root = _resolve_root(args.project)
+        repair = repair_languages(root) if args.repair_languages else None
+        report = audit(root)
+        if repair is not None:
+            report["language_repair"] = repair
+    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+        print(f"serena-project-doctor: {error}", file=sys.stderr)
+        return 2
+    try:
+        _record_history(report)
+    except OSError as error:
+        report["history_record_error"] = str(error)
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        _print_text(report)
+    if args.strict and report["status"] != "ready":
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

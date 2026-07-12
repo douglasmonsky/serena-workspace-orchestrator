@@ -1,0 +1,408 @@
+#!/usr/bin/env python3
+"""Launch Serena reliably from Codex task roots.
+
+The upstream ``--project-from-cwd`` lookup searches only ancestors. Codex task
+roots often contain a single repository below ``work/``, so this launcher adds
+an ambiguity-safe, bounded descendant lookup. It also supplies the JetBrains
+health check that Serena 1.5.3 currently lacks.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import json
+import os
+from pathlib import Path
+import sys
+import traceback
+from typing import Any, NoReturn, Sequence
+
+
+REAL_SERENA = Path(
+    os.environ.get(
+        "SERENA_CODEX_EXECUTABLE",
+        Path.home() / ".local" / "share" / "uv" / "tools" / "serena-agent" / "bin" / "serena",
+    )
+)
+FRESHNESS_OVERLAY = Path.home() / ".codex" / "lib" / "serena-freshness"
+DEFAULT_SEARCH_DEPTH = 4
+PRUNED_DIRECTORIES = frozenset(
+    {
+        ".git",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".serena",
+        ".tox",
+        ".venv",
+        ".verify-logs",
+        "__pycache__",
+        "build",
+        "dist",
+        "htmlcov",
+        "node_modules",
+        "venv",
+    }
+)
+
+
+@dataclass(frozen=True)
+class ProjectDiscovery:
+    """Outcome of a Serena project lookup."""
+
+    project: Path | None
+    origin: str
+    candidates: tuple[Path, ...] = ()
+
+
+def _ancestors(start: Path) -> tuple[Path, ...]:
+    resolved = start.resolve()
+    return (resolved, *resolved.parents)
+
+
+def _find_upward_project(start: Path) -> ProjectDiscovery | None:
+    """Mirror Serena's normal ancestor lookup before adding a fallback."""
+    ancestors = _ancestors(start)
+    for directory in ancestors:
+        if (directory / ".serena" / "project.yml").is_file():
+            return ProjectDiscovery(directory, "upward-serena")
+    for directory in ancestors:
+        if (directory / ".git").exists():
+            return ProjectDiscovery(directory, "upward-git")
+    return None
+
+
+def _nested_projects(start: Path, max_depth: int) -> tuple[Path, ...]:
+    """Find bounded descendant Serena projects without following symlinks."""
+    root = start.resolve()
+    matches: list[Path] = []
+    for current_text, directory_names, _ in os.walk(root, followlinks=False):
+        current = Path(current_text)
+        depth = len(current.relative_to(root).parts)
+        if depth > max_depth:
+            directory_names[:] = []
+            continue
+        if (current / ".serena" / "project.yml").is_file():
+            matches.append(current)
+        if depth == max_depth:
+            directory_names[:] = []
+            continue
+        directory_names[:] = sorted(
+            name
+            for name in directory_names
+            if name not in PRUNED_DIRECTORIES
+            and not (current / name).is_symlink()
+        )
+    return tuple(sorted(matches))
+
+
+def discover_project(start: Path, max_depth: int) -> ProjectDiscovery:
+    """Resolve a normal ancestor or one unambiguous nested Serena project."""
+    upward = _find_upward_project(start)
+    if upward is not None:
+        return upward
+    candidates = _nested_projects(start, max_depth)
+    if len(candidates) == 1:
+        return ProjectDiscovery(candidates[0], "nested-serena", candidates)
+    if candidates:
+        return ProjectDiscovery(None, "ambiguous", candidates)
+    return ProjectDiscovery(None, "not-found")
+
+
+def _search_depth() -> int:
+    raw_value = os.environ.get("SERENA_CODEX_PROJECT_SEARCH_DEPTH", "")
+    if not raw_value:
+        return DEFAULT_SEARCH_DEPTH
+    try:
+        value = int(raw_value)
+    except ValueError:
+        print(
+            "serena-codex: SERENA_CODEX_PROJECT_SEARCH_DEPTH must be an integer",
+            file=sys.stderr,
+        )
+        return DEFAULT_SEARCH_DEPTH
+    return max(0, value)
+
+
+def _warn_ambiguous(discovery: ProjectDiscovery) -> None:
+    rendered = ", ".join(str(path) for path in discovery.candidates)
+    print(
+        "serena-codex: multiple nested Serena projects found; refusing to "
+        f"guess: {rendered}",
+        file=sys.stderr,
+    )
+
+
+def _rewrite_mcp_args(args: Sequence[str], cwd: Path) -> list[str]:
+    rewritten = list(args)
+    if not rewritten or rewritten[0] != "start-mcp-server":
+        return rewritten
+    if "--project-from-cwd" not in rewritten:
+        return rewritten
+    if any(
+        item in {"--project", "--project-file"}
+        or item.startswith(("--project=", "--project-file="))
+        for item in rewritten
+    ):
+        return rewritten
+    discovery = discover_project(cwd, _search_depth())
+    if discovery.origin == "nested-serena" and discovery.project is not None:
+        index = rewritten.index("--project-from-cwd")
+        rewritten[index] = f"--project={discovery.project}"
+    elif discovery.origin == "ambiguous":
+        _warn_ambiguous(discovery)
+    return rewritten
+
+
+def _write_health_log(project_root: Path, payload: dict[str, Any]) -> Path:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%fZ")
+    log_dir = project_root / ".serena" / "logs" / "health-checks"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"jetbrains_health_check_{timestamp}.json"
+    log_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return log_path
+
+
+def _source_sort_key(relative_path: str) -> tuple[int, int, str]:
+    path = Path(relative_path)
+    if path.parts and path.parts[0] == "src" and path.suffix == ".py":
+        priority = 0
+    elif path.suffix == ".py":
+        priority = 1
+    else:
+        priority = 2
+    return priority, len(path.parts), relative_path
+
+
+def _inspection_count(response: dict[str, Any]) -> int:
+    """Read both the documented and current JetBrains response shapes."""
+    if "inspections" in response:
+        return len(response["inspections"])
+    if "total_problems" in response:
+        return int(response["total_problems"])
+    raise RuntimeError(
+        "JetBrains inspection response has unknown keys: "
+        f"{sorted(response)}"
+    )
+
+
+def _run_jetbrains_health_check(project_root: Path) -> int | None:
+    """Run a JetBrains-native check, or defer when the project uses LSP."""
+    from serena.config.serena_config import LanguageBackend, SerenaConfig
+    from serena.jetbrains.jetbrains_plugin_client import JetBrainsPluginClient
+    from serena.project import Project
+
+    if not (project_root / ".serena" / "project.yml").is_file():
+        return None
+
+    config = SerenaConfig.from_config_file()
+    config.gui_log_window = False
+    config.web_dashboard = False
+    config.web_dashboard_open_on_launch = False
+    config.propagate_settings()
+    project = Project.load(project_root, serena_config=config, autogenerate=False)
+    backend = project.project_config.language_backend or config.language_backend
+    if backend is not LanguageBackend.JETBRAINS:
+        return None
+
+    payload: dict[str, Any] = {
+        "backend": backend.value,
+        "project": str(project_root),
+        "status": "failed",
+    }
+    try:
+        client = JetBrainsPluginClient.from_project(project)
+        source_files = sorted(project.gather_source_files(), key=_source_sort_key)
+        overview: dict[str, Any] | None = None
+        target_file: str | None = None
+        for relative_path in source_files[:50]:
+            full_path = project_root / relative_path
+            if not full_path.is_file() or full_path.stat().st_size == 0:
+                continue
+            candidate = client.get_symbols_overview(
+                relative_path,
+                depth=1,
+                include_file_documentation=True,
+            )
+            if candidate.get("symbols"):
+                target_file = relative_path
+                overview = candidate
+                break
+        if target_file is None or overview is None:
+            raise RuntimeError("no analyzable file with symbols was found")
+
+        symbols = overview["symbols"]
+        preferred_type_fragments = ("class", "constructor", "function", "method")
+        selected = next(
+            (
+                symbol
+                for symbol in symbols
+                if any(
+                    fragment in str(symbol.get("type", "")).casefold()
+                    for fragment in preferred_type_fragments
+                )
+            ),
+            symbols[0],
+        )
+        name_path = selected["name_path"]
+        found = client.find_symbol(
+            name_path,
+            relative_path=target_file,
+            include_body=True,
+            include_location=True,
+        )
+        if not found.get("symbols"):
+            raise RuntimeError(f"find_symbol returned no match for {name_path!r}")
+        references = client.find_references(
+            name_path,
+            relative_path=target_file,
+            include_quick_info=False,
+        )
+        inspections = client.run_inspections(target_file, min_severity="ERROR")
+        if "symbols" not in references:
+            raise RuntimeError(
+                "JetBrains reference response has unknown keys: "
+                f"{sorted(references)}"
+            )
+        inspection_count = _inspection_count(inspections)
+
+        payload.update(
+            {
+                "file": target_file,
+                "find_symbol_matches": len(found["symbols"]),
+                "inspection_errors": inspection_count,
+                "reference_matches": len(references["symbols"]),
+                "status": "passed",
+                "symbol": name_path,
+                "top_level_symbols": len(symbols),
+            }
+        )
+        log_path = _write_health_log(project_root, payload)
+        print("PASS Serena JetBrains health check")
+        print(f"  project: {project_root}")
+        print(f"  semantic probe: {target_file}::{name_path}")
+        print(
+            "  results: "
+            f"{len(symbols)} overview, {len(found['symbols'])} symbol, "
+            f"{len(references['symbols'])} references, "
+            f"{inspection_count} inspection errors"
+        )
+        print(f"  log: {log_path}")
+        return 0
+    except Exception as error:
+        payload.update(
+            {
+                "error": str(error),
+                "traceback": traceback.format_exc(),
+            }
+        )
+        try:
+            log_path = _write_health_log(project_root, payload)
+            log_message = f"; log: {log_path}"
+        except OSError:
+            log_message = ""
+        print(
+            f"FAIL Serena JetBrains health check: {error}{log_message}",
+            file=sys.stderr,
+        )
+        return 1
+
+
+def _uses_jetbrains_mcp(args: Sequence[str]) -> bool:
+    if not args or args[0] != "start-mcp-server":
+        return False
+    for index, argument in enumerate(args):
+        if argument.startswith("--language-backend="):
+            return argument.partition("=")[2].casefold() == "jetbrains"
+        if argument == "--language-backend" and index + 1 < len(args):
+            return args[index + 1].casefold() == "jetbrains"
+    return False
+
+
+def _exec_real_serena(args: Sequence[str]) -> NoReturn:
+    if not REAL_SERENA.is_file():
+        print(f"serena-codex: Serena executable not found: {REAL_SERENA}", file=sys.stderr)
+        raise SystemExit(127)
+    if _uses_jetbrains_mcp(args):
+        existing_pythonpath = os.environ.get("PYTHONPATH")
+        overlay_path = str(FRESHNESS_OVERLAY)
+        os.environ["PYTHONPATH"] = (
+            overlay_path
+            if not existing_pythonpath
+            else os.pathsep.join((overlay_path, existing_pythonpath))
+        )
+    os.execv(str(REAL_SERENA), [str(REAL_SERENA), *args])
+
+
+def _resolve_project_command(args: Sequence[str]) -> int:
+    if len(args) > 2:
+        print("Usage: serena-codex resolve-project [START_DIR]", file=sys.stderr)
+        return 2
+    start = Path(args[1]) if len(args) == 2 else Path.cwd()
+    if not start.is_dir():
+        print(f"serena-codex: not a directory: {start}", file=sys.stderr)
+        return 2
+    discovery = discover_project(start, _search_depth())
+    if discovery.project is not None:
+        print(discovery.project)
+        return 0
+    if discovery.origin == "ambiguous":
+        _warn_ambiguous(discovery)
+        return 2
+    print(f"serena-codex: no Serena project found from {start.resolve()}", file=sys.stderr)
+    return 1
+
+
+def _jetbrains_service_status_command(args: Sequence[str]) -> int:
+    """Report whether the exact project root has a live Serena IDE service."""
+    if len(args) > 2:
+        print("Usage: serena-codex jetbrains-service-status [PROJECT_DIR]", file=sys.stderr)
+        return 2
+    project_root = Path(args[1]) if len(args) == 2 else Path.cwd()
+    if not project_root.is_dir():
+        print(f"serena-codex: not a directory: {project_root}", file=sys.stderr)
+        return 2
+
+    from serena.jetbrains.jetbrains_plugin_client import (
+        JetBrainsPluginClientManager,
+        ServerNotFoundError,
+    )
+
+    resolved_root = project_root.resolve()
+    try:
+        JetBrainsPluginClientManager().find_client(resolved_root)
+    except ServerNotFoundError:
+        print(f"MISSING Serena JetBrains service: {resolved_root}", file=sys.stderr)
+        return 1
+    print(f"READY Serena JetBrains service: {resolved_root}")
+    return 0
+
+
+def main(args: Sequence[str] | None = None) -> int:
+    """Route wrapper-specific behavior and delegate everything else."""
+    arguments = list(sys.argv[1:] if args is None else args)
+    if arguments and arguments[0] == "resolve-project":
+        return _resolve_project_command(arguments)
+    if arguments and arguments[0] == "jetbrains-service-status":
+        return _jetbrains_service_status_command(arguments)
+
+    rewritten = _rewrite_mcp_args(arguments, Path.cwd())
+    if os.environ.get("SERENA_CODEX_DRY_RUN") == "1":
+        print(json.dumps([str(REAL_SERENA), *rewritten]))
+        return 0
+
+    if rewritten[:2] == ["project", "health-check"] and len(rewritten) <= 3:
+        project_root = Path(rewritten[2] if len(rewritten) == 3 else Path.cwd()).resolve()
+        result = _run_jetbrains_health_check(project_root)
+        if result is not None:
+            return result
+
+    _exec_real_serena(rewritten)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
