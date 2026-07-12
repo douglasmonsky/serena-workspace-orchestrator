@@ -14,6 +14,7 @@ opener_lock_timeout="${INTELLIJ_OPENER_LOCK_TIMEOUT:-30}"
 reaper_command="${INTELLIJ_PROJECT_REAPER_COMMAND:-$HOME/.codex/bin/intellij-project-reaper}"
 model_ready_command="${INTELLIJ_MODEL_READY_COMMAND:-$reaper_command}"
 project_trust_command="${INTELLIJ_PROJECT_TRUST_COMMAND:-$HOME/.codex/bin/intellij-project-trust}"
+bootstrap_command="${WORKSPACE_HARBOR_BOOTSTRAP_COMMAND:-$HOME/.codex/bin/workspace-harbor-bootstrap}"
 
 usage() {
   print -u2 "Usage: open-codex-project-in-intellij [--require-github] [PROJECT_DIR]"
@@ -50,6 +51,34 @@ ensure_project_trusted() {
 
   [[ -x "$project_trust_command" ]] || return 1
   "$project_trust_command" allow "$dir"
+}
+
+prepare_project_dependencies() {
+  local dir="$1" result_code
+
+  if [[ ! -x "$bootstrap_command" ]]; then
+    print -u2 "open-codex-project-in-intellij: dependency bootstrap command unavailable"
+    return 2
+  fi
+  if "$bootstrap_command" run "$dir" --json >/dev/null 2>&1; then
+    return 0
+  else
+    result_code=$?
+  fi
+  case "$result_code" in
+    1)
+      print -u2 "open-codex-project-in-intellij: dependency bootstrap is degraded; continuing with IntelliJ and Serena available for diagnosis"
+      return 0
+      ;;
+    3)
+      print -u2 "open-codex-project-in-intellij: dependency bootstrap needs one repository decision; continuing without retry"
+      return 0
+      ;;
+    *)
+      print -u2 "open-codex-project-in-intellij: dependency bootstrap configuration or state is invalid"
+      return 2
+      ;;
+  esac
 }
 
 release_opener_lock() {
@@ -196,6 +225,13 @@ trap release_opener_lock EXIT INT TERM HUP
 if [[ "$require_github" == true ]] && ! has_github_remote "$project_dir"; then
   print "open-codex-project-in-intellij: skipped, no GitHub remote found for $project_dir"
   exit 0
+fi
+
+if prepare_project_dependencies "$project_dir"; then
+  :
+else
+  bootstrap_status=$?
+  exit "$bootstrap_status"
 fi
 
 if is_ready_in_intellij "$project_dir"; then

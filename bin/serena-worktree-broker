@@ -57,6 +57,12 @@ PROJECT_DOCTOR = Path(
         CODEX_HOME / "bin" / "serena-project-doctor",
     )
 )
+BOOTSTRAP = Path(
+    os.environ.get(
+        "SERENA_BROKER_BOOTSTRAP",
+        CODEX_HOME / "bin" / "workspace-harbor-bootstrap",
+    )
+)
 PORT_FIRST = int(os.environ.get("SERENA_BROKER_PORT_FIRST", "24320"))
 PORT_LAST = int(os.environ.get("SERENA_BROKER_PORT_LAST", "24419"))
 DEFAULT_IDLE_SECONDS = int(os.environ.get("SERENA_BROKER_IDLE_SECONDS", "900"))
@@ -310,6 +316,38 @@ def _auto_repair_project_languages(project_root: Path) -> None:
         raise RuntimeError(f"Serena language auto-repair failed: {message}")
 
 
+def _bootstrap_status(project_root: Path) -> dict[str, Any]:
+    if not BOOTSTRAP.is_file() or not os.access(BOOTSTRAP, os.X_OK):
+        raise RuntimeError(f"Workspace Harbor bootstrap not found: {BOOTSTRAP}")
+    try:
+        result = subprocess.run(
+            [str(BOOTSTRAP), "status", str(project_root), "--json"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RuntimeError(f"Workspace Harbor bootstrap status failed: {error}") from error
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("Workspace Harbor bootstrap returned malformed status") from error
+    allowed_codes = {
+        "ready": 0,
+        "pending": 0,
+        "not-needed": 0,
+        "disabled": 0,
+        "failed": 1,
+        "needs-decision": 3,
+    }
+    status = payload.get("status") if isinstance(payload, dict) else None
+    if not isinstance(status, str) or allowed_codes.get(status) != result.returncode:
+        message = result.stderr.strip() or "invalid status contract"
+        raise RuntimeError(f"Workspace Harbor bootstrap status is invalid: {message}")
+    return payload
+
+
 def _start_service(
     state: dict[str, Any],
     project_root: Path,
@@ -444,6 +482,7 @@ def _connect(args: argparse.Namespace) -> int:
     if project_root is None:
         return _direct_stdio_fallback(args.backend, args.context, args.add_mode)
     _auto_repair_project_languages(project_root)
+    _bootstrap_status(project_root)
     if not MCP_PROXY.is_file():
         raise RuntimeError(f"mcp-proxy not found: {MCP_PROXY}")
 

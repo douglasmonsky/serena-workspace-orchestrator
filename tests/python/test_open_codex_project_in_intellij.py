@@ -18,6 +18,10 @@ DEFAULT_MODEL_READY_COMMAND = Path(tempfile.gettempdir()) / "open-codex-project-
 DEFAULT_MODEL_READY_COMMAND.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
 DEFAULT_MODEL_READY_COMMAND.chmod(0o755)
 os.environ.setdefault("INTELLIJ_MODEL_READY_COMMAND", str(DEFAULT_MODEL_READY_COMMAND))
+DEFAULT_BOOTSTRAP_COMMAND = Path(tempfile.gettempdir()) / "open-codex-project-in-intellij-test-bootstrap"
+DEFAULT_BOOTSTRAP_COMMAND.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+DEFAULT_BOOTSTRAP_COMMAND.chmod(0o755)
+os.environ.setdefault("WORKSPACE_HARBOR_BOOTSTRAP_COMMAND", str(DEFAULT_BOOTSTRAP_COMMAND))
 
 
 class OpenCodexProjectInIntellijTests(unittest.TestCase):
@@ -520,6 +524,43 @@ class OpenCodexProjectInIntellijTests(unittest.TestCase):
             result = subprocess.run([str(HELPER), str(project)], capture_output=True, text=True, env=env, check=False)
             self.assertEqual(0, result.returncode, result.stderr)
             self.assertFalse(log.exists())
+
+    def test_bootstrap_runs_before_already_open_shortcut(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory); project = root / "project"; project.mkdir()
+            home = root / "home"; bin_dir = home / ".codex/bin"; bin_dir.mkdir(parents=True); log = root / "log"
+            bootstrap = root / "bootstrap"
+            bootstrap.write_text(f"#!/bin/sh\nprintf 'bootstrap %s %s %s\\n' \"$1\" \"$2\" \"$3\" >> '{log}'\n", encoding="utf-8"); bootstrap.chmod(0o755)
+            (bin_dir / "serena-codex").write_text(f"#!/bin/sh\nprintf 'service\\n' >> '{log}'\nexit 0\n", encoding="utf-8"); (bin_dir / "serena-codex").chmod(0o755)
+            (bin_dir / "intellij-project-reaper").write_text(f"#!/bin/sh\nprintf 'reaper %s\\n' \"$1\" >> '{log}'\nexit 0\n", encoding="utf-8"); (bin_dir / "intellij-project-reaper").chmod(0o755)
+            result = subprocess.run(
+                [str(HELPER), str(project)], capture_output=True, text=True, check=False,
+                env=os.environ | {"HOME": str(home), "WORKSPACE_HARBOR_BOOTSTRAP_COMMAND": str(bootstrap)},
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            lines = log.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(f"bootstrap run {project.resolve()} --json", lines[0])
+            self.assertIn("service", lines[1:])
+
+    def test_bootstrap_failure_is_degraded_but_invalid_configuration_blocks_open(self) -> None:
+        for bootstrap_exit, expected_exit, should_open in ((1, 0, True), (3, 0, True), (2, 2, False)):
+            with self.subTest(bootstrap_exit=bootstrap_exit), tempfile.TemporaryDirectory() as temporary_directory:
+                root = Path(temporary_directory); project = root / "project"; project.mkdir()
+                home = root / "home"; bin_dir = home / ".codex/bin"; bin_dir.mkdir(parents=True)
+                app = root / "IntelliJ IDEA.app"; app.mkdir(); ready = project / "ready"; log = root / "log"
+                bootstrap = root / "bootstrap"
+                bootstrap.write_text(f"#!/bin/sh\nprintf 'bootstrap\\n' >> '{log}'\nexit {bootstrap_exit}\n", encoding="utf-8"); bootstrap.chmod(0o755)
+                (bin_dir / "serena-codex").write_text(f"#!/bin/sh\n[ -f '{ready}' ]\n", encoding="utf-8"); (bin_dir / "serena-codex").chmod(0o755)
+                (bin_dir / "intellij-project-reaper").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8"); (bin_dir / "intellij-project-reaper").chmod(0o755)
+                opener = root / "open"; opener.write_text(f"#!/bin/sh\nprintf 'open\\n' >> '{log}'\ntouch '{ready}'\n", encoding="utf-8"); opener.chmod(0o755)
+                result = subprocess.run(
+                    [str(HELPER), str(project)], capture_output=True, text=True, check=False,
+                    env=os.environ | {"HOME": str(home), "INTELLIJ_APP_PATH": str(app), "INTELLIJ_OPEN_COMMAND": str(opener), "WORKSPACE_HARBOR_BOOTSTRAP_COMMAND": str(bootstrap), "INTELLIJ_SERENA_READY_INTERVAL": "0.01", "INTELLIJ_SERENA_READY_TIMEOUT": "1"},
+                )
+                self.assertEqual(expected_exit, result.returncode, result.stderr)
+                self.assertEqual(should_open, "open" in log.read_text(encoding="utf-8").splitlines())
+                if bootstrap_exit in {1, 3}:
+                    self.assertIn("dependency bootstrap", result.stderr)
 
 
 if __name__ == "__main__":

@@ -227,12 +227,42 @@ class SerenaWorktreeBrokerTests(unittest.TestCase):
         ), mock.patch.object(
             broker, "_auto_repair_project_languages"
         ) as repair, mock.patch.object(
+            broker, "_bootstrap_status", return_value={"status": "pending"}
+        ) as bootstrap_status, mock.patch.object(
             broker, "MCP_PROXY", missing_proxy
         ):
             with self.assertRaisesRegex(RuntimeError, "mcp-proxy not found"):
                 broker._connect(args)
 
         repair.assert_called_once_with(project_root)
+        bootstrap_status.assert_called_once_with(project_root)
+
+    def test_bootstrap_probe_is_status_only_and_accepts_decision_status(self) -> None:
+        helper = Path(self.temporary_directory.name) / "bootstrap"; helper.write_text("fixture"); helper.chmod(0o755)
+        completed = mock.Mock(returncode=3, stdout=json.dumps({"status": "needs-decision"}), stderr="")
+        with mock.patch.object(broker, "BOOTSTRAP", helper), mock.patch.object(
+            broker.subprocess, "run", return_value=completed
+        ) as run:
+            result = broker._bootstrap_status(Path("/tmp/example"))
+        self.assertEqual("needs-decision", result["status"])
+        command = run.call_args.args[0]
+        self.assertIn("status", command)
+        self.assertNotIn("run", command)
+        self.assertLessEqual(run.call_args.kwargs["timeout"], 5)
+
+    def test_bootstrap_probe_rejects_invalid_or_malformed_results(self) -> None:
+        helper = Path(self.temporary_directory.name) / "bootstrap"; helper.write_text("fixture"); helper.chmod(0o755)
+        cases = [
+            mock.Mock(returncode=2, stdout=json.dumps({"status": "invalid"}), stderr="bad config"),
+            mock.Mock(returncode=0, stdout="not-json", stderr=""),
+            mock.Mock(returncode=0, stdout=json.dumps({"status": "surprise"}), stderr=""),
+        ]
+        for completed in cases:
+            with self.subTest(stdout=completed.stdout), mock.patch.object(broker, "BOOTSTRAP", helper), mock.patch.object(
+                broker.subprocess, "run", return_value=completed
+            ):
+                with self.assertRaisesRegex(RuntimeError, "bootstrap"):
+                    broker._bootstrap_status(Path("/tmp/example"))
 
 
 if __name__ == "__main__":
