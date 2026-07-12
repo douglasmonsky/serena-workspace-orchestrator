@@ -38,7 +38,8 @@ def _codex_home() -> Path:
 def _serena_python() -> Path:
     configured = os.environ.get("WORKSPACE_HARBOR_SERENA_PYTHON")
     default = Path.home() / ".local/share/uv/tools/serena-agent/bin/python"
-    return Path(configured).expanduser().resolve() if configured else default.resolve()
+    path = Path(configured).expanduser() if configured else default
+    return path if path.is_absolute() else Path.cwd() / path
 
 
 def _expected_bytes(source: Path, name: str, serena_python: Path) -> bytes:

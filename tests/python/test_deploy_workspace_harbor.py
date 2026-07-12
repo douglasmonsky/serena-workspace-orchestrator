@@ -35,9 +35,11 @@ class DeployWorkspaceHarborTests(unittest.TestCase):
         for name in (*EXECUTABLES, *MODULES):
             (self.bin_source / name).write_text(f"#!/usr/bin/env python3\n# {name}\n", encoding="utf-8")
         self.codex_home = self.base / "codex"
+        self.serena_runtime = self.base / "runtime-python"
+        self.serena_runtime.write_text("fixture\n", encoding="utf-8")
+        self.serena_runtime.chmod(0o755)
         self.serena_python = self.base / "serena-python"
-        self.serena_python.write_text("fixture\n", encoding="utf-8")
-        self.serena_python.chmod(0o755)
+        self.serena_python.symlink_to(self.serena_runtime)
         self.environment = os.environ | {
             "CODEX_HOME": str(self.codex_home),
             "WORKSPACE_HARBOR_SOURCE_ROOT": str(self.source),
@@ -86,7 +88,7 @@ class DeployWorkspaceHarborTests(unittest.TestCase):
         self.assertEqual(expected_shebang, (destination / "serena-project-doctor").read_text().splitlines()[0])
         self.assertEqual(expected_shebang, (destination / "workspace-harbor-bootstrap").read_text().splitlines()[0])
         self.assertEqual(
-            f"#!{self.serena_python.resolve()}",
+            f"#!{self.serena_python}",
             (destination / "serena-codex").read_text().splitlines()[0],
         )
 
