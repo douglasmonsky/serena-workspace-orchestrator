@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail-closed registry and policy for managed PyCharm projects."""
+"""Fail-closed registry and policy for managed IntelliJ projects."""
 import argparse, datetime as dt, fcntl, json, os, stat, subprocess, sys, tempfile, time
 from dataclasses import dataclass
 from pathlib import Path
@@ -7,7 +7,7 @@ from typing import Literal
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
-STATE = Path.home() / ".codex/state/pycharm-projects/managed.json"
+STATE = Path.home() / ".codex/state/intellij-projects/managed.json"
 RUNTIME = STATE.with_name("plugin-runtime.json")
 CAP, IDLE = 4, 1800
 BROKER = Path.home() / ".codex/bin/serena-worktree-broker"
@@ -185,14 +185,14 @@ def status_report(records, plugins, leases, corrupt=False, idle=IDLE):
 
 def environment():
     values = {"state": STATE, "runtime": RUNTIME, "broker": BROKER, "cap": CAP, "idle": IDLE}
-    mapping = {"state": "PYCHARM_PROJECT_REAPER_STATE_FILE", "runtime": "PYCHARM_PROJECT_REAPER_RUNTIME_FILE", "broker": "PYCHARM_PROJECT_REAPER_BROKER_COMMAND"}
+    mapping = {"state": "INTELLIJ_PROJECT_REAPER_STATE_FILE", "runtime": "INTELLIJ_PROJECT_REAPER_RUNTIME_FILE", "broker": "INTELLIJ_PROJECT_REAPER_BROKER_COMMAND"}
     try:
         for key, name in mapping.items():
             if name in os.environ:
                 value = Path(os.environ[name]).expanduser()
                 if not value.is_absolute(): raise ValueError(name)
                 values[key] = value
-        for key, name in (("cap", "PYCHARM_PROJECT_REAPER_CAP"), ("idle", "PYCHARM_PROJECT_REAPER_IDLE_SECONDS")):
+        for key, name in (("cap", "INTELLIJ_PROJECT_REAPER_CAP"), ("idle", "INTELLIJ_PROJECT_REAPER_IDLE_SECONDS")):
             if name in os.environ:
                 values[key] = int(os.environ[name])
                 if values[key] < 0: raise ValueError(name)

@@ -4,18 +4,18 @@ setopt extendedglob
 
 require_github=false
 project_dir="$PWD"
-pycharm_app_path="${PYCHARM_APP_PATH:-/Applications/PyCharm.app}"
-pycharm_open_command="${PYCHARM_OPEN_COMMAND:-/usr/bin/open}"
-ready_interval="${PYCHARM_SERENA_READY_INTERVAL:-1}"
-ready_timeout="${PYCHARM_SERENA_READY_TIMEOUT:-120}"
-opener_state_dir="${PYCHARM_OPENER_STATE_DIR:-$HOME/.codex/state/pycharm-projects}"
+intellij_app_path="${INTELLIJ_APP_PATH:-$HOME/Applications/IntelliJ IDEA.app}"
+intellij_open_command="${INTELLIJ_OPEN_COMMAND:-/usr/bin/open}"
+ready_interval="${INTELLIJ_SERENA_READY_INTERVAL:-1}"
+ready_timeout="${INTELLIJ_SERENA_READY_TIMEOUT:-120}"
+opener_state_dir="${INTELLIJ_OPENER_STATE_DIR:-$HOME/.codex/state/intellij-projects}"
 opener_lock_dir="$opener_state_dir/opener.lock"
-opener_lock_timeout="${PYCHARM_OPENER_LOCK_TIMEOUT:-30}"
-reaper_command="${PYCHARM_PROJECT_REAPER_COMMAND:-$HOME/.codex/bin/pycharm-project-reaper}"
-project_trust_command="${PYCHARM_PROJECT_TRUST_COMMAND:-$HOME/.codex/bin/pycharm-project-trust}"
+opener_lock_timeout="${INTELLIJ_OPENER_LOCK_TIMEOUT:-30}"
+reaper_command="${INTELLIJ_PROJECT_REAPER_COMMAND:-$HOME/.codex/bin/intellij-project-reaper}"
+project_trust_command="${INTELLIJ_PROJECT_TRUST_COMMAND:-$HOME/.codex/bin/intellij-project-trust}"
 
 usage() {
-  print -u2 "Usage: open-codex-project-in-pycharm [--require-github] [PROJECT_DIR]"
+  print -u2 "Usage: open-codex-project-in-intellij [--require-github] [PROJECT_DIR]"
 }
 
 has_github_remote() {
@@ -25,7 +25,7 @@ has_github_remote() {
   git -C "$dir" remote -v 2>/dev/null | grep -Eq 'github\.com[:/]'
 }
 
-is_open_in_pycharm() {
+is_open_in_intellij() {
   local dir="$1"
 
   "$HOME/.codex/bin/serena-codex" jetbrains-service-status "$dir" >/dev/null 2>&1
@@ -56,7 +56,7 @@ lock_owner_is_live() {
   current_started="$(ps -p "$owner_pid" -o lstart= 2>/dev/null | sed 's/^ *//;s/ *$//' || true)"
   current_command="$(ps -p "$owner_pid" -o command= 2>/dev/null || true)"
   [[ "$current_started" == "$owner_started" \
-    && "$current_command" == *"open-codex-project-in-pycharm"* ]]
+    && "$current_command" == *"open-codex-project-in-intellij"* ]]
 }
 
 acquire_opener_lock() {
@@ -83,7 +83,7 @@ acquire_opener_lock() {
     sleep 0.1
   done
 
-  print -u2 "open-codex-project-in-pycharm: timed out waiting for opener lock: $opener_lock_dir"
+  print -u2 "open-codex-project-in-intellij: timed out waiting for opener lock: $opener_lock_dir"
   return 1
 }
 
@@ -94,14 +94,14 @@ wait_for_serena_service() {
   zmodload zsh/datetime
   deadline=$(( EPOCHREALTIME + ready_timeout ))
   while (( EPOCHREALTIME < deadline )); do
-    if is_open_in_pycharm "$dir"; then
-      print "open-codex-project-in-pycharm: Serena service ready: $dir"
+    if is_open_in_intellij "$dir"; then
+      print "open-codex-project-in-intellij: Serena service ready: $dir"
       return 0
     fi
     sleep "$ready_interval"
   done
 
-  print -u2 "open-codex-project-in-pycharm: timed out waiting for Serena service after ${ready_timeout}s: $dir"
+  print -u2 "open-codex-project-in-intellij: timed out waiting for Serena service after ${ready_timeout}s: $dir"
   return 1
 }
 
@@ -119,9 +119,9 @@ update_reaper_registry() {
       return 0
     fi
     if [[ "$confirmation" -eq 1 ]]; then
-      print -u2 "open-codex-project-in-pycharm: reaper reports root not present in PyCharm inventory: $dir"
+      print -u2 "open-codex-project-in-intellij: reaper reports root not present in IntelliJ inventory: $dir"
     else
-      print -u2 "open-codex-project-in-pycharm: reaper inventory confirmation unavailable: $dir"
+      print -u2 "open-codex-project-in-intellij: reaper inventory confirmation unavailable: $dir"
     fi
     return 1
   fi
@@ -133,36 +133,16 @@ update_reaper_registry() {
     return 0
   fi
   if [[ "$action" == register ]]; then
-    print -u2 "open-codex-project-in-pycharm: reaper $action failed; project ownership is ambiguous: $dir"
+    print -u2 "open-codex-project-in-intellij: reaper $action failed; project ownership is ambiguous: $dir"
     return 1
   fi
 }
 
-open_new_pycharm_window() {
+open_new_intellij_window() {
   local dir="$1"
 
-  if [[ -d "$pycharm_app_path" && -x "$pycharm_open_command" ]]; then
-    "$pycharm_open_command" -a "$pycharm_app_path" "$dir" >/dev/null 2>&1
-    return 0
-  fi
-
-  if command -v pycharm >/dev/null 2>&1; then
-    pycharm "$dir" >/dev/null 2>&1 &
-    return 0
-  fi
-
-  if command -v charm >/dev/null 2>&1; then
-    charm "$dir" >/dev/null 2>&1 &
-    return 0
-  fi
-
-  if [[ -d /Applications/PyCharm.app ]]; then
-    nohup /Applications/PyCharm.app/Contents/MacOS/pycharm "$dir" >/dev/null 2>&1 &
-    return 0
-  fi
-
-  if [[ -d "$HOME/Applications/PyCharm.app" ]]; then
-    nohup "$HOME/Applications/PyCharm.app/Contents/MacOS/pycharm" "$dir" >/dev/null 2>&1 &
+  if [[ -d "$intellij_app_path" && -x "$intellij_open_command" ]]; then
+    "$intellij_open_command" -a "$intellij_app_path" "$dir" >/dev/null 2>&1
     return 0
   fi
 
@@ -181,7 +161,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     --*)
       usage
-      print -u2 "open-codex-project-in-pycharm: unknown option: $1"
+      print -u2 "open-codex-project-in-intellij: unknown option: $1"
       exit 2
       ;;
     *)
@@ -192,7 +172,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ ! -d "$project_dir" ]]; then
-  print -u2 "open-codex-project-in-pycharm: not a directory: $project_dir"
+  print -u2 "open-codex-project-in-intellij: not a directory: $project_dir"
   exit 2
 fi
 
@@ -200,31 +180,31 @@ project_dir="$(cd "$project_dir" && pwd -P)"
 trap release_opener_lock EXIT INT TERM HUP
 
 if [[ "$require_github" == true ]] && ! has_github_remote "$project_dir"; then
-  print "open-codex-project-in-pycharm: skipped, no GitHub remote found for $project_dir"
+  print "open-codex-project-in-intellij: skipped, no GitHub remote found for $project_dir"
   exit 0
 fi
 
-if is_open_in_pycharm "$project_dir"; then
-  print "open-codex-project-in-pycharm: already open in PyCharm: $project_dir"
+if is_open_in_intellij "$project_dir"; then
+  print "open-codex-project-in-intellij: already open in IntelliJ: $project_dir"
   update_reaper_registry touch "$project_dir" || exit 1
   exit 0
 fi
 
 acquire_opener_lock || exit 2
 
-if is_open_in_pycharm "$project_dir"; then
-  print "open-codex-project-in-pycharm: already open in PyCharm: $project_dir"
+if is_open_in_intellij "$project_dir"; then
+  print "open-codex-project-in-intellij: already open in IntelliJ: $project_dir"
   update_reaper_registry touch "$project_dir" || exit 1
   exit 0
 fi
 
 if ! ensure_project_trusted "$project_dir"; then
-  print -u2 "open-codex-project-in-pycharm: failed to trust project before opening: $project_dir"
+  print -u2 "open-codex-project-in-intellij: failed to trust project before opening: $project_dir"
   exit 1
 fi
 
-if open_new_pycharm_window "$project_dir"; then
-  print "open-codex-project-in-pycharm: opened in a new PyCharm window: $project_dir"
+if open_new_intellij_window "$project_dir"; then
+  print "open-codex-project-in-intellij: opened in a new IntelliJ window: $project_dir"
   if wait_for_serena_service "$project_dir"; then
     update_reaper_registry register "$project_dir" || exit 1
     exit 0
@@ -234,5 +214,5 @@ if open_new_pycharm_window "$project_dir"; then
   fi
 fi
 
-print -u2 "open-codex-project-in-pycharm: PyCharm launcher or app bundle not found"
+print -u2 "open-codex-project-in-intellij: IntelliJ launcher or app bundle not found"
 exit 1

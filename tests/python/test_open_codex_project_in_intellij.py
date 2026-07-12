@@ -9,23 +9,30 @@ import unittest
 
 TEST_FILE = Path(__file__).resolve()
 ROOT = TEST_FILE.parent.parent if TEST_FILE.parent.name == "tests" else TEST_FILE.parents[2]
-HELPER = ROOT / "bin/open-codex-project-in-pycharm"
-DEFAULT_TRUST_COMMAND = Path(tempfile.gettempdir()) / "open-codex-project-in-pycharm-test-trust"
+HELPER = ROOT / "bin/open-codex-project-in-intellij"
+DEFAULT_TRUST_COMMAND = Path(tempfile.gettempdir()) / "open-codex-project-in-intellij-test-trust"
 DEFAULT_TRUST_COMMAND.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
 DEFAULT_TRUST_COMMAND.chmod(0o755)
-os.environ.setdefault("PYCHARM_PROJECT_TRUST_COMMAND", str(DEFAULT_TRUST_COMMAND))
+os.environ.setdefault("INTELLIJ_PROJECT_TRUST_COMMAND", str(DEFAULT_TRUST_COMMAND))
 
 
-class OpenCodexProjectInPycharmTests(unittest.TestCase):
+class OpenCodexProjectInIntellijTests(unittest.TestCase):
+    def test_default_launcher_is_only_the_toolbox_intellij_app(self) -> None:
+        script = HELPER.read_text(encoding="utf-8")
+        self.assertIn('$HOME/Applications/IntelliJ IDEA.app', script)
+        self.assertNotIn("command -v charm", script)
+        self.assertNotIn("command -v intellij", script)
+        self.assertNotIn(":-/Applications/IntelliJ IDEA.app", script)
+
     def test_registers_only_after_new_open_is_ready_and_fails_actionably(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory); project = root / "project"; project.mkdir()
-            app = root / "PyCharm.app"; app.mkdir(); home = root / "home"; bin_dir = home / ".codex/bin"; bin_dir.mkdir(parents=True)
+            app = root / "IntelliJ IDEA.app"; app.mkdir(); home = root / "home"; bin_dir = home / ".codex/bin"; bin_dir.mkdir(parents=True)
             log = root / "log"; ready = project / "ready"
             (bin_dir / "serena-codex").write_text(f"#!/bin/sh\n[ -f '{ready}' ]\n"); (bin_dir / "serena-codex").chmod(0o755)
-            (bin_dir / "pycharm-project-reaper").write_text(f"#!/bin/sh\nprintf '%s %s\\n' \"$1\" \"$2\" >> '{log}'\n"); (bin_dir / "pycharm-project-reaper").chmod(0o755)
+            (bin_dir / "intellij-project-reaper").write_text(f"#!/bin/sh\nprintf '%s %s\\n' \"$1\" \"$2\" >> '{log}'\n"); (bin_dir / "intellij-project-reaper").chmod(0o755)
             opener = root / "open"; opener.write_text(f"#!/bin/sh\ntouch '{ready}'\n"); opener.chmod(0o755)
-            env = os.environ | {"HOME": str(home), "PYCHARM_APP_PATH": str(app), "PYCHARM_OPEN_COMMAND": str(opener), "PYCHARM_SERENA_READY_INTERVAL": "0.01", "PYCHARM_SERENA_READY_TIMEOUT": "1"}
+            env = os.environ | {"HOME": str(home), "INTELLIJ_APP_PATH": str(app), "INTELLIJ_OPEN_COMMAND": str(opener), "INTELLIJ_SERENA_READY_INTERVAL": "0.01", "INTELLIJ_SERENA_READY_TIMEOUT": "1"}
             result = subprocess.run([str(HELPER), str(project)], capture_output=True, text=True, env=env, check=False)
             self.assertEqual(0, result.returncode, result.stderr); self.assertEqual(f"is-open {project.resolve()}\nregister {project.resolve()}\n", log.read_text())
 
@@ -33,19 +40,19 @@ class OpenCodexProjectInPycharmTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory); project = root / "project"; project.mkdir(); home = root / "home"; bin_dir = home / ".codex/bin"; bin_dir.mkdir(parents=True); log = root / "log"
             (bin_dir / "serena-codex").write_text("#!/bin/sh\nexit 0\n"); (bin_dir / "serena-codex").chmod(0o755)
-            (bin_dir / "pycharm-project-reaper").write_text(f"#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{log}'\nexit 1\n"); (bin_dir / "pycharm-project-reaper").chmod(0o755)
+            (bin_dir / "intellij-project-reaper").write_text(f"#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{log}'\nexit 1\n"); (bin_dir / "intellij-project-reaper").chmod(0o755)
             result = subprocess.run([str(HELPER), str(project)], capture_output=True, text=True, env=os.environ | {"HOME": str(home)}, check=False)
             self.assertEqual(0, result.returncode, result.stderr); self.assertEqual(f"is-open\n", log.read_text())
-    def test_reuses_pycharm_application_and_waits_for_exact_serena_service(self) -> None:
+    def test_reuses_intellij_application_and_waits_for_exact_serena_service(self) -> None:
         script = HELPER.read_text(encoding="utf-8")
-        self.assertIn("PYCHARM_APP_PATH", script, "helper lacks an injectable app path")
-        self.assertIn("PYCHARM_OPEN_COMMAND", script, "helper lacks an injectable open command")
+        self.assertIn("INTELLIJ_APP_PATH", script, "helper lacks an injectable app path")
+        self.assertIn("INTELLIJ_OPEN_COMMAND", script, "helper lacks an injectable open command")
 
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             project = root / "project"
             project.mkdir()
-            fake_app = root / "PyCharm.app"
+            fake_app = root / "IntelliJ IDEA.app"
             fake_app.mkdir()
             fake_home = root / "home"
             bin_dir = fake_home / ".codex/bin"
@@ -76,10 +83,10 @@ class OpenCodexProjectInPycharmTests(unittest.TestCase):
             environment.update(
                 {
                     "HOME": str(fake_home),
-                    "PYCHARM_APP_PATH": str(fake_app),
-                    "PYCHARM_OPEN_COMMAND": str(fake_open),
-                    "PYCHARM_SERENA_READY_INTERVAL": "0.01",
-                    "PYCHARM_SERENA_READY_TIMEOUT": "2",
+                    "INTELLIJ_APP_PATH": str(fake_app),
+                    "INTELLIJ_OPEN_COMMAND": str(fake_open),
+                    "INTELLIJ_SERENA_READY_INTERVAL": "0.01",
+                    "INTELLIJ_SERENA_READY_TIMEOUT": "2",
                 }
             )
             result = subprocess.run(
@@ -102,27 +109,27 @@ class OpenCodexProjectInPycharmTests(unittest.TestCase):
     def test_reaper_absent_or_unknown_blocks_registration_without_registering(self) -> None:
         for confirmation, expected in [("exit 1", "not present"), ("exit 2", "unavailable")]:
             with self.subTest(confirmation=confirmation), tempfile.TemporaryDirectory() as temporary_directory:
-                root = Path(temporary_directory); project = root / "project"; project.mkdir(); app = root / "PyCharm.app"; app.mkdir(); home = root / "home"; bin_dir = home / ".codex/bin"; bin_dir.mkdir(parents=True); log = root / "log"; ready = project / "ready"
+                root = Path(temporary_directory); project = root / "project"; project.mkdir(); app = root / "IntelliJ IDEA.app"; app.mkdir(); home = root / "home"; bin_dir = home / ".codex/bin"; bin_dir.mkdir(parents=True); log = root / "log"; ready = project / "ready"
                 (bin_dir / "serena-codex").write_text(f"#!/bin/sh\n[ -f '{ready}' ]\n"); (bin_dir / "serena-codex").chmod(0o755)
-                (bin_dir / "pycharm-project-reaper").write_text(f"#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{log}'\n[ \"$1\" = is-open ] && {confirmation}\nexit 0\n"); (bin_dir / "pycharm-project-reaper").chmod(0o755)
+                (bin_dir / "intellij-project-reaper").write_text(f"#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{log}'\n[ \"$1\" = is-open ] && {confirmation}\nexit 0\n"); (bin_dir / "intellij-project-reaper").chmod(0o755)
                 opener = root / "open"; opener.write_text(f"#!/bin/sh\ntouch '{ready}'\n"); opener.chmod(0o755)
-                result = subprocess.run([str(HELPER), str(project)], capture_output=True, text=True, env=os.environ | {"HOME": str(home), "PYCHARM_APP_PATH": str(app), "PYCHARM_OPEN_COMMAND": str(opener), "PYCHARM_SERENA_READY_INTERVAL": "0.01", "PYCHARM_SERENA_READY_TIMEOUT": "1"}, check=False)
+                result = subprocess.run([str(HELPER), str(project)], capture_output=True, text=True, env=os.environ | {"HOME": str(home), "INTELLIJ_APP_PATH": str(app), "INTELLIJ_OPEN_COMMAND": str(opener), "INTELLIJ_SERENA_READY_INTERVAL": "0.01", "INTELLIJ_SERENA_READY_TIMEOUT": "1"}, check=False)
                 self.assertEqual(1, result.returncode); self.assertIn(expected, result.stderr); self.assertEqual("is-open\n", log.read_text())
 
     def test_launcher_never_forces_a_new_macos_application_instance(self) -> None:
         script = HELPER.read_text(encoding="utf-8")
 
-        self.assertNotIn('"$pycharm_open_command" -n', script)
+        self.assertNotIn('"$intellij_open_command" -n', script)
 
     def test_times_out_when_serena_service_never_becomes_ready(self) -> None:
         script = HELPER.read_text(encoding="utf-8")
-        self.assertIn("PYCHARM_APP_PATH", script, "helper lacks an injectable app path")
+        self.assertIn("INTELLIJ_APP_PATH", script, "helper lacks an injectable app path")
 
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             project = root / "project"
             project.mkdir()
-            fake_app = root / "PyCharm.app"
+            fake_app = root / "IntelliJ IDEA.app"
             fake_app.mkdir()
             fake_home = root / "home"
             bin_dir = fake_home / ".codex/bin"
@@ -139,10 +146,10 @@ class OpenCodexProjectInPycharmTests(unittest.TestCase):
             environment.update(
                 {
                     "HOME": str(fake_home),
-                    "PYCHARM_APP_PATH": str(fake_app),
-                    "PYCHARM_OPEN_COMMAND": str(fake_open),
-                    "PYCHARM_SERENA_READY_INTERVAL": "0.01",
-                    "PYCHARM_SERENA_READY_TIMEOUT": "0.05",
+                    "INTELLIJ_APP_PATH": str(fake_app),
+                    "INTELLIJ_OPEN_COMMAND": str(fake_open),
+                    "INTELLIJ_SERENA_READY_INTERVAL": "0.01",
+                    "INTELLIJ_SERENA_READY_TIMEOUT": "0.05",
                 }
             )
             result = subprocess.run(
@@ -162,7 +169,7 @@ class OpenCodexProjectInPycharmTests(unittest.TestCase):
             root = Path(temporary_directory)
             project = root / "project"
             project.mkdir()
-            fake_app = root / "PyCharm.app"
+            fake_app = root / "IntelliJ IDEA.app"
             fake_app.mkdir()
             fake_home = root / "home"
             bin_dir = fake_home / ".codex/bin"
@@ -203,11 +210,11 @@ class OpenCodexProjectInPycharmTests(unittest.TestCase):
             environment.update(
                 {
                     "HOME": str(fake_home),
-                    "PYCHARM_APP_PATH": str(fake_app),
-                    "PYCHARM_OPEN_COMMAND": str(fake_open),
-                    "PYCHARM_OPENER_STATE_DIR": str(state_dir),
-                    "PYCHARM_SERENA_READY_INTERVAL": "0.01",
-                    "PYCHARM_SERENA_READY_TIMEOUT": "2",
+                    "INTELLIJ_APP_PATH": str(fake_app),
+                    "INTELLIJ_OPEN_COMMAND": str(fake_open),
+                    "INTELLIJ_OPENER_STATE_DIR": str(state_dir),
+                    "INTELLIJ_SERENA_READY_INTERVAL": "0.01",
+                    "INTELLIJ_SERENA_READY_TIMEOUT": "2",
                 }
             )
 
@@ -232,8 +239,8 @@ class OpenCodexProjectInPycharmTests(unittest.TestCase):
             environment = os.environ.copy()
             environment.update(
                 {
-                    "PYCHARM_OPENER_STATE_DIR": str(root / "state"),
-                    "PYCHARM_OPENER_LOCK_TIMEOUT": "0.2",
+                    "INTELLIJ_OPENER_STATE_DIR": str(root / "state"),
+                    "INTELLIJ_OPENER_LOCK_TIMEOUT": "0.2",
                 }
             )
 
@@ -252,7 +259,7 @@ class OpenCodexProjectInPycharmTests(unittest.TestCase):
             root = Path(temporary_directory)
             project = root / "project"
             project.mkdir()
-            fake_app = root / "PyCharm.app"
+            fake_app = root / "IntelliJ IDEA.app"
             fake_app.mkdir()
             fake_home = root / "home"
             bin_dir = fake_home / ".codex/bin"
@@ -287,12 +294,12 @@ class OpenCodexProjectInPycharmTests(unittest.TestCase):
             environment.update(
                 {
                     "HOME": str(fake_home),
-                    "PYCHARM_APP_PATH": str(fake_app),
-                    "PYCHARM_OPEN_COMMAND": str(fake_open),
-                    "PYCHARM_OPENER_STATE_DIR": str(state_dir),
-                    "PYCHARM_OPENER_LOCK_TIMEOUT": "0.2",
-                    "PYCHARM_SERENA_READY_INTERVAL": "0.01",
-                    "PYCHARM_SERENA_READY_TIMEOUT": "0.2",
+                    "INTELLIJ_APP_PATH": str(fake_app),
+                    "INTELLIJ_OPEN_COMMAND": str(fake_open),
+                    "INTELLIJ_OPENER_STATE_DIR": str(state_dir),
+                    "INTELLIJ_OPENER_LOCK_TIMEOUT": "0.2",
+                    "INTELLIJ_SERENA_READY_INTERVAL": "0.01",
+                    "INTELLIJ_SERENA_READY_TIMEOUT": "0.2",
                 }
             )
 
@@ -327,7 +334,7 @@ class OpenCodexProjectInPycharmTests(unittest.TestCase):
             root = Path(temporary_directory)
             project = root / "project"
             project.mkdir()
-            fake_app = root / "PyCharm.app"
+            fake_app = root / "IntelliJ IDEA.app"
             fake_app.mkdir()
             fake_home = root / "home"
             bin_dir = fake_home / ".codex/bin"
@@ -355,11 +362,11 @@ class OpenCodexProjectInPycharmTests(unittest.TestCase):
             environment.update(
                 {
                     "HOME": str(fake_home),
-                    "PYCHARM_APP_PATH": str(fake_app),
-                    "PYCHARM_OPEN_COMMAND": str(fake_open),
-                    "PYCHARM_OPENER_STATE_DIR": str(root / "state"),
-                    "PYCHARM_SERENA_READY_INTERVAL": "0.01",
-                    "PYCHARM_SERENA_READY_TIMEOUT": "2",
+                    "INTELLIJ_APP_PATH": str(fake_app),
+                    "INTELLIJ_OPEN_COMMAND": str(fake_open),
+                    "INTELLIJ_OPENER_STATE_DIR": str(root / "state"),
+                    "INTELLIJ_SERENA_READY_INTERVAL": "0.01",
+                    "INTELLIJ_SERENA_READY_TIMEOUT": "2",
                 }
             )
 
@@ -377,7 +384,7 @@ class OpenCodexProjectInPycharmTests(unittest.TestCase):
             self.assertEqual([0, 0], sorted([first.returncode, second.returncode]))
             self.assertEqual([str(project.resolve())], open_log.read_text().splitlines())
             self.assertTrue(
-                "already open in PyCharm" in first_stdout + second_stdout
+                "already open in IntelliJ" in first_stdout + second_stdout
                 or "Serena service ready" in first_stdout + second_stdout
             )
             self.assertEqual("", first_stderr + second_stderr)
@@ -389,7 +396,7 @@ class OpenCodexProjectInPycharmTests(unittest.TestCase):
             second_project = root / "second-project"
             first_project.mkdir()
             second_project.mkdir()
-            fake_app = root / "PyCharm.app"
+            fake_app = root / "IntelliJ IDEA.app"
             fake_app.mkdir()
             fake_home = root / "home"
             bin_dir = fake_home / ".codex/bin"
@@ -421,11 +428,11 @@ class OpenCodexProjectInPycharmTests(unittest.TestCase):
             environment.update(
                 {
                     "HOME": str(fake_home),
-                    "PYCHARM_APP_PATH": str(fake_app),
-                    "PYCHARM_OPEN_COMMAND": str(fake_open),
-                    "PYCHARM_OPENER_STATE_DIR": str(root / "state"),
-                    "PYCHARM_SERENA_READY_INTERVAL": "0.01",
-                    "PYCHARM_SERENA_READY_TIMEOUT": "2",
+                    "INTELLIJ_APP_PATH": str(fake_app),
+                    "INTELLIJ_OPEN_COMMAND": str(fake_open),
+                    "INTELLIJ_OPENER_STATE_DIR": str(root / "state"),
+                    "INTELLIJ_SERENA_READY_INTERVAL": "0.01",
+                    "INTELLIJ_SERENA_READY_TIMEOUT": "2",
                 }
             )
 
@@ -448,14 +455,14 @@ class OpenCodexProjectInPycharmTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory); project = root / "project"; project.mkdir()
             home = root / "home"; bin_dir = home / ".codex/bin"; bin_dir.mkdir(parents=True)
-            app = root / "PyCharm.app"; app.mkdir(); log = root / "log"
+            app = root / "IntelliJ IDEA.app"; app.mkdir(); log = root / "log"
             (bin_dir / "serena-codex").write_text("#!/bin/sh\n[ -f \"$2/ready\" ]\n")
             (bin_dir / "serena-codex").chmod(0o755)
-            (bin_dir / "pycharm-project-reaper").write_text(f"#!/bin/sh\n[ \"$1\" = is-open ] && exit 0\nprintf 'register\\n' >> '{log}'\n")
-            (bin_dir / "pycharm-project-reaper").chmod(0o755)
+            (bin_dir / "intellij-project-reaper").write_text(f"#!/bin/sh\n[ \"$1\" = is-open ] && exit 0\nprintf 'register\\n' >> '{log}'\n")
+            (bin_dir / "intellij-project-reaper").chmod(0o755)
             trust = root / "trust"; trust.write_text(f"#!/bin/sh\nprintf 'trust %s %s\\n' \"$1\" \"$2\" >> '{log}'\n"); trust.chmod(0o755)
             opener = root / "open"; opener.write_text(f"#!/bin/sh\nprintf 'open\\n' >> '{log}'\ntouch \"$3/ready\"\n"); opener.chmod(0o755)
-            env = os.environ | {"HOME": str(home), "PYCHARM_APP_PATH": str(app), "PYCHARM_OPEN_COMMAND": str(opener), "PYCHARM_PROJECT_TRUST_COMMAND": str(trust), "PYCHARM_SERENA_READY_INTERVAL": "0.01", "PYCHARM_SERENA_READY_TIMEOUT": "1"}
+            env = os.environ | {"HOME": str(home), "INTELLIJ_APP_PATH": str(app), "INTELLIJ_OPEN_COMMAND": str(opener), "INTELLIJ_PROJECT_TRUST_COMMAND": str(trust), "INTELLIJ_SERENA_READY_INTERVAL": "0.01", "INTELLIJ_SERENA_READY_TIMEOUT": "1"}
             result = subprocess.run([str(HELPER), str(project)], capture_output=True, text=True, env=env, check=False)
             self.assertEqual(0, result.returncode, result.stderr)
             self.assertEqual([f"trust allow {project.resolve()}", "open", "register"], log.read_text().splitlines())
@@ -464,12 +471,12 @@ class OpenCodexProjectInPycharmTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory); project = root / "project"; project.mkdir()
             home = root / "home"; bin_dir = home / ".codex/bin"; bin_dir.mkdir(parents=True)
-            app = root / "PyCharm.app"; app.mkdir(); log = root / "log"
+            app = root / "IntelliJ IDEA.app"; app.mkdir(); log = root / "log"
             (bin_dir / "serena-codex").write_text("#!/bin/sh\nexit 1\n"); (bin_dir / "serena-codex").chmod(0o755)
-            (bin_dir / "pycharm-project-reaper").write_text(f"#!/bin/sh\nprintf 'reaper\\n' >> '{log}'\n"); (bin_dir / "pycharm-project-reaper").chmod(0o755)
+            (bin_dir / "intellij-project-reaper").write_text(f"#!/bin/sh\nprintf 'reaper\\n' >> '{log}'\n"); (bin_dir / "intellij-project-reaper").chmod(0o755)
             trust = root / "trust"; trust.write_text(f"#!/bin/sh\nprintf 'trust %s %s\\n' \"$1\" \"$2\" >> '{log}'\nexit 2\n"); trust.chmod(0o755)
             opener = root / "open"; opener.write_text(f"#!/bin/sh\nprintf 'open\\n' >> '{log}'\n"); opener.chmod(0o755)
-            env = os.environ | {"HOME": str(home), "PYCHARM_APP_PATH": str(app), "PYCHARM_OPEN_COMMAND": str(opener), "PYCHARM_PROJECT_TRUST_COMMAND": str(trust)}
+            env = os.environ | {"HOME": str(home), "INTELLIJ_APP_PATH": str(app), "INTELLIJ_OPEN_COMMAND": str(opener), "INTELLIJ_PROJECT_TRUST_COMMAND": str(trust)}
             result = subprocess.run([str(HELPER), str(project)], capture_output=True, text=True, env=env, check=False)
             self.assertEqual(1, result.returncode)
             self.assertEqual([f"trust allow {project.resolve()}"], log.read_text().splitlines())
@@ -480,7 +487,7 @@ class OpenCodexProjectInPycharmTests(unittest.TestCase):
             home = root / "home"; bin_dir = home / ".codex/bin"; bin_dir.mkdir(parents=True); log = root / "log"
             (bin_dir / "serena-codex").write_text("#!/bin/sh\nexit 0\n"); (bin_dir / "serena-codex").chmod(0o755)
             trust = root / "trust"; trust.write_text(f"#!/bin/sh\nprintf 'trust\\n' >> '{log}'\nexit 2\n"); trust.chmod(0o755)
-            env = os.environ | {"HOME": str(home), "PYCHARM_PROJECT_TRUST_COMMAND": str(trust)}
+            env = os.environ | {"HOME": str(home), "INTELLIJ_PROJECT_TRUST_COMMAND": str(trust)}
             result = subprocess.run([str(HELPER), str(project)], capture_output=True, text=True, env=env, check=False)
             self.assertEqual(0, result.returncode, result.stderr)
             self.assertFalse(log.exists())

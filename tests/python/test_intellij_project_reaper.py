@@ -13,7 +13,7 @@ from pathlib import Path
 
 TEST_FILE = Path(__file__).resolve()
 ROOT = TEST_FILE.parent.parent if TEST_FILE.parent.name == "tests" else TEST_FILE.parents[2]
-SCRIPT = str(ROOT / "bin" / "pycharm-project-reaper")
+SCRIPT = str(ROOT / "bin" / "intellij-project-reaper")
 loader = importlib.machinery.SourceFileLoader("reaper", SCRIPT)
 spec = importlib.util.spec_from_loader(loader.name, loader)
 reaper = importlib.util.module_from_spec(spec)
@@ -26,6 +26,12 @@ class RegistryTests(unittest.TestCase):
         self.state = Path(self.tmp.name) / "managed.json"
 
     def tearDown(self): self.tmp.cleanup()
+
+    def test_defaults_never_read_pycharm_state(self):
+        with patch.dict(os.environ, {}, clear=True):
+            config = reaper.environment()
+        self.assertIn("intellij-projects", str(config["state"]))
+        self.assertNotIn("pycharm-projects", str(config["state"]))
 
     def test_register_deduplicates_canonical_root_and_writes_private_atomically(self):
         root = Path(self.tmp.name) / "project"; root.mkdir()
@@ -46,9 +52,9 @@ class RegistryTests(unittest.TestCase):
     def test_python39_cleanup_quarantines_malformed_isolated_registry(self):
         self.state.write_text("not json")
         environment = os.environ | {
-            "PYCHARM_PROJECT_REAPER_STATE_FILE": str(self.state),
-            "PYCHARM_PROJECT_REAPER_RUNTIME_FILE": str(Path(self.tmp.name) / "missing-runtime.json"),
-            "PYCHARM_PROJECT_REAPER_BROKER_COMMAND": str(Path(self.tmp.name) / "missing-broker"),
+            "INTELLIJ_PROJECT_REAPER_STATE_FILE": str(self.state),
+            "INTELLIJ_PROJECT_REAPER_RUNTIME_FILE": str(Path(self.tmp.name) / "missing-runtime.json"),
+            "INTELLIJ_PROJECT_REAPER_BROKER_COMMAND": str(Path(self.tmp.name) / "missing-broker"),
         }
         completed = subprocess.run(
             ["/usr/bin/python3", SCRIPT, "cleanup"],
@@ -71,9 +77,9 @@ class RegistryTests(unittest.TestCase):
             with self.subTest(registry=registry):
                 self.state.write_text(json.dumps(registry))
                 environment = os.environ | {
-                    "PYCHARM_PROJECT_REAPER_STATE_FILE": str(self.state),
-                    "PYCHARM_PROJECT_REAPER_RUNTIME_FILE": str(Path(self.tmp.name) / "invalid-runtime.json"),
-                    "PYCHARM_PROJECT_REAPER_BROKER_COMMAND": str(Path(self.tmp.name) / "missing-broker"),
+                    "INTELLIJ_PROJECT_REAPER_STATE_FILE": str(self.state),
+                    "INTELLIJ_PROJECT_REAPER_RUNTIME_FILE": str(Path(self.tmp.name) / "invalid-runtime.json"),
+                    "INTELLIJ_PROJECT_REAPER_BROKER_COMMAND": str(Path(self.tmp.name) / "missing-broker"),
                 }
                 completed = subprocess.run(
                     ["/usr/bin/python3", SCRIPT, "cleanup"],
@@ -125,9 +131,9 @@ class RegistryTests(unittest.TestCase):
             with self.subTest(record=record):
                 self.state.write_text(json.dumps({"schemaVersion": 1, "projects": [record]}))
                 environment = os.environ | {
-                    "PYCHARM_PROJECT_REAPER_STATE_FILE": str(self.state),
-                    "PYCHARM_PROJECT_REAPER_RUNTIME_FILE": str(Path(self.tmp.name) / "invalid-runtime.json"),
-                    "PYCHARM_PROJECT_REAPER_BROKER_COMMAND": str(Path(self.tmp.name) / "missing-broker"),
+                    "INTELLIJ_PROJECT_REAPER_STATE_FILE": str(self.state),
+                    "INTELLIJ_PROJECT_REAPER_RUNTIME_FILE": str(Path(self.tmp.name) / "invalid-runtime.json"),
+                    "INTELLIJ_PROJECT_REAPER_BROKER_COMMAND": str(Path(self.tmp.name) / "missing-broker"),
                 }
                 completed = subprocess.run(
                     ["/usr/bin/python3", SCRIPT, "cleanup"],
@@ -156,13 +162,13 @@ class PolicyTests(unittest.TestCase):
         with self.assertRaises(ValueError): reaper.project_status({"projects": [body["projects"][0] | {"safeToClose": True, "reasons": ["unsaved-documents"]}]})
 
     def test_invalid_integration_overrides_fail_closed_before_requests(self):
-        for name, value in [("PYCHARM_PROJECT_REAPER_CAP", "-1"), ("PYCHARM_PROJECT_REAPER_IDLE_SECONDS", "-1"), ("PYCHARM_PROJECT_REAPER_IDLE_SECONDS", "bad"), ("PYCHARM_PROJECT_REAPER_STATE_FILE", "relative"), ("PYCHARM_PROJECT_REAPER_RUNTIME_FILE", "relative"), ("PYCHARM_PROJECT_REAPER_BROKER_COMMAND", "relative")]:
+        for name, value in [("INTELLIJ_PROJECT_REAPER_CAP", "-1"), ("INTELLIJ_PROJECT_REAPER_IDLE_SECONDS", "-1"), ("INTELLIJ_PROJECT_REAPER_IDLE_SECONDS", "bad"), ("INTELLIJ_PROJECT_REAPER_STATE_FILE", "relative"), ("INTELLIJ_PROJECT_REAPER_RUNTIME_FILE", "relative"), ("INTELLIJ_PROJECT_REAPER_BROKER_COMMAND", "relative")]:
             with patch.dict(os.environ, {name: value}, clear=False), patch.object(reaper, "http_request") as request:
                 self.assertEqual(2, reaper.main_with_environment(["cleanup"]))
                 request.assert_not_called()
 
     def test_zero_cap_and_idle_overrides_are_valid_for_isolated_one_shot_cleanup(self):
-        with patch.dict(os.environ, {"PYCHARM_PROJECT_REAPER_CAP": "0", "PYCHARM_PROJECT_REAPER_IDLE_SECONDS": "0"}, clear=True):
+        with patch.dict(os.environ, {"INTELLIJ_PROJECT_REAPER_CAP": "0", "INTELLIJ_PROJECT_REAPER_IDLE_SECONDS": "0"}, clear=True):
             config = reaper.environment()
         self.assertEqual(0, config["cap"])
         self.assertEqual(0, config["idle"])
@@ -227,7 +233,7 @@ class ClientTests(unittest.TestCase):
                 patch.object(reaper, "runtime_client", return_value={"token": "t"}), \
                 patch.object(reaper, "plugin_inventory", return_value=plugin), \
                 patch.object(reaper, "broker_live_roots", return_value=set()), \
-                patch.dict(os.environ, {"PYCHARM_PROJECT_REAPER_IDLE_SECONDS": "0"}, clear=True), \
+                patch.dict(os.environ, {"INTELLIJ_PROJECT_REAPER_IDLE_SECONDS": "0"}, clear=True), \
                 patch("sys.stdout", output):
             self.assertEqual(0, reaper.main_with_environment(["status", "--json"]))
         result = json.loads(output.getvalue())
@@ -288,7 +294,7 @@ class ClientTests(unittest.TestCase):
                 patch.object(reaper, "plugin_inventory", return_value=plugin), \
                 patch.object(reaper, "broker_live_roots", side_effect=[set(), {root}]), \
                 patch.object(reaper, "close_verified", close), \
-                patch.dict(os.environ, {"PYCHARM_PROJECT_REAPER_CAP": "0", "PYCHARM_PROJECT_REAPER_IDLE_SECONDS": "0"}, clear=True), \
+                patch.dict(os.environ, {"INTELLIJ_PROJECT_REAPER_CAP": "0", "INTELLIJ_PROJECT_REAPER_IDLE_SECONDS": "0"}, clear=True), \
                 patch("sys.stdout", output):
             self.assertEqual(0, reaper.main_with_environment(["cleanup"]))
         close.assert_not_called()
@@ -302,7 +308,7 @@ class ClientTests(unittest.TestCase):
                 patch.object(reaper, "plugin_inventory", side_effect=[{root: {"safe": True}}, {root: {"safe": False}}]), \
                 patch.object(reaper, "broker_live_roots", return_value=set()), \
                 patch.object(reaper, "close_verified", close), \
-                patch.dict(os.environ, {"PYCHARM_PROJECT_REAPER_CAP": "0", "PYCHARM_PROJECT_REAPER_IDLE_SECONDS": "0"}, clear=True), \
+                patch.dict(os.environ, {"INTELLIJ_PROJECT_REAPER_CAP": "0", "INTELLIJ_PROJECT_REAPER_IDLE_SECONDS": "0"}, clear=True), \
                 patch("sys.stdout", io.StringIO()):
             self.assertEqual(0, reaper.main_with_environment(["cleanup"]))
         close.assert_not_called()
@@ -324,7 +330,7 @@ class ClientTests(unittest.TestCase):
                     patch.object(reaper, "plugin_inventory", return_value=plugin), \
                     patch.object(reaper, "broker_live_roots", return_value=set()), \
                     patch.object(reaper, "close_verified", side_effect=close_and_reregister), \
-                    patch.dict(os.environ, {"PYCHARM_PROJECT_REAPER_STATE_FILE": str(state), "PYCHARM_PROJECT_REAPER_CAP": "0", "PYCHARM_PROJECT_REAPER_IDLE_SECONDS": "0"}, clear=True), \
+                    patch.dict(os.environ, {"INTELLIJ_PROJECT_REAPER_STATE_FILE": str(state), "INTELLIJ_PROJECT_REAPER_CAP": "0", "INTELLIJ_PROJECT_REAPER_IDLE_SECONDS": "0"}, clear=True), \
                     patch("sys.stdout", io.StringIO()):
                 self.assertEqual(0, reaper.main_with_environment(["cleanup"]))
             projects = reaper.load_registry(state)[0]["projects"]
