@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""Safely manage exact Git roots in PyCharm's trusted-paths registry."""
+import fcntl
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+
+def canonical_git_root(value: str, allowed: tuple[Path, ...]) -> Path:
+    """Return value's canonical Git top-level only when it is allowlisted exactly."""
+    requested = Path(value).expanduser().resolve(strict=True)
+    if not requested.is_dir():
+        raise ValueError("root is not a directory")
+    try:
+        output = subprocess.check_output(
+            ["git", "-C", str(requested), "rev-parse", "--show-toplevel"],
+            stderr=subprocess.DEVNULL, text=True,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise ValueError("root is not a Git repository") from error
+    root = Path(output).resolve(strict=True)
+    if root != requested:
+        raise ValueError("root must be the exact Git top level")
+    for parent in allowed:
+        try:
+            root.relative_to(parent.resolve(strict=True))
+            return root
+        except ValueError:
+            continue
+    raise ValueError("root is outside allowed parents")
+
+
+def _empty_tree() -> ET.ElementTree:
+    root = ET.Element("application")
+    component = ET.SubElement(root, "component", {"name": "Trusted.Paths"})
+    option = ET.SubElement(component, "option", {"name": "TRUSTED_PATHS"})
+    ET.SubElement(option, "map")
+    return ET.ElementTree(root)
+
+
+def _trust_map(tree: ET.ElementTree) -> ET.Element:
+    for component in tree.getroot().findall(".//component"):
+        if component.get("name") == "Trusted.Paths":
+            for option in component.findall("option"):
+                if option.get("name") == "TRUSTED_PATHS":
+                    found = option.find("map")
+                    if found is not None:
+                        return found
+                    return ET.SubElement(option, "map")
+    component = ET.SubElement(tree.getroot(), "component", {"name": "Trusted.Paths"})
+    option = ET.SubElement(component, "option", {"name": "TRUSTED_PATHS"})
+    return ET.SubElement(option, "map")
+
+
+def load_entries(path: Path) -> tuple[ET.ElementTree, dict[str, bool]]:
+    """Read a registry without mutating it; a missing registry is an empty one."""
+    if not path.exists():
+        return _empty_tree(), {}
+    tree = ET.parse(path)
+    entries: dict[str, bool] = {}
+    for entry in _trust_map(tree).findall("entry"):
+        key = entry.get("key")
+        if key is not None:
+            entries[key] = entry.get("value", "true").lower() == "true"
+    return tree, entries
+
+
+def encode_path(path: Path, home: Path | None = None) -> str:
+    path = path.resolve()
+    home = (home or Path.home()).resolve()
+    try:
+        suffix = path.relative_to(home)
+    except ValueError:
+        return str(path)
+    return "$USER_HOME$" if suffix == Path(".") else "$USER_HOME$/" + suffix.as_posix()
+
+
+def trust_status(root: Path, entries: dict[str, bool]) -> str:
+    return "trusted" if entries.get(encode_path(root), False) else "untrusted"
+
+
+def _decode_path(value: str, home: Path) -> Path | None:
+    if value == "$USER_HOME$":
+        return home
+    if value.startswith("$USER_HOME$/"):
+        return home / value[len("$USER_HOME$/"):]
+    if value.startswith("/"):
+        return Path(value)
+    return None
+
+
+def _allowed() -> tuple[Path, ...]:
+    raw = os.environ.get("PYCHARM_TRUST_ALLOWED_ROOTS", "")
+    if not raw:
+        raise RuntimeError("PYCHARM_TRUST_ALLOWED_ROOTS is required")
+    return tuple(Path(item).expanduser() for item in raw.split(os.pathsep) if item)
+
+
+def _config() -> Path:
+    raw = os.environ.get("PYCHARM_TRUST_CONFIG_FILE")
+    if not raw:
+        raise RuntimeError("PYCHARM_TRUST_CONFIG_FILE is required")
+    return Path(raw).expanduser()
+
+
+def _timeout() -> float:
+    try:
+        return float(os.environ.get("PYCHARM_TRUST_LOCK_TIMEOUT", "5"))
+    except ValueError as error:
+        raise RuntimeError("invalid PYCHARM_TRUST_LOCK_TIMEOUT") from error
+
+
+def allow(root: Path, config: Path) -> None:
+    config.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lock_path = config.with_name(config.name + ".lock")
+    with lock_path.open("a+") as lock:
+        deadline = time.monotonic() + _timeout()
+        while True:
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("timed out waiting for registry lock")
+                time.sleep(0.02)
+        try:
+            tree, entries = load_entries(config)
+            key = encode_path(root)
+            if entries.get(key) is True:
+                return
+            trust_map = _trust_map(tree)
+            entry = next((node for node in trust_map.findall("entry") if node.get("key") == key), None)
+            if entry is None:
+                ET.SubElement(trust_map, "entry", {"key": key, "value": "true"})
+            else:
+                entry.set("value", "true")
+            if config.exists():
+                backup = config.with_name(config.name + ".bak-" + time.strftime("%Y%m%d%H%M%S"))
+                backup.write_bytes(config.read_bytes())
+                os.chmod(backup, 0o600)
+            fd, temporary = tempfile.mkstemp(prefix=config.name + ".", dir=config.parent)
+            try:
+                os.fchmod(fd, 0o600)
+                with os.fdopen(fd, "wb") as handle:
+                    tree.write(handle, encoding="utf-8", xml_declaration=True)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, config)
+                os.chmod(config, 0o600)
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def audit(config: Path, allowed: tuple[Path, ...]) -> dict[str, list[str] | bool]:
+    try:
+        _, entries = load_entries(config)
+    except (OSError, ET.ParseError):
+        return {"exact": [], "broad": [], "outsideAllowed": [], "malformed": True}
+    result: dict[str, list[str] | bool] = {"exact": [], "broad": [], "outsideAllowed": [], "malformed": False}
+    for value, enabled in entries.items():
+        if not enabled:
+            continue
+        decoded = _decode_path(value, Path.home())
+        if decoded is None:
+            result["outsideAllowed"].append(value)  # type: ignore[index]
+            continue
+        try:
+            resolved = decoded.resolve(strict=True)
+            exact = canonical_git_root(str(resolved), allowed) == resolved
+            if exact:
+                result["exact"].append(value)  # type: ignore[index]
+            else:
+                result["broad"].append(value)  # type: ignore[index]
+        except (OSError, ValueError):
+            try:
+                if any(parent.resolve(strict=True).is_relative_to(decoded.resolve()) for parent in allowed):
+                    result["broad"].append(value)  # type: ignore[index]
+                else:
+                    result["outsideAllowed"].append(value)  # type: ignore[index]
+            except OSError:
+                result["outsideAllowed"].append(value)  # type: ignore[index]
+    return result
+
+
+def main(argv: list[str]) -> int:
+    if not argv or argv[0] not in {"allow", "status", "audit"} or (argv[0] == "audit" and len(argv) != 1) or (argv[0] != "audit" and len(argv) != 2):
+        return 2
+    try:
+        config, allowed = _config(), _allowed()
+        if argv[0] == "audit":
+            print(json.dumps(audit(config, allowed), sort_keys=True))
+            return 2 if audit(config, allowed)["malformed"] else 0
+        root = canonical_git_root(argv[1], allowed)
+        tree, entries = load_entries(config)
+        if argv[0] == "status":
+            print(trust_status(root, entries))
+            return 0 if trust_status(root, entries) == "trusted" else 1
+        allow(root, config)
+        return 0
+    except (OSError, RuntimeError, ET.ParseError, ValueError):
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
