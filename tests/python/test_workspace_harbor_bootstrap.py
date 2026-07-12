@@ -175,6 +175,28 @@ class BootstrapPlansTests(unittest.TestCase):
         with patch.object(bootstrap.subprocess, "run", side_effect=git_common), patch.dict(os.environ, {"WORKSPACE_HARBOR_BOOTSTRAP_STATE_DIR": str(state)}, clear=False):
             bootstrap.record_decision(self.root, "tracking", "current", "local")
             self.assertEqual("local", bootstrap.repository_decisions(sibling)["tracking:current"]["decision"])
+
+    def test_language_decision_expires_when_evidence_changes_and_state_records_are_strict(self):
+        state = Path(self.tmp.name) / "state"; self.write("src/main.rs", "fn main() {}")
+        with patch.dict(os.environ, {"WORKSPACE_HARBOR_BOOTSTRAP_STATE_DIR": str(state)}, clear=False):
+            bootstrap.record_decision(self.root, "language", "rust", "ignore")
+            self.assertEqual("ignore", bootstrap.language_decision(self.root, "rust"))
+            self.write("Cargo.toml", ""); self.write("Cargo.lock", "")
+            self.assertIsNone(bootstrap.language_decision(self.root, "rust"))
+            record = next((state / "repositories").glob("*.json")); record.write_text('{"version":1,"decisions":{"language:rust":{"decision":"bad","evidence":"x"}}}')
+            with self.assertRaises(ValueError): bootstrap.repository_decisions(self.root)
+
+    def test_command_approval_digest_covers_declared_inputs_and_markers_and_lock_is_separate(self):
+        state = Path(self.tmp.name) / "state"; self.write("setup.lock", "one")
+        self.write(".serena/codex-integration.yml", "bootstrap:\n  command: {argv: [tool, setup], inputs: [setup.lock], markers: [.ready]}\n")
+        with patch.dict(os.environ, {"WORKSPACE_HARBOR_BOOTSTRAP_STATE_DIR": str(state)}, clear=False):
+            bootstrap.record_decision(self.root, "command", "current", "approve")
+            first = bootstrap.repository_decisions(self.root)["command:current"]["evidence"]
+            self.write("setup.lock", "changed-content")
+            self.assertEqual(first, bootstrap._decision_subject(self.root, "command", "current"))
+            self.write(".serena/codex-integration.yml", "bootstrap:\n  command: {argv: [tool, setup], inputs: [other.lock], markers: [.ready]}\n")
+            self.assertNotEqual(first, bootstrap._decision_subject(self.root, "command", "current"))
+        self.assertTrue(list((state / "locks").glob("*.lock")))
         (self.root / "outside").mkdir()
         self.write(".serena/codex-integration.yml", "bootstrap:\n  boundaries:\n    include: [missing]\n")
         self.assertEqual("needs-decision", bootstrap.plan_repository(self.root)["status"])

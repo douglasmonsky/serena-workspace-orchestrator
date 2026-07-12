@@ -110,6 +110,11 @@ def _read_state(path: Path) -> dict[str, object]:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error: raise ValueError("corrupt bootstrap state") from error
     if not isinstance(data, dict) or set(data) != {"version", "decisions"} or data["version"] != STATE_VERSION or not isinstance(data["decisions"], dict): raise ValueError("invalid bootstrap state")
+    allowed = {"language": {"enable", "ignore"}, "tracking": {"shared", "local"}, "command": {"approve", "reject"}}
+    for key, item in data["decisions"].items():
+        if not isinstance(key, str) or ":" not in key or not isinstance(item, dict) or set(item) != {"decision", "evidence"}: raise ValueError("invalid bootstrap decision")
+        category = key.split(":", 1)[0]
+        if category not in allowed or item["decision"] not in allowed[category] or not isinstance(item["evidence"], str) or not item["evidence"]: raise ValueError("invalid bootstrap decision")
     return data
 
 
@@ -133,6 +138,11 @@ def repository_decisions(root: Path) -> dict[str, object]:
     return _read_state(_repository_path(root))["decisions"]
 
 
+def language_decision(root: Path, language: str) -> str | None:
+    item = repository_decisions(root).get(f"language:{language}")
+    return item["decision"] if isinstance(item, dict) and item.get("evidence") == language_evidence(root, language) else None
+
+
 def _decision_subject(root: Path, category: str, subject: str) -> str:
     if category == "language":
         if subject not in {"python", "rust", "go", "java", "kotlin", "typescript", "svelte", "vue", "angular", "csharp", "php", "ruby", "swift"}: raise ValueError("unknown language")
@@ -142,7 +152,8 @@ def _decision_subject(root: Path, category: str, subject: str) -> str:
         plans = plan_repository(root)["plans"]
         command = next((p for p in plans if p["source"] == "command"), None)
         if command is None: raise ValueError("no current custom command")
-        return command["plan_id"]
+        material = json.dumps({key: command[key] for key in ("argv", "cwd", "inputs", "markers")}, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(material.encode()).hexdigest()
     raise ValueError("unknown decision category")
 
 
@@ -150,7 +161,7 @@ def record_decision(root: Path, category: str, subject: str, decision: str) -> d
     allowed = {"language": {"enable", "ignore"}, "tracking": {"shared", "local"}, "command": {"approve", "reject"}}
     if category not in allowed or decision not in allowed[category]: raise ValueError("invalid decision")
     root = resolve_root(root); key = _decision_subject(root, category, subject)
-    path = _repository_path(root); lock_path = path.with_suffix(".lock")
+    path = _repository_path(root); lock_path = _state_dir() / "locks" / (repository_identity(root) + ".lock")
     lock_path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
     with lock_path.open("a+") as lock:
         os.chmod(lock_path, 0o600); fcntl.flock(lock, fcntl.LOCK_EX)
