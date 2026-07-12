@@ -201,10 +201,11 @@ def _tool_identity(executable: str, cwd: Path | None = None) -> dict[str, object
         path = None
         for entry in os.environ.get("PATH", "").split(os.pathsep):
             candidate = (Path(entry) / executable) if Path(entry).is_absolute() else (cwd / entry / executable)
-            if candidate.is_file():
+            if candidate.is_file() and os.access(candidate, os.X_OK):
                 path = candidate.resolve(strict=False)
                 break
-    return {"path": str(path) if path and path.is_file() else None, "version": _version([str(path)]) if path and path.is_file() else "unavailable"}
+    available = path and path.is_file() and os.access(path, os.X_OK)
+    return {"path": str(path) if available else None, "version": _version([str(path)]) if available else "unavailable"}
 
 
 def _markers(plan: dict[str, object]) -> list[Path]:

@@ -249,6 +249,17 @@ class BootstrapPlansTests(unittest.TestCase):
         with patch.dict(os.environ, {"PATH": "tools"}, clear=False):
             self.assertEqual(str(tool.resolve()), bootstrap._tool_identity("runner", frontend)["path"])
 
+    def test_non_executable_tool_is_unavailable_and_revokes_cache_hit(self):
+        state = Path(self.tmp.name) / "state"; tool = self.root / "setup"; tool.write_text("#!/bin/sh\n"); tool.chmod(0o755)
+        self.write("setup.lock", "x"); self.write(".serena/codex-integration.yml", "bootstrap:\n  command: {argv: [./setup], inputs: [setup.lock]}\n")
+        with patch.dict(os.environ, {"WORKSPACE_HARBOR_BOOTSTRAP_STATE_DIR": str(state)}, clear=False):
+            bootstrap.record_decision(self.root, "command", "current", "approve")
+            first = bootstrap.bootstrap_status(self.root); bootstrap.write_worktree_success(self.root, first["fingerprint"])
+            self.assertEqual("ready", bootstrap.bootstrap_status(self.root)["status"])
+            tool.chmod(0o644)
+            self.assertIsNone(bootstrap._tool_identity("./setup", self.root)["path"])
+            self.assertEqual("pending", bootstrap.bootstrap_status(self.root)["status"])
+
     def test_command_approval_digest_covers_declared_inputs_and_markers_and_lock_is_separate(self):
         state = Path(self.tmp.name) / "state"; self.write("setup.lock", "one")
         self.write(".serena/codex-integration.yml", "bootstrap:\n  command: {argv: [tool, setup], inputs: [setup.lock], markers: [.ready]}\n")
