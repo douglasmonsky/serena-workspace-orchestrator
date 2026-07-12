@@ -5,6 +5,7 @@ import io
 import json
 import os
 import pwd
+import plistlib
 import stat
 import subprocess
 import tempfile
@@ -116,8 +117,13 @@ class PyCharmProjectTrustTests(unittest.TestCase):
         live_registry = live_home / "Library/Application Support/JetBrains/PyCharm2099.1/options/trusted-paths.xml"
         live_registry.parent.mkdir(parents=True)
         live_registry.write_text("<application/>")
+        app = self.base / "DefaultPyCharm.app"
+        info = app / "Contents/Info.plist"
+        info.parent.mkdir(parents=True)
+        with info.open("wb") as handle:
+            plistlib.dump({"CFBundleShortVersionString": "2099.1.2"}, handle)
         with mock.patch.object(TRUST, "_account_home", return_value=live_home), mock.patch.dict(
-            os.environ, {"PYCHARM_TRUST_ALLOWED_ROOTS": str(self.other)}, clear=False
+            os.environ, {"PYCHARM_TRUST_ALLOWED_ROOTS": str(self.other), "PYCHARM_APP_PATH": str(app)}, clear=False
         ):
             self.assertEqual(live_registry, TRUST._config())
             self.assertEqual(TRUST.DEFAULT_ALLOWED_ROOTS, TRUST._allowed(live_registry))
@@ -134,7 +140,7 @@ class PyCharmProjectTrustTests(unittest.TestCase):
         self.assertEqual(0, self.run_cli("allow", second))
         self.assertEqual(2, len(list(self.registry.parent.glob("trusted-paths.xml.bak-*"))))
 
-    def test_ambiguous_default_registries_fail_closed(self):
+    def test_unidentifiable_app_fails_closed_with_multiple_registries(self):
         live_home = self.base / "ambiguous-home"
         for version in ("PyCharm2098.1", "PyCharm2099.1"):
             registry = live_home / "Library/Application Support/JetBrains" / version / "options/trusted-paths.xml"
@@ -145,6 +151,24 @@ class PyCharmProjectTrustTests(unittest.TestCase):
         ):
             with self.assertRaises(RuntimeError):
                 TRUST._config()
+
+    def test_active_app_version_selects_matching_registry(self):
+        live_home = self.base / "versioned-home"
+        registries = {}
+        for version in ("2024.3", "2025.1", "2026.1"):
+            registry = live_home / "Library/Application Support/JetBrains" / ("PyCharm" + version) / "options/trusted-paths.xml"
+            registry.parent.mkdir(parents=True)
+            registry.write_text("<application/>")
+            registries[version] = registry
+        app = self.base / "PyCharm.app"
+        info = app / "Contents/Info.plist"
+        info.parent.mkdir(parents=True)
+        with info.open("wb") as handle:
+            plistlib.dump({"CFBundleShortVersionString": "2026.1.4"}, handle)
+        with mock.patch.object(TRUST, "_account_home", return_value=live_home), mock.patch.dict(
+            os.environ, {"PYCHARM_APP_PATH": str(app)}, clear=True
+        ):
+            self.assertEqual(registries["2026.1"], TRUST._config())
 
     def test_missing_live_and_isolated_registries_fail_closed(self):
         isolated = self.base / "missing" / "trusted-paths.xml"

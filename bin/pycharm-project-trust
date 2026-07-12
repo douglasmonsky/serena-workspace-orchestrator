@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """Safely manage exact Git roots in PyCharm's trusted-paths registry."""
+from __future__ import annotations
+
 import fcntl
 import json
 import os
+import plistlib
 import pwd
+import re
 import subprocess
 import sys
 import tempfile
@@ -122,10 +126,26 @@ def _config() -> Path:
     raw = os.environ.get("PYCHARM_TRUST_CONFIG_FILE")
     if raw:
         return Path(raw).expanduser()
-    candidates = sorted((_account_home() / "Library/Application Support/JetBrains").glob("PyCharm*/options/trusted-paths.xml"))
-    if len(candidates) != 1:
-        raise RuntimeError("expected exactly one PyCharm trusted-paths.xml registry")
-    return candidates[0]
+    app = Path(os.environ.get("PYCHARM_APP_PATH", "/Applications/PyCharm.app"))
+    try:
+        with (app / "Contents/Info.plist").open("rb") as handle:
+            version = plistlib.load(handle).get("CFBundleShortVersionString")
+    except (OSError, plistlib.InvalidFileException) as error:
+        raise RuntimeError("cannot identify configured PyCharm application") from error
+    if not isinstance(version, str):
+        raise RuntimeError("configured PyCharm application has no version")
+    match = re.match(r"^(\d{4})\.(\d+)", version)
+    if match is None:
+        raise RuntimeError("configured PyCharm application has an invalid version")
+    registry = (
+        _account_home()
+        / "Library/Application Support/JetBrains"
+        / ("PyCharm" + match.group(1) + "." + match.group(2))
+        / "options/trusted-paths.xml"
+    )
+    if not registry.is_file():
+        raise RuntimeError("configured PyCharm registry is unavailable")
+    return registry
 
 
 def _timeout() -> float:
