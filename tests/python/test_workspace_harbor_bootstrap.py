@@ -395,5 +395,56 @@ class BootstrapPlansTests(unittest.TestCase):
         self.assertEqual(1, len(log.read_text(encoding="utf-8").splitlines()))
         self.assertEqual(["ready", "ready"], [json.loads(result[0])["status"] for result in results])
 
+    def test_custom_argv_rejects_likely_inline_secrets(self):
+        secret_values = [
+            "--api-key=supersecret",
+            "Authorization: Bearer abc.def",
+            "https://user:password@example.test/package",
+            "sk-abcdefghijklmnopqrstuvwxyz123456",
+        ]
+        for value in secret_values:
+            with self.subTest(value=value):
+                self.write(
+                    ".serena/codex-integration.yml",
+                    "bootstrap:\n  command:\n    argv: [tool, " + json.dumps(value) + "]\n",
+                )
+                result = bootstrap.plan_repository(self.root)
+                self.assertEqual("needs-decision", result["status"])
+                self.assertEqual("invalid-policy", result["decisions"][0]["code"])
+
+    def test_execute_missing_timeout_and_failure_tail_are_bounded_and_redacted(self):
+        plan = {
+            "plan_id": "fixture",
+            "source": "command",
+            "ecosystem": "custom",
+            "cwd": str(self.root),
+            "argv": ["tool", "setup"],
+            "inputs": [],
+            "markers": [],
+        }
+        with patch.object(bootstrap, "_tool_identity", return_value={"path": None, "version": "unavailable"}):
+            code, output = bootstrap._execute(plan)
+        self.assertEqual(127, code)
+        self.assertIn("unavailable", output)
+
+        timeout = subprocess.TimeoutExpired(
+            ["/tools/tool", "setup"],
+            1,
+            output="api_key=secret-value\n",
+            stderr="Authorization: Bearer abc.def\n",
+        )
+        with patch.object(bootstrap, "_tool_identity", return_value={"path": "/tools/tool", "version": "1"}), \
+             patch.object(bootstrap.subprocess, "run", side_effect=timeout):
+            code, output = bootstrap._execute(plan)
+        self.assertEqual(124, code)
+        self.assertNotIn("secret-value", output)
+        self.assertNotIn("abc.def", output)
+
+        noisy = "\n".join(f"line-{index} token=secret-{index}" for index in range(1000))
+        tail = bootstrap._sanitized_tail(noisy)
+        self.assertLessEqual(len(tail.encode("utf-8")), 8192)
+        self.assertLessEqual(len(tail.splitlines()), 60)
+        self.assertNotIn("secret-999", tail)
+
 
 if __name__ == "__main__": unittest.main()

@@ -35,6 +35,13 @@ TOKEN_SHAPE_RE = re.compile(r"(?:sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,
 URL_CREDENTIAL_RE = re.compile(r"(?i)(https?://)[^/@\s:]+:[^/@\s]+@")
 
 
+def _contains_likely_secret(value: str) -> bool:
+    return any(
+        pattern.search(value)
+        for pattern in (SECRET_ASSIGNMENT_RE, BEARER_RE, TOKEN_SHAPE_RE, URL_CREDENTIAL_RE)
+    )
+
+
 @dataclass(frozen=True)
 class BootstrapPlan:
     plan_id: str
@@ -83,6 +90,8 @@ def load_policy(root: Path) -> dict[str, object]:
         command = bootstrap["command"]
         if not isinstance(command, dict) or set(command) - {"argv", "cwd", "inputs", "markers"}: raise ValueError("invalid command schema")
         if not isinstance(command.get("argv"), list) or not command["argv"] or not all(isinstance(v, str) and v for v in command["argv"]): raise ValueError("command argv must be non-empty strings")
+        if any(_contains_likely_secret(value) for value in command["argv"]):
+            raise ValueError("command argv must not contain inline credentials or likely secrets")
         for key in ("inputs", "markers"):
             if key in command and (not isinstance(command[key], list) or not all(isinstance(v, str) and v for v in command[key])): raise ValueError(f"command {key} must be strings")
         if "cwd" in command and not isinstance(command["cwd"], str): raise ValueError("command cwd must be string")
