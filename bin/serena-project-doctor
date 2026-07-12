@@ -331,11 +331,19 @@ def _semantic_probe_file(root: Path) -> str | None:
         for preferred in (root / "src/main", root / "src/test", root / "src"):
             if not preferred.is_dir():
                 continue
-            for path in sorted(preferred.rglob("*")):
-                if path.is_file() and path.suffix.lower() in EXTENSION_LANGUAGES:
+            for current_text, directory_names, file_names in os.walk(preferred):
+                directory_names[:] = sorted(
+                    name for name in directory_names if name not in PRUNED_DIRECTORIES
+                )
+                for name in sorted(file_names):
+                    path = Path(current_text) / name
+                    if path.suffix.lower() not in EXTENSION_LANGUAGES:
+                        continue
                     candidates.append(str(path.relative_to(root)))
                     if len(candidates) >= 500:
                         break
+                if len(candidates) >= 500:
+                    break
             if len(candidates) >= 500:
                 break
         if len(candidates) < 500:
