@@ -74,6 +74,14 @@ EXTENSION_LANGUAGES = {
     ".tsx": "typescript",
     ".vue": "vue",
 }
+PYCHARM_PROBE_LANGUAGE_PRIORITY = {
+    ".py": 0,
+    ".pyi": 0,
+    ".js": 1,
+    ".jsx": 1,
+    ".ts": 1,
+    ".tsx": 1,
+}
 
 
 def _run(command: Sequence[str], cwd: Path) -> subprocess.CompletedProcess[str]:
@@ -362,7 +370,7 @@ def _semantic_probe_file(root: Path) -> str | None:
                 if len(candidates) >= 500:
                     break
 
-    analyzable: list[tuple[tuple[int, str], str]] = []
+    analyzable: list[tuple[tuple[int, int, str], str]] = []
     seen: set[str] = set()
     for relative_path in candidates:
         if relative_path in seen:
@@ -384,7 +392,10 @@ def _semantic_probe_file(root: Path) -> str | None:
                     source_priority = 4
                 else:
                     source_priority = 3
-                analyzable.append(((source_priority, relative_path), relative_path))
+                language_priority = PYCHARM_PROBE_LANGUAGE_PRIORITY.get(path.suffix.lower(), 2)
+                analyzable.append(
+                    ((language_priority, source_priority, relative_path), relative_path)
+                )
         except OSError:
             continue
     return min(analyzable)[1] if analyzable else None
