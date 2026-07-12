@@ -42,7 +42,12 @@ def load_registry(path=STATE):
     if not path.exists(): return empty_registry(), False
     try:
         data = json.loads(path.read_text())
-        if data.get("schemaVersion") != 1 or not isinstance(data.get("projects"), list): raise ValueError("schema")
+        if (not isinstance(data, dict) or set(data) != {"schemaVersion", "projects"}
+                or type(data["schemaVersion"]) is not int or data["schemaVersion"] != 1
+                or not isinstance(data["projects"], list)):
+            raise ValueError("schema")
+        for project in data["projects"]:
+            if not isinstance(project, dict): raise ValueError("project")
         return data, False
     except (OSError, ValueError, json.JSONDecodeError):
         stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")

@@ -58,6 +58,35 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(0, completed.returncode, completed.stderr)
         self.assertEqual(1, len(list(self.state.parent.glob("managed.corrupt-*.json"))))
 
+    def test_python39_cleanup_quarantines_structurally_invalid_registries(self):
+        invalid_registries = [
+            [],
+            {},
+            {"schemaVersion": 1, "projects": [None]},
+            {"schemaVersion": 1, "projects": [[]]},
+        ]
+        for registry in invalid_registries:
+            with self.subTest(registry=registry):
+                self.state.write_text(json.dumps(registry))
+                environment = os.environ | {
+                    "PYCHARM_PROJECT_REAPER_STATE_FILE": str(self.state),
+                    "PYCHARM_PROJECT_REAPER_RUNTIME_FILE": str(Path(self.tmp.name) / "invalid-runtime.json"),
+                    "PYCHARM_PROJECT_REAPER_BROKER_COMMAND": str(Path(self.tmp.name) / "missing-broker"),
+                }
+                completed = subprocess.run(
+                    ["/usr/bin/python3", SCRIPT, "cleanup"],
+                    capture_output=True,
+                    text=True,
+                    env=environment,
+                    check=False,
+                )
+                self.assertEqual(0, completed.returncode, completed.stderr)
+                self.assertFalse(self.state.exists())
+                self.assertTrue(list(self.state.parent.glob("managed.corrupt-*.json")))
+                report = json.loads(completed.stdout)
+                self.assertTrue(report["reportOnly"])
+                self.assertEqual([], report["selected"])
+
     def test_unregistered_is_unmanaged(self):
         decision = reaper.classify("/not-registered", {}, {}, now=2000)
         self.assertEqual("unmanaged", decision.classification)
