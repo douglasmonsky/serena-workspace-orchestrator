@@ -30,8 +30,8 @@ class PyCharmProjectTrustTests(unittest.TestCase):
         subprocess.run(["git", "init", "-q", str(path)], check=True)
         return path
 
-    def run_cli(self, *args, capture=False):
-        env = os.environ | {"PYCHARM_TRUST_CONFIG_FILE": str(self.registry), "PYCHARM_TRUST_ALLOWED_ROOTS": str(self.allowed)}
+    def run_cli(self, *args, capture=False, env_extra=None):
+        env = os.environ | {"PYCHARM_TRUST_CONFIG_FILE": str(self.registry), "PYCHARM_TRUST_ALLOWED_ROOTS": str(self.allowed)} | (env_extra or {})
         result = subprocess.run([str(CLI), *map(str, args)], env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         return result.stdout.strip() if capture else result.returncode
 
@@ -89,6 +89,47 @@ class PyCharmProjectTrustTests(unittest.TestCase):
         self.assertEqual([0, 0], [process.wait() for process in processes])
         entries = {node.get("key") for node in ET.parse(self.registry).findall(".//entry")}
         self.assertEqual({str(first.resolve()), str(second.resolve())}, entries)
+
+    def test_allowed_override_cannot_target_live_registry(self):
+        live_home = self.base / "home"
+        live_registry = live_home / "Library/Application Support/JetBrains/PyCharm2099.1/options/trusted-paths.xml"
+        live_registry.parent.mkdir(parents=True)
+        original = b'<application><component name="Trusted.Paths"><option name="TRUSTED_PATHS"><map/></option></component></application>'
+        live_registry.write_bytes(original)
+        arbitrary = self.git_repo(self.other / "arbitrary")
+        result = subprocess.run(
+            [str(CLI), "allow", str(arbitrary)],
+            env=os.environ | {"HOME": str(live_home), "PYCHARM_TRUST_CONFIG_FILE": str(live_registry), "PYCHARM_TRUST_ALLOWED_ROOTS": str(self.other)},
+        )
+        self.assertNotEqual(0, result.returncode)
+        self.assertEqual(original, live_registry.read_bytes())
+
+    def test_allowed_override_cannot_target_default_registry(self):
+        live_home = self.base / "default-home"
+        live_registry = live_home / "Library/Application Support/JetBrains/PyCharm2099.1/options/trusted-paths.xml"
+        live_registry.parent.mkdir(parents=True)
+        original = b'<application><component name="Trusted.Paths"><option name="TRUSTED_PATHS"><map/></option></component></application>'
+        live_registry.write_bytes(original)
+        arbitrary = self.git_repo(self.other / "default-arbitrary")
+        result = subprocess.run(
+            [str(CLI), "allow", str(arbitrary)],
+            env=os.environ | {"HOME": str(live_home), "PYCHARM_TRUST_ALLOWED_ROOTS": str(self.other)},
+        )
+        self.assertNotEqual(0, result.returncode)
+        self.assertEqual(original, live_registry.read_bytes())
+
+    def test_isolated_config_can_use_allowed_override(self):
+        repo = self.git_repo(self.other / "isolated")
+        self.assertEqual(0, self.run_cli("allow", repo, env_extra={"PYCHARM_TRUST_ALLOWED_ROOTS": str(self.other)}))
+        self.assertEqual("trusted", self.run_cli("status", repo, capture=True, env_extra={"PYCHARM_TRUST_ALLOWED_ROOTS": str(self.other)}))
+
+    def test_multiple_writes_create_distinct_backups(self):
+        first, second = self.git_repo(self.allowed / "one"), self.git_repo(self.allowed / "two")
+        self.registry.parent.mkdir()
+        self.registry.write_text('<application><component name="Trusted.Paths"><option name="TRUSTED_PATHS"><map/></option></component></application>')
+        self.assertEqual(0, self.run_cli("allow", first))
+        self.assertEqual(0, self.run_cli("allow", second))
+        self.assertEqual(2, len(list(self.registry.parent.glob("trusted-paths.xml.bak-*"))))
 
 
 if __name__ == "__main__":

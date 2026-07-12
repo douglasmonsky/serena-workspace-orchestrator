@@ -10,6 +10,11 @@ import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+DEFAULT_ALLOWED_ROOTS = (
+    Path("/Users/Monsky/Documents/Codex"),
+    Path("/Users/Monsky/.codex/src"),
+)
+
 
 def canonical_git_root(value: str, allowed: tuple[Path, ...]) -> Path:
     """Return value's canonical Git top-level only when it is allowlisted exactly."""
@@ -94,18 +99,36 @@ def _decode_path(value: str, home: Path) -> Path | None:
     return None
 
 
-def _allowed() -> tuple[Path, ...]:
+def _is_live_registry(config: Path) -> bool:
+    """Whether config is a native PyCharm registry under this user's home."""
+    try:
+        relative = config.expanduser().resolve(strict=False).relative_to(
+            (Path.home() / "Library/Application Support/JetBrains").resolve(strict=False)
+        )
+    except ValueError:
+        return False
+    return (
+        len(relative.parts) == 3
+        and relative.parts[0].startswith("PyCharm")
+        and relative.parts[1:] == ("options", "trusted-paths.xml")
+    )
+
+
+def _allowed(config: Path) -> tuple[Path, ...]:
     raw = os.environ.get("PYCHARM_TRUST_ALLOWED_ROOTS", "")
-    if not raw:
-        raise RuntimeError("PYCHARM_TRUST_ALLOWED_ROOTS is required")
+    if _is_live_registry(config) or not raw:
+        return DEFAULT_ALLOWED_ROOTS
     return tuple(Path(item).expanduser() for item in raw.split(os.pathsep) if item)
 
 
 def _config() -> Path:
     raw = os.environ.get("PYCHARM_TRUST_CONFIG_FILE")
-    if not raw:
-        raise RuntimeError("PYCHARM_TRUST_CONFIG_FILE is required")
-    return Path(raw).expanduser()
+    if raw:
+        return Path(raw).expanduser()
+    candidates = sorted((Path.home() / "Library/Application Support/JetBrains").glob("PyCharm*/options/trusted-paths.xml"))
+    if not candidates:
+        raise RuntimeError("no PyCharm trusted-paths.xml registry found")
+    return candidates[-1]
 
 
 def _timeout() -> float:
@@ -140,9 +163,15 @@ def allow(root: Path, config: Path) -> None:
             else:
                 entry.set("value", "true")
             if config.exists():
-                backup = config.with_name(config.name + ".bak-" + time.strftime("%Y%m%d%H%M%S"))
-                backup.write_bytes(config.read_bytes())
-                os.chmod(backup, 0o600)
+                backup_fd, backup_name = tempfile.mkstemp(
+                    prefix=config.name + ".bak-" + time.strftime("%Y%m%d%H%M%S") + ".",
+                    dir=config.parent,
+                )
+                with os.fdopen(backup_fd, "wb") as backup:
+                    os.fchmod(backup.fileno(), 0o600)
+                    backup.write(config.read_bytes())
+                    backup.flush()
+                    os.fsync(backup.fileno())
             fd, temporary = tempfile.mkstemp(prefix=config.name + ".", dir=config.parent)
             try:
                 os.fchmod(fd, 0o600)
@@ -194,7 +223,8 @@ def main(argv: list[str]) -> int:
     if not argv or argv[0] not in {"allow", "status", "audit"} or (argv[0] == "audit" and len(argv) != 1) or (argv[0] != "audit" and len(argv) != 2):
         return 2
     try:
-        config, allowed = _config(), _allowed()
+        config = _config()
+        allowed = _allowed(config)
         if argv[0] == "audit":
             print(json.dumps(audit(config, allowed), sort_keys=True))
             return 2 if audit(config, allowed)["malformed"] else 0
