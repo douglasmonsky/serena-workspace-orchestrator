@@ -66,6 +66,14 @@ requires the exact authenticated account home, the `IntelliJIdea` prefix, and
 the expected relative path. Existing broad entries are reported but never
 removed automatically.
 
+When IntelliJ is already running, a registry write alone does not update its
+in-memory trust state. The helper therefore calls Workspace Harbor's
+authenticated loopback `POST /v1/projects/trust` endpoint after exact-root
+validation and the atomic registry update. The plugin applies IntelliJ's
+native `TrustedProjects` API before the opener proceeds. Missing runtime state
+is acceptable before the first IntelliJ launch; malformed or rejected live
+state fails closed.
+
 ## Managed opener
 
 `open-codex-project-in-intellij` serializes opens in a new
@@ -104,6 +112,13 @@ check. It keeps one persistent service per canonical worktree, backend, and
 context. It never starts a direct persistent Serena process outside broker
 ownership.
 
+The canonical worktree is also the ownership boundary. A parent agent and its
+subagents share one explicit `WORKSPACE_HARBOR_OWNER_ID`; another logical task
+cannot acquire that same root. Independent tasks may own different worktrees
+or repositories concurrently. All project windows may live in the same
+IntelliJ application process because ownership attaches to roots and leases,
+not to the macOS application process.
+
 ## Reaper and plugin
 
 The Java package moves from `com.monsky.codex.pycharm.lifecycle` to
@@ -130,6 +145,8 @@ Python, Go, Rust, and other recognized models. The doctor distinguishes
 `indexReady` from a usable project model: semantic navigation may be healthy
 while inspections are not authoritative until the repository's native model
 is linked. The doctor reports this condition once rather than retrying.
+Gradle verification and local automation use IntelliJ's bundled JBR, avoiding
+a separate machine-wide JDK dependency.
 
 ## Deployment and migration
 
