@@ -1,6 +1,7 @@
 <idea-plugin>
-  <id>com.monsky.codex.pycharm.lifecycle</id>
-  <name>Codex PyCharm Lifecycle Companion</name>
+  <id>com.monsky.workspaceharbor</id>
+  <name>Workspace Harbor</name>
+  <description>Safely manages idle IDE project windows using fail-closed lifecycle checks.</description>
   <vendor>Monsky</vendor>
   <idea-version since-build="261" until-build="261.*"/>
   <depends>com.intellij.modules.platform</depends>

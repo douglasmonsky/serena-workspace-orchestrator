@@ -1,2 +1,1 @@
-rootProject.name = "pycharm-lifecycle-companion"
-
+rootProject.name = "workspace-harbor"

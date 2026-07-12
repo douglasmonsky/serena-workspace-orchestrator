@@ -1,6 +1,5 @@
-# Codex PyCharm Lifecycle Companion
+# Workspace Harbor
 
-A standalone PyCharm companion plugin with a fail-closed lifecycle safety model.
+Safely manages idle IDE project windows using fail-closed lifecycle checks.
 
 Run tests with `JAVA_HOME=/Applications/PyCharm.app/Contents/jbr/Contents/Home ./gradlew test`.
-

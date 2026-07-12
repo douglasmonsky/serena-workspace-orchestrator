@@ -1,7 +1,11 @@
+import org.jetbrains.intellij.platform.gradle.tasks.VerifyPluginTask
+
 plugins {
     java
     id("org.jetbrains.intellij.platform") version "2.18.1"
 }
+
+version = "0.1.0"
 
 java {
     sourceCompatibility = JavaVersion.VERSION_21
@@ -28,6 +32,20 @@ dependencies {
     testRuntimeOnly("org.junit.platform:junit-platform-launcher:1.13.4")
 }
 
+intellijPlatform {
+    pluginVerification {
+        ides {
+            local("/Applications/PyCharm.app")
+        }
+    }
+}
+
 tasks.test {
     useJUnitPlatform()
+}
+
+tasks.named<VerifyPluginTask>("verifyPlugin") {
+    javaLauncher.set(javaToolchains.launcherFor {
+        languageVersion.set(JavaLanguageVersion.of(25))
+    })
 }
