@@ -117,6 +117,31 @@ class BootstrapPlansTests(unittest.TestCase):
             policy = bootstrap.load_policy(self.root)
         self.assertEqual(["frontend"], policy["bootstrap"]["boundaries"]["include"])
         self.assertEqual(["frontend"], policy["bootstrap"]["boundaries"]["ignore"])
+
+    def test_language_evidence_reports_only_confirmed_source_only_or_absent(self):
+        self.write("Cargo.toml", "[package]"); self.write("Cargo.lock", ""); self.write("src/main.rs", "fn main() {}")
+        self.assertEqual("confirmed", bootstrap.language_evidence(self.root, "rust"))
+        self.assertEqual("absent", bootstrap.language_evidence(self.root, "typescript"))
+        self.write("web/app.ts", "export {}")
+        self.assertEqual("source-only", bootstrap.language_evidence(self.root, "typescript"))
+        self.write("package.json", "{}"); self.write("package-lock.json", "{}")
+        self.assertEqual("confirmed", bootstrap.language_evidence(self.root, "typescript"))
+
+    def test_maven_is_ide_managed_and_global_bootstrap_can_disable(self):
+        self.write("pom.xml", "<project/>")
+        self.assertEqual("ide-managed", bootstrap.plan_repository(self.root)["plans"][0]["ecosystem"])
+        home = Path(self.tmp.name) / "codex"; (home).mkdir()
+        (home / "serena-integration.yml").write_text("bootstrap:\n  enabled: false\n")
+        with patch.object(bootstrap, "CODEX_HOME", home):
+            self.assertEqual("disabled", bootstrap.plan_repository(self.root)["status"])
+
+    def test_symlink_escape_boundary_is_rejected(self):
+        outside = Path(self.tmp.name) / "outside"; outside.mkdir()
+        (self.root / "escape").symlink_to(outside, target_is_directory=True)
+        self.write(".serena/codex-integration.yml", "bootstrap:\n  boundaries:\n    include: [escape]\n")
+        result = bootstrap.plan_repository(self.root)
+        self.assertEqual("needs-decision", result["status"])
+        self.assertEqual("invalid-boundary", result["decisions"][0]["code"])
         (self.root / "outside").mkdir()
         self.write(".serena/codex-integration.yml", "bootstrap:\n  boundaries:\n    include: [missing]\n")
         self.assertEqual("needs-decision", bootstrap.plan_repository(self.root)["status"])

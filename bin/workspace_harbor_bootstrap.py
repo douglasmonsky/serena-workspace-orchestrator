@@ -101,6 +101,7 @@ def _contains_source(root: Path, suffixes: set[str]) -> bool:
 
 
 def language_evidence(root: Path, language: str) -> str:
+    """Report repository facts only; Task 3 combines them with language policy decisions."""
     root = resolve_root(root); language = language.lower()
     files = {p.name for p in root.iterdir()}
     rules = {
