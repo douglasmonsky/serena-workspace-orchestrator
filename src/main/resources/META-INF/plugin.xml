@@ -7,6 +7,7 @@
   <depends>com.intellij.modules.platform</depends>
   <depends>org.jetbrains.plugins.terminal</depends>
   <depends>com.intellij.gradle</depends>
+  <depends>com.intellij.java</depends>
   <extensions defaultExtensionNs="com.intellij">
     <applicationService serviceImplementation="com.monsky.workspaceharbor.lifecycle.LifecycleService"/>
     <postStartupActivity implementation="com.monsky.workspaceharbor.lifecycle.LifecycleStartupActivity"/>
