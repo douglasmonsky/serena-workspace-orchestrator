@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import json
 from pathlib import Path
 import subprocess
 import tempfile
@@ -191,6 +192,29 @@ class SerenaProjectDoctorTests(unittest.TestCase):
             ],
         )
         self.assertEqual(client._timeout, 300)
+
+    def test_semantic_health_runs_in_serena_runtime_subprocess(self) -> None:
+        payload = {
+            "status": "healthy",
+            "file": "src/app.py",
+            "symbols": 2,
+            "elapsed_ms": 14,
+        }
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=json.dumps(payload), stderr=""
+        )
+
+        with mock.patch.object(
+            doctor, "_semantic_probe_file", return_value="src/app.py"
+        ), mock.patch.object(doctor.subprocess, "run", return_value=completed) as run:
+            result = doctor._jetbrains_semantic_health(self.root, True, True)
+
+        self.assertEqual(payload, result)
+        self.assertEqual(
+            [str(doctor.SERENA_CODEX), "semantic-probe", str(self.root), "src/app.py"],
+            run.call_args.args[0],
+        )
+        self.assertEqual(12, run.call_args.kwargs["timeout"])
 
     def test_semantic_probe_prefers_intellij_native_source_over_gradle_and_java(self) -> None:
         (self.root / "build.gradle.kts").write_text("plugins { java }\n", encoding="utf-8")

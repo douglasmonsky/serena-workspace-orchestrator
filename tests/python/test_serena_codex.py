@@ -58,6 +58,17 @@ class SerenaCodexLauncherTests(unittest.TestCase):
         marker.parent.mkdir(parents=True)
         marker.write_text('project_name: "fixture"\n', encoding="utf-8")
 
+    def test_semantic_probe_routes_to_runtime_owned_command(self) -> None:
+        with mock.patch.object(
+            launcher, "_semantic_probe_command", return_value=0, create=True
+        ) as probe, mock.patch.object(
+            launcher, "_exec_real_serena", side_effect=AssertionError("delegated upstream")
+        ):
+            status = launcher.main(["semantic-probe", "/repo", "src/app.py"])
+
+        self.assertEqual(0, status)
+        probe.assert_called_once_with(["semantic-probe", "/repo", "src/app.py"])
+
     def service_status(self, root: Path, matches, owned_ports):
         stdout, stderr = io.StringIO(), io.StringIO()
         with mock.patch.object(

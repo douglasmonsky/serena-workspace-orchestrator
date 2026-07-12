@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 import traceback
 from typing import Any, NoReturn, Sequence
 
@@ -408,6 +409,65 @@ def _jetbrains_service_status_command(args: Sequence[str]) -> int:
     return 1
 
 
+def _semantic_probe_command(args: Sequence[str]) -> int:
+    """Run one bounded semantic read inside Serena's own Python runtime."""
+    if len(args) != 3:
+        print("Usage: serena-codex semantic-probe PROJECT_DIR RELATIVE_FILE", file=sys.stderr)
+        return 2
+    project_root = Path(args[1]).resolve()
+    relative_path = Path(args[2])
+    if not project_root.is_dir() or relative_path.is_absolute():
+        print("serena-codex: invalid semantic probe path", file=sys.stderr)
+        return 2
+    target = (project_root / relative_path).resolve()
+    try:
+        target.relative_to(project_root)
+    except ValueError:
+        print("serena-codex: semantic probe escapes project root", file=sys.stderr)
+        return 2
+    if not target.is_file():
+        print(f"serena-codex: semantic probe file is missing: {target}", file=sys.stderr)
+        return 2
+
+    started = time.monotonic()
+    result: dict[str, Any] = {"file": relative_path.as_posix(), "status": "failed"}
+    try:
+        from serena.config.serena_config import SerenaConfig
+        from serena.jetbrains.jetbrains_plugin_client import JetBrainsPluginClient
+        from serena.project import Project
+
+        config = SerenaConfig.from_config_file()
+        config.web_dashboard = False
+        config.web_dashboard_open_on_launch = False
+        project = Project.load(project_root, serena_config=config, autogenerate=False)
+        with JetBrainsPluginClient.from_project(project) as client:
+            original_timeout = client._timeout
+            client._timeout = min(original_timeout, 10)
+            try:
+                client.refresh_file(relative_path.as_posix())
+                response = client.get_symbols_overview(
+                    relative_path.as_posix(),
+                    depth=0,
+                    include_file_documentation=False,
+                )
+            finally:
+                client._timeout = original_timeout
+        result.update(status="healthy", symbols=len(response.get("symbols", [])))
+    except Exception as error:
+        message = str(error)[:500]
+        folded = message.casefold()
+        if "timed out" in folded or "timeout" in folded:
+            status = "stalled"
+        elif "badlocationexception" in folded or "plugin side" in folded or "status 500" in folded:
+            status = "plugin-error"
+        else:
+            status = "failed"
+        result.update(status=status, error=message)
+    result["elapsed_ms"] = round((time.monotonic() - started) * 1000)
+    print(json.dumps(result, sort_keys=True))
+    return 0 if result["status"] == "healthy" else 1
+
+
 def main(args: Sequence[str] | None = None) -> int:
     """Route wrapper-specific behavior and delegate everything else."""
     arguments = list(sys.argv[1:] if args is None else args)
@@ -415,6 +475,8 @@ def main(args: Sequence[str] | None = None) -> int:
         return _resolve_project_command(arguments)
     if arguments and arguments[0] == "jetbrains-service-status":
         return _jetbrains_service_status_command(arguments)
+    if arguments and arguments[0] == "semantic-probe":
+        return _semantic_probe_command(arguments)
 
     rewritten = _rewrite_mcp_args(arguments, Path.cwd())
     if os.environ.get("SERENA_CODEX_DRY_RUN") == "1":

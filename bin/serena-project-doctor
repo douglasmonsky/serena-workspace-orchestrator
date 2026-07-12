@@ -5,11 +5,10 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import fcntl
 import hashlib
-import io
 import json
 import os
 from pathlib import Path
@@ -494,24 +493,32 @@ def _jetbrains_semantic_health(
         return {"status": "no-source-file"}
 
     try:
-        from serena.config.serena_config import SerenaConfig
-        from serena.jetbrains.jetbrains_plugin_client import JetBrainsPluginClient
-        from serena.project import Project
-
-        captured_output = io.StringIO()
-        with redirect_stdout(captured_output), redirect_stderr(captured_output):
-            config = SerenaConfig.from_config_file()
-            config.web_dashboard = False
-            config.web_dashboard_open_on_launch = False
-            project = Project.load(root, serena_config=config, autogenerate=False)
-        with JetBrainsPluginClient.from_project(project) as client:
-            return _probe_jetbrains_client(client, relative_path)
-    except Exception as error:
+        completed = subprocess.run(
+            [str(SERENA_CODEX), "semantic-probe", str(root), relative_path],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=12,
+        )
+    except subprocess.TimeoutExpired:
+        return {"status": "stalled", "file": relative_path, "error": "probe timed out"}
+    except OSError as error:
         return {
             "status": "failed",
             "file": relative_path,
             "error": str(error),
         }
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        detail = (completed.stderr or completed.stdout or "invalid probe response").strip()[-500:]
+        return {"status": "failed", "file": relative_path, "error": detail}
+    if not isinstance(payload, dict) or payload.get("status") not in {
+        "healthy", "stalled", "plugin-error", "failed"
+    }:
+        return {"status": "failed", "file": relative_path, "error": "invalid probe payload"}
+    return payload
 
 
 def _broker_services(root: Path) -> list[dict[str, Any]]:
