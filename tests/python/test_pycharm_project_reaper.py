@@ -11,7 +11,9 @@ import unittest
 from unittest.mock import patch
 from pathlib import Path
 
-SCRIPT = str(Path(__file__).resolve().parents[2] / "bin" / "pycharm-project-reaper")
+TEST_FILE = Path(__file__).resolve()
+ROOT = TEST_FILE.parent.parent if TEST_FILE.parent.name == "tests" else TEST_FILE.parents[2]
+SCRIPT = str(ROOT / "bin" / "pycharm-project-reaper")
 loader = importlib.machinery.SourceFileLoader("reaper", SCRIPT)
 spec = importlib.util.spec_from_loader(loader.name, loader)
 reaper = importlib.util.module_from_spec(spec)
