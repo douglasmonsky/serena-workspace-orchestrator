@@ -51,6 +51,16 @@ class LifecycleHttpServerTest {
         assertEquals(404, post("/v1/projects/close?root=%2Fother").statusCode());
     }
 
+    @Test void accepts_authenticated_exact_trust_request() throws Exception {
+        start();
+
+        HttpResponse<String> response = post("/v1/projects/trust?root=%2Fworkspace");
+
+        assertEquals(200, response.statusCode());
+        assertEquals("/workspace", adapter.trustedRoot);
+        assertEquals(404, post("/v1/projects/trust").statusCode());
+    }
+
     @Test void refuses_when_final_close_safety_check_changes() throws Exception {
         start();
         adapter.closeAccepted = false;
@@ -103,6 +113,7 @@ class LifecycleHttpServerTest {
         boolean closeAccepted = true;
         boolean throwOnClose;
         int closeCalls;
+        String trustedRoot;
         CountDownLatch concurrentDecisionBarrier;
         @Override public List<SafetySnapshot> openProjects() { return open ? List.of(snapshot()) : List.of(); }
         @Override public SafetyDecision freshDecision(String root) {
@@ -113,6 +124,7 @@ class LifecycleHttpServerTest {
             return safe ? new SafetyDecision(true, List.of()) : new SafetyDecision(false, List.of("unsaved-documents"));
         }
         @Override public boolean close(String root) { closeCalls++; if (throwOnClose) throw new RuntimeException("close failed"); if (closeAccepted) open = false; return closeAccepted; }
+        @Override public boolean trust(String root) { trustedRoot = root; return true; }
         private SafetySnapshot snapshot() { return new SafetySnapshot("/workspace", 0, true, false, true, 0, true, 0, true, 0, true, false, true, false, true); }
     }
 }

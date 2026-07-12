@@ -285,6 +285,23 @@ class IntelliJProjectTrustTests(unittest.TestCase):
                 self.assertEqual(0, TRUST.main(["audit"]))
         audit_call.assert_called_once()
 
+    def test_live_trust_posts_exact_root_to_authenticated_plugin(self):
+        runtime = self.base / "plugin-runtime.json"
+        runtime.write_text(json.dumps({"schemaVersion": 1, "port": 43123, "token": "secret"}))
+        repo = self.git_repo(self.allowed / "live")
+        response = mock.MagicMock()
+        response.status = 200
+        response.__enter__.return_value = response
+        with mock.patch.object(TRUST, "urlopen", return_value=response) as opened:
+            self.assertTrue(TRUST.activate_live(repo.resolve(), runtime))
+        request = opened.call_args.args[0]
+        self.assertEqual("POST", request.method)
+        self.assertEqual("Bearer secret", request.get_header("Authorization"))
+        self.assertEqual("http://127.0.0.1:43123/v1/projects/trust?root=%2F" + str(repo.resolve()).lstrip("/").replace("/", "%2F"), request.full_url)
+
+    def test_absent_runtime_is_a_safe_noop(self):
+        self.assertFalse(TRUST.activate_live(self.allowed, self.base / "missing.json"))
+
 
 if __name__ == "__main__":
     unittest.main()

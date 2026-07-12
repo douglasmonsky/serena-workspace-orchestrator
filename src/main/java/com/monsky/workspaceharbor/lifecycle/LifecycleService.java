@@ -1,6 +1,7 @@
 package com.monsky.workspaceharbor.lifecycle;
 
 import com.intellij.ide.plugins.PluginManagerCore;
+import com.intellij.ide.trustedProjects.TrustedProjects;
 import com.intellij.openapi.Disposable;
 import com.intellij.openapi.application.ApplicationManager;
 import com.intellij.openapi.extensions.PluginId;
@@ -21,7 +22,7 @@ import java.util.Set;
 
 /** Owns the authenticated loopback endpoint and its same-instance discovery record. */
 public final class LifecycleService implements Disposable, LifecycleHttpServer.Adapter {
-    private static final Path RUNTIME_FILE = Path.of(System.getProperty("user.home"), ".codex", "state", "pycharm-projects", "plugin-runtime.json");
+    private static final Path RUNTIME_FILE = Path.of(System.getProperty("user.home"), ".codex", "state", "intellij-projects", "plugin-runtime.json");
     private LifecycleHttpServer server;
     private String token;
 
@@ -62,6 +63,27 @@ public final class LifecycleService implements Disposable, LifecycleHttpServer.A
             accepted[0] = true;
         });
         return accepted[0];
+    }
+
+    @Override public boolean trust(String root) {
+        Path requested;
+        try {
+            requested = Path.of(root);
+            if (!requested.isAbsolute() || !requested.equals(requested.normalize())) return false;
+            requested = requested.toRealPath();
+            Path home = Path.of(System.getProperty("user.home")).toRealPath();
+            if (!requested.startsWith(home.resolve("Documents/Codex"))
+                    && !requested.startsWith(home.resolve(".codex/src"))) return false;
+        } catch (IOException | RuntimeException exception) {
+            return false;
+        }
+        Path exactRoot = requested;
+        final boolean[] trusted = {false};
+        ApplicationManager.getApplication().invokeAndWait(() -> {
+            TrustedProjects.setProjectTrusted(exactRoot, true);
+            trusted[0] = TrustedProjects.isProjectTrusted(exactRoot);
+        });
+        return trusted[0];
     }
 
     private Project findOpenProject(String root) {

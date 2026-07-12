@@ -13,6 +13,8 @@ import tempfile
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 BIN_DIR = Path(__file__).resolve().parent
 if str(BIN_DIR) not in sys.path:
@@ -214,6 +216,37 @@ def allow(root: Path, config: Path) -> None:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
+def activate_live(
+    root: Path,
+    runtime_path: Path | None = None,
+) -> bool:
+    """Update a running IntelliJ instance after exact on-disk trust succeeds."""
+    runtime_path = runtime_path or (
+        _account_home() / ".codex/state/intellij-projects/plugin-runtime.json"
+    )
+    if not runtime_path.is_file():
+        return False
+    payload = json.loads(runtime_path.read_text(encoding="utf-8"))
+    if payload.get("schemaVersion") != 1:
+        raise RuntimeError("unsupported Workspace Harbor runtime schema")
+    port = payload.get("port")
+    token = payload.get("token")
+    if not isinstance(port, int) or not 1 <= port <= 65535:
+        raise RuntimeError("invalid Workspace Harbor runtime port")
+    if not isinstance(token, str) or not token:
+        raise RuntimeError("invalid Workspace Harbor runtime token")
+    query = urlencode({"root": str(root)}, safe="")
+    request = Request(
+        f"http://127.0.0.1:{port}/v1/projects/trust?{query}",
+        method="POST",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    with urlopen(request, timeout=5) as response:
+        if response.status != 200:
+            raise RuntimeError("IntelliJ rejected live trust activation")
+    return True
+
+
 def audit(config: Path, allowed: tuple[Path, ...]) -> dict[str, list[str] | bool]:
     try:
         _, entries = load_entries(config)
@@ -261,6 +294,8 @@ def main(argv: list[str]) -> int:
             print(trust_status(root, entries))
             return 0 if trust_status(root, entries) == "trusted" else 1
         allow(root, config)
+        if _is_live_registry(config):
+            activate_live(root)
         return 0
     except (OSError, RuntimeError, ET.ParseError, ValueError):
         return 2

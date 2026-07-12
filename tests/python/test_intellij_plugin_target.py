@@ -28,6 +28,11 @@ class IntelliJPluginTargetTests(unittest.TestCase):
         old_package = ROOT / "src/main/java/com/monsky/codex/pycharm"
         self.assertEqual([], list(old_package.rglob("*.java")))
 
+    def test_runtime_discovery_uses_intellij_state_namespace(self):
+        service = (ROOT / "src/main/java/com/monsky/workspaceharbor/lifecycle/LifecycleService.java").read_text()
+        self.assertIn('"intellij-projects"', service)
+        self.assertNotIn('"pycharm-projects"', service)
+
 
 if __name__ == "__main__":
     unittest.main()
