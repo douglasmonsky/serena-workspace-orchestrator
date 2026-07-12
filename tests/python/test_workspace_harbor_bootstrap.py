@@ -1,5 +1,6 @@
 import importlib.machinery
 import importlib.util
+import os
 import tempfile
 import unittest
 import sys
@@ -142,6 +143,38 @@ class BootstrapPlansTests(unittest.TestCase):
         result = bootstrap.plan_repository(self.root)
         self.assertEqual("needs-decision", result["status"])
         self.assertEqual("invalid-boundary", result["decisions"][0]["code"])
+
+    def test_decisions_are_private_and_language_evidence_bound(self):
+        state = Path(self.tmp.name) / "state"
+        self.write("src/main.rs", "fn main() {}")
+        with patch.dict(os.environ, {"WORKSPACE_HARBOR_BOOTSTRAP_STATE_DIR": str(state)}, clear=False):
+            bootstrap.record_decision(self.root, "language", "rust", "enable")
+            stored = bootstrap.repository_decisions(self.root)["language:rust"]
+        self.assertEqual("source-only", stored["evidence"])
+        record = next((state / "repositories").glob("*.json"))
+        self.assertEqual(0o600, record.stat().st_mode & 0o777)
+        self.assertEqual(0o700, (state / "repositories").stat().st_mode & 0o777)
+
+    def test_tracking_and_exact_command_decisions_and_corrupt_state(self):
+        state = Path(self.tmp.name) / "state"; self.write("setup.lock", "v1")
+        self.write(".serena/codex-integration.yml", "bootstrap:\n  command: {argv: [tool, setup], inputs: [setup.lock]}\n")
+        with patch.dict(os.environ, {"WORKSPACE_HARBOR_BOOTSTRAP_STATE_DIR": str(state)}, clear=False):
+            bootstrap.record_decision(self.root, "tracking", "current", "shared")
+            bootstrap.record_decision(self.root, "command", "current", "approve")
+            decisions = bootstrap.repository_decisions(self.root)
+            self.assertEqual("shared", decisions["tracking:current"]["decision"])
+            self.assertEqual("approve", decisions["command:current"]["decision"])
+            next((state / "repositories").glob("*.json")).write_text("bad")
+            with self.assertRaises(ValueError): bootstrap.repository_decisions(self.root)
+
+    def test_sibling_worktrees_share_repository_decision_key(self):
+        sibling = Path(self.tmp.name) / "sibling"; sibling.mkdir()
+        common = Path(self.tmp.name) / "common"; common.mkdir()
+        state = Path(self.tmp.name) / "state"
+        def git_common(command, **_): return type("Done", (), {"returncode": 0, "stdout": str(common) + "\n"})()
+        with patch.object(bootstrap.subprocess, "run", side_effect=git_common), patch.dict(os.environ, {"WORKSPACE_HARBOR_BOOTSTRAP_STATE_DIR": str(state)}, clear=False):
+            bootstrap.record_decision(self.root, "tracking", "current", "local")
+            self.assertEqual("local", bootstrap.repository_decisions(sibling)["tracking:current"]["decision"])
         (self.root / "outside").mkdir()
         self.write(".serena/codex-integration.yml", "bootstrap:\n  boundaries:\n    include: [missing]\n")
         self.assertEqual("needs-decision", bootstrap.plan_repository(self.root)["status"])

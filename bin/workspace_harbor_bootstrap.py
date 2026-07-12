@@ -6,8 +6,10 @@ from dataclasses import asdict, dataclass
 import hashlib
 import json
 import os
+import fcntl
 from pathlib import Path
 import subprocess
+import tempfile
 from typing import Any
 
 import yaml
@@ -16,6 +18,7 @@ RECIPE_VERSION = 1
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
 CODEX_TASK = Path(os.environ.get("CODEX_TASK", CODEX_HOME / "bin/codex-task"))
 PRUNED_DIRECTORIES = {".git", ".idea", ".serena", ".venv", "venv", "node_modules", "target", "build", "dist", "vendor", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
+STATE_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -91,6 +94,70 @@ def repository_identity(root: Path) -> str:
         common = Path(output.stdout.strip()).resolve() if output.returncode == 0 else root
     except (OSError, subprocess.SubprocessError): common = root
     return hashlib.sha256(str(common).encode()).hexdigest()
+
+
+def _state_dir() -> Path:
+    return Path(os.environ.get("WORKSPACE_HARBOR_BOOTSTRAP_STATE_DIR", CODEX_HOME / "state/workspace-harbor-bootstrap"))
+
+
+def _repository_path(root: Path) -> Path:
+    return _state_dir() / "repositories" / (repository_identity(root) + ".json")
+
+
+def _read_state(path: Path) -> dict[str, object]:
+    if not path.exists(): return {"version": STATE_VERSION, "decisions": {}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error: raise ValueError("corrupt bootstrap state") from error
+    if not isinstance(data, dict) or set(data) != {"version", "decisions"} or data["version"] != STATE_VERSION or not isinstance(data["decisions"], dict): raise ValueError("invalid bootstrap state")
+    return data
+
+
+def _write_state(path: Path, state: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    os.chmod(path.parent.parent, 0o700); os.chmod(path.parent, 0o700)
+    fd, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            json.dump(state, output, sort_keys=True); output.flush(); os.fsync(output.fileno())
+        os.replace(temporary, path)
+    except Exception:
+        try: os.unlink(temporary)
+        except OSError: pass
+        raise
+
+
+def repository_decisions(root: Path) -> dict[str, object]:
+    """Read private repository-scoped decisions; corrupt state is never trusted."""
+    return _read_state(_repository_path(root))["decisions"]
+
+
+def _decision_subject(root: Path, category: str, subject: str) -> str:
+    if category == "language":
+        if subject not in {"python", "rust", "go", "java", "kotlin", "typescript", "svelte", "vue", "angular", "csharp", "php", "ruby", "swift"}: raise ValueError("unknown language")
+        return language_evidence(root, subject)
+    if category == "tracking": return "tracking"
+    if category == "command":
+        plans = plan_repository(root)["plans"]
+        command = next((p for p in plans if p["source"] == "command"), None)
+        if command is None: raise ValueError("no current custom command")
+        return command["plan_id"]
+    raise ValueError("unknown decision category")
+
+
+def record_decision(root: Path, category: str, subject: str, decision: str) -> dict[str, object]:
+    allowed = {"language": {"enable", "ignore"}, "tracking": {"shared", "local"}, "command": {"approve", "reject"}}
+    if category not in allowed or decision not in allowed[category]: raise ValueError("invalid decision")
+    root = resolve_root(root); key = _decision_subject(root, category, subject)
+    path = _repository_path(root); lock_path = path.with_suffix(".lock")
+    lock_path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    with lock_path.open("a+") as lock:
+        os.chmod(lock_path, 0o600); fcntl.flock(lock, fcntl.LOCK_EX)
+        state = _read_state(path); decisions = state["decisions"]
+        decisions[f"{category}:{subject}"] = {"decision": decision, "evidence": key}
+        _write_state(path, state)
+    return {"repository": repository_identity(root), "category": category, "subject": subject, "decision": decision}
 
 
 def _contains_source(root: Path, suffixes: set[str]) -> bool:
