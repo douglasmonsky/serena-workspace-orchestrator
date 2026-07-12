@@ -47,9 +47,20 @@ class SerenaProjectDoctorTests(unittest.TestCase):
         (self.root / "src").mkdir()
         (self.root / "src" / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
         (self.root / "src" / "view.tsx").write_text("export const View = 1;\n", encoding="utf-8")
+        (self.root / "package.json").write_text("{}\n", encoding="utf-8")
+        (self.root / "package-lock.json").write_text("{}\n", encoding="utf-8")
+        (self.root / "pyproject.toml").write_text("[project]\nname='fixture'\n", encoding="utf-8")
+        (self.root / "uv.lock").write_text("version = 1\n", encoding="utf-8")
         self.integration_config = Path(self.temporary_directory.name) / "global-integration.yml"
         self.repair_lock_dir = Path(self.temporary_directory.name) / "locks"
         self.history_path = Path(self.temporary_directory.name) / "history.jsonl"
+        self.bootstrap_state_dir = Path(self.temporary_directory.name) / "bootstrap-state"
+        self.environment_patch = mock.patch.dict(
+            "os.environ",
+            {"WORKSPACE_HARBOR_BOOTSTRAP_STATE_DIR": str(self.bootstrap_state_dir)},
+            clear=False,
+        )
+        self.environment_patch.start()
         self.config_patches = mock.patch.multiple(
             doctor,
             INTEGRATION_CONFIG=self.integration_config,
@@ -60,6 +71,7 @@ class SerenaProjectDoctorTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.config_patches.stop()
+        self.environment_patch.stop()
         self.temporary_directory.cleanup()
 
     def test_mixed_language_gap_is_reported(self) -> None:
@@ -249,6 +261,112 @@ class SerenaProjectDoctorTests(unittest.TestCase):
         self.assertEqual(summary["runs"], 2)
         self.assertEqual(summary["semantic_status_counts"], {"healthy": 1, "stalled": 1})
         self.assertEqual(summary["healthy_rate"], 0.5)
+
+    def test_confirmed_typescript_repairs_but_source_only_rust_needs_decision(self) -> None:
+        (self.root / "src" / "lib.rs").write_text("pub fn value() {}\n", encoding="utf-8")
+
+        result = doctor.repair_languages(self.root)
+
+        self.assertEqual(["typescript"], result["added_languages"])
+        self.assertEqual(["rust"], result["pending_languages"])
+        configured = doctor._load_project_config(self.root)[1]["languages"]
+        self.assertIn("typescript", configured)
+        self.assertNotIn("rust", configured)
+
+    def test_language_enable_and_ignore_decisions_are_remembered(self) -> None:
+        (self.root / "src" / "lib.rs").write_text("pub fn value() {}\n", encoding="utf-8")
+        doctor.bootstrap.record_decision(self.root, "language", "rust", "ignore")
+        ignored = doctor.repair_languages(self.root)
+        self.assertEqual(["rust"], ignored["ignored_languages"])
+        self.assertNotIn("rust", doctor._load_project_config(self.root)[1]["languages"])
+
+        doctor.bootstrap.record_decision(self.root, "language", "rust", "enable")
+        enabled = doctor.repair_languages(self.root)
+        self.assertIn("rust", enabled["added_languages"])
+
+    def test_tracking_policy_replaces_repeated_untracked_warnings(self) -> None:
+        memories = self.root / ".serena/memories"; memories.mkdir()
+        (memories / "core.md").write_text("stable\n", encoding="utf-8")
+        with mock.patch.object(doctor, "_jetbrains_ready", return_value=False), mock.patch.object(
+            doctor, "_broker_services", return_value=[]
+        ), mock.patch.object(doctor, "_memory_check", return_value="ok"), mock.patch.object(
+            doctor.bootstrap, "bootstrap_status", return_value={"status": "not-needed", "plans": []}
+        ):
+            undecided = doctor.audit(self.root)
+        codes = {item["code"] for item in undecided["findings"]}
+        self.assertIn("serena_tracking_policy", codes)
+        self.assertNotIn("untracked_project_config", codes)
+        self.assertNotIn("untracked_memories", codes)
+
+        doctor.bootstrap.record_decision(self.root, "tracking", "serena-files", "local")
+        with mock.patch.object(doctor, "_jetbrains_ready", return_value=False), mock.patch.object(
+            doctor, "_broker_services", return_value=[]
+        ), mock.patch.object(doctor, "_memory_check", return_value="ok"), mock.patch.object(
+            doctor.bootstrap, "bootstrap_status", return_value={"status": "not-needed", "plans": []}
+        ):
+            local = doctor.audit(self.root)
+        codes = {item["code"] for item in local["findings"]}
+        self.assertIn("serena_files_local", codes)
+        self.assertNotIn("serena_tracking_policy", codes)
+        self.assertEqual("local", local["serena_file_policy"])
+
+    def test_plain_audit_reads_status_but_never_runs_bootstrap(self) -> None:
+        with mock.patch.object(doctor.bootstrap, "bootstrap_status", return_value={"status": "pending", "plans": []}) as status, mock.patch.object(
+            doctor.bootstrap, "run_bootstrap"
+        ) as run, mock.patch.object(doctor, "_jetbrains_ready", return_value=False), mock.patch.object(
+            doctor, "_broker_services", return_value=[]
+        ), mock.patch.object(doctor, "_memory_check", return_value="ok"):
+            report = doctor.audit(self.root)
+        status.assert_called_once_with(self.root)
+        run.assert_not_called()
+        self.assertEqual("pending", report["bootstrap"]["status"])
+
+    def test_bootstrap_flag_repairs_runs_and_returns_bootstrap_status(self) -> None:
+        run_result = {"status": "needs-decision", "decisions": [{"code": "fixture"}]}
+        report = {
+            "root": str(self.root),
+            "status": "needs-attention",
+            "configured_languages": ["python", "typescript"],
+            "detected_languages": ["python", "typescript"],
+            "memory_count": 0,
+            "tracked_memory_count": 0,
+            "initial_prompt_configured": False,
+            "jetbrains_service_ready": False,
+            "jetbrains_semantic_health": {"status": "missing"},
+            "broker_services": [],
+            "auto_repair_languages": True,
+            "auto_repair_setting_source": "default",
+            "findings": [],
+            "recommended_action": "fixture",
+        }
+        with mock.patch.object(doctor, "repair_languages", return_value={"changed": False}) as repair, mock.patch.object(
+            doctor.bootstrap, "run_bootstrap", return_value=run_result
+        ) as run, mock.patch.object(doctor, "audit", return_value=report), mock.patch.object(
+            doctor, "_record_history"
+        ), mock.patch("sys.stdout", new_callable=mock.MagicMock):
+            status = doctor.main(["--bootstrap", "--json", str(self.root)])
+        self.assertEqual(3, status)
+        repair.assert_called_once_with(self.root.resolve())
+        run.assert_called_once_with(self.root.resolve())
+
+    def test_bootstrap_flag_requires_pending_language_decision(self) -> None:
+        with mock.patch.object(
+            doctor,
+            "repair_languages",
+            return_value={"changed": False, "pending_languages": ["rust"]},
+        ), mock.patch.object(
+            doctor.bootstrap,
+            "run_bootstrap",
+            return_value={"status": "ready", "cache": "hit"},
+        ), mock.patch.object(
+            doctor,
+            "audit",
+            return_value={"status": "needs-attention"},
+        ), mock.patch.object(doctor, "_record_history"), mock.patch(
+            "sys.stdout", new_callable=mock.MagicMock
+        ):
+            status = doctor.main(["--bootstrap", "--json", str(self.root)])
+        self.assertEqual(3, status)
 
 
 if __name__ == "__main__":

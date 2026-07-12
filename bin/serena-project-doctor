@@ -22,6 +22,11 @@ from typing import Any, Iterator, Sequence
 
 import yaml
 
+BIN_DIR = Path(__file__).resolve().parent
+if str(BIN_DIR) not in sys.path:
+    sys.path.insert(0, str(BIN_DIR))
+import workspace_harbor_bootstrap as bootstrap
+
 
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
 SERENA = Path.home() / ".local" / "share" / "uv" / "tools" / "serena-agent" / "bin" / "serena"
@@ -261,13 +266,34 @@ def _create_project_config(root: Path, languages: Sequence[str]) -> None:
         raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "Serena project creation failed")
 
 
+def _language_policy(
+    root: Path,
+    detected: Sequence[str],
+) -> tuple[list[str], list[str], list[str]]:
+    approved: list[str] = []
+    pending: list[str] = []
+    ignored: list[str] = []
+    for language in detected:
+        decision = bootstrap.language_decision(root, language)
+        if decision == "ignore":
+            ignored.append(language)
+        elif decision == "enable" or bootstrap.language_evidence(root, language) == "confirmed":
+            approved.append(language)
+        else:
+            pending.append(language)
+    return approved, pending, ignored
+
+
 def repair_languages(root: Path) -> dict[str, Any]:
     enabled, setting_source = _auto_repair_setting(root)
     detected, _, truncated = _detect_languages(root)
+    approved, pending, ignored = _language_policy(root, detected)
     result: dict[str, Any] = {
         "enabled": enabled,
         "setting_source": setting_source,
         "detected_languages": detected,
+        "pending_languages": pending,
+        "ignored_languages": ignored,
         "changed": False,
         "created_project_config": False,
         "added_languages": [],
@@ -279,13 +305,16 @@ def repair_languages(root: Path) -> dict[str, Any]:
     if not detected:
         result["reason"] = "no_supported_languages_detected"
         return result
-
     with _repair_lock(root):
         project_path, config, config_error = _load_project_config(root)
         if config_error:
             raise RuntimeError(f"refusing to repair invalid {project_path}: {config_error}")
         if config is None:
-            _create_project_config(root, detected)
+            if not approved:
+                result["configured_languages"] = []
+                result["reason"] = "language_decision_required"
+                return result
+            _create_project_config(root, approved)
             project_path, config, config_error = _load_project_config(root)
             if config is None or config_error:
                 raise RuntimeError(f"Serena did not create a valid {project_path}")
@@ -295,7 +324,11 @@ def repair_languages(root: Path) -> dict[str, Any]:
         configured = config.get("languages")
         if not isinstance(configured, list) or not all(isinstance(item, str) for item in configured):
             raise RuntimeError(f"languages must be a list of strings in {project_path}")
-        missing = [language for language in detected if language not in configured]
+        pending = [language for language in pending if language not in configured]
+        ignored = [language for language in ignored if language not in configured]
+        result["pending_languages"] = pending
+        result["ignored_languages"] = ignored
+        missing = [language for language in approved if language not in configured]
         result["added_languages"] = missing
         if missing:
             original = project_path.read_text(encoding="utf-8")
@@ -306,7 +339,12 @@ def repair_languages(root: Path) -> dict[str, Any]:
             _atomic_write(project_path, updated)
             result["changed"] = True
         result["configured_languages"] = [*configured, *missing]
-        result["reason"] = "updated" if missing else "already_current"
+        if missing:
+            result["reason"] = "updated"
+        elif pending:
+            result["reason"] = "language_decision_required"
+        else:
+            result["reason"] = "already_current"
     return result
 
 
@@ -549,11 +587,19 @@ def audit(root: Path) -> dict[str, Any]:
     configured = []
     if config is not None and isinstance(config.get("languages"), list):
         configured = [str(item) for item in config["languages"]]
-    missing_languages = [language for language in detected if language not in configured]
+    approved_languages, pending_languages, ignored_languages = _language_policy(root, detected)
+    missing_languages = [language for language in approved_languages if language not in configured]
+    pending_languages = [language for language in pending_languages if language not in configured]
     memories_dir = root / ".serena" / "memories"
     memories = sorted(memories_dir.rglob("*.md")) if memories_dir.is_dir() else []
     git_repo = _is_git_repo(root)
     tracked_memories = [path for path in memories if git_repo and _is_tracked(root, path)]
+    project_config_tracked = bool(
+        git_repo and project_path.is_file() and _is_tracked(root, project_path)
+    )
+    untracked_memory_count = len(memories) - len(tracked_memories) if git_repo else 0
+    serena_file_policy = bootstrap.tracking_decision(root)
+    bootstrap_report = bootstrap.bootstrap_status(root)
     findings: list[dict[str, str]] = []
 
     if config is None:
@@ -572,6 +618,18 @@ def audit(root: Path) -> dict[str, Any]:
                 "message": "Detected but not configured: " + ", ".join(missing_languages),
             }
         )
+    if pending_languages:
+        findings.append(
+            {
+                "severity": "warning",
+                "code": "language_policy_decision",
+                "message": (
+                    "Source detected without a confirmed dependency boundary: "
+                    + ", ".join(pending_languages)
+                    + ". Choose enable or ignore once for this repository."
+                ),
+            }
+        )
     if not memories:
         findings.append(
             {
@@ -588,20 +646,71 @@ def audit(root: Path) -> dict[str, Any]:
                 "message": "No project-specific activation prompt is configured.",
             }
         )
-    if git_repo and project_path.is_file() and not _is_tracked(root, project_path):
+    has_untracked_serena_files = bool(
+        git_repo
+        and (
+            (project_path.is_file() and not project_config_tracked)
+            or untracked_memory_count
+        )
+    )
+    if has_untracked_serena_files and serena_file_policy is None:
         findings.append(
             {
                 "severity": "warning",
-                "code": "untracked_project_config",
-                "message": ".serena/project.yml is not tracked by Git, so worktrees may drift.",
+                "code": "serena_tracking_policy",
+                "message": (
+                    "Choose once whether Serena project configuration and curated memories "
+                    "are shared through Git or intentionally local."
+                ),
             }
         )
-    if git_repo and len(tracked_memories) < len(memories):
+    elif serena_file_policy == "local":
+        findings.append(
+            {
+                "severity": "info",
+                "code": "serena_files_local",
+                "message": "Serena configuration and memories are intentionally local on this machine.",
+            }
+        )
+    elif has_untracked_serena_files and serena_file_policy == "shared":
+        if project_path.is_file() and not project_config_tracked:
+            findings.append(
+                {
+                    "severity": "warning",
+                    "code": "untracked_project_config",
+                    "message": ".serena/project.yml is intended to be shared but is not tracked by Git.",
+                }
+            )
+        if untracked_memory_count:
+            findings.append(
+                {
+                    "severity": "warning",
+                    "code": "untracked_memories",
+                    "message": f"{untracked_memory_count} shared Serena memory file(s) are not tracked by Git.",
+                }
+            )
+    if bootstrap_report.get("status") == "needs-decision":
         findings.append(
             {
                 "severity": "warning",
-                "code": "untracked_memories",
-                "message": f"{len(memories) - len(tracked_memories)} Serena memory file(s) are not tracked by Git.",
+                "code": "bootstrap_needs_decision",
+                "message": "Dependency bootstrap requires one explicit repository decision.",
+            }
+        )
+    elif bootstrap_report.get("status") == "failed":
+        findings.append(
+            {
+                "severity": "warning",
+                "code": "bootstrap_failed",
+                "message": "The last explicit dependency bootstrap run failed.",
+            }
+        )
+    elif bootstrap_report.get("status") == "pending":
+        findings.append(
+            {
+                "severity": "info",
+                "code": "bootstrap_pending",
+                "message": "A deterministic dependency plan is ready for the explicit bootstrap phase.",
             }
         )
     if truncated:
@@ -635,17 +744,21 @@ def audit(root: Path) -> dict[str, Any]:
     blockers = [item for item in findings if item["severity"] == "error"]
     warnings = [item for item in findings if item["severity"] == "warning"]
     auto_repair_enabled, auto_repair_source = _auto_repair_setting(root)
-    if semantic_status == "healthy":
-        recommended_action = "Use Serena normally."
-    elif semantic_status == "missing":
-        recommended_action = (
-            f'Run open-codex-project-in-intellij "{root}" once, then rerun the doctor once.'
-        )
-    elif semantic_status in {"stalled", "plugin-error"}:
+    if semantic_status in {"stalled", "plugin-error"}:
         recommended_action = (
             "Do not retry Serena tools repeatedly. Save any IDE edits, recover the exact "
             "IntelliJ project service, then rerun the doctor once; use native diagnostics "
             "if that bounded retry is not healthy."
+        )
+    elif bootstrap_report.get("status") == "needs-decision":
+        recommended_action = "Resolve the reported bootstrap decision once, then rerun preparation."
+    elif bootstrap_report.get("status") == "pending":
+        recommended_action = f'Run serena-project-doctor --bootstrap "{root}" once.'
+    elif semantic_status == "healthy":
+        recommended_action = "Use Serena normally."
+    elif semantic_status == "missing":
+        recommended_action = (
+            f'Run open-codex-project-in-intellij "{root}" once, then rerun the doctor once.'
         )
     else:
         recommended_action = (
@@ -661,11 +774,15 @@ def audit(root: Path) -> dict[str, Any]:
         "detected_languages": detected,
         "language_file_counts": counts,
         "missing_languages": missing_languages,
+        "pending_language_decisions": pending_languages,
+        "ignored_languages": ignored_languages,
         "memory_count": len(memories),
         "tracked_memory_count": len(tracked_memories),
         "memory_check": _memory_check(root, config is not None),
         "initial_prompt_configured": bool(config and str(config.get("initial_prompt") or "").strip()),
-        "project_config_tracked": bool(git_repo and project_path.is_file() and _is_tracked(root, project_path)),
+        "project_config_tracked": project_config_tracked,
+        "serena_file_policy": serena_file_policy,
+        "bootstrap": bootstrap_report,
         "jetbrains_service_ready": jetbrains_ready,
         "jetbrains_semantic_health": semantic_health,
         "broker_services": _broker_services(root),
@@ -681,6 +798,8 @@ def _print_text(report: dict[str, Any]) -> None:
     print(f"Status: {report['status']}")
     print("Configured languages: " + (", ".join(report["configured_languages"]) or "none"))
     print("Detected languages: " + (", ".join(report["detected_languages"]) or "none"))
+    if report.get("pending_language_decisions"):
+        print("Pending language decisions: " + ", ".join(report["pending_language_decisions"]))
     print(
         f"Memories: {report['memory_count']} total, {report['tracked_memory_count']} tracked; "
         f"initial prompt: {'yes' if report['initial_prompt_configured'] else 'no'}"
@@ -694,6 +813,13 @@ def _print_text(report: dict[str, Any]) -> None:
         f"Language auto-repair: {'enabled' if report['auto_repair_languages'] else 'disabled'} "
         f"({report['auto_repair_setting_source']})"
     )
+    bootstrap_report = report.get("bootstrap", {})
+    if isinstance(bootstrap_report, dict):
+        print(
+            "Dependency bootstrap: "
+            + str(bootstrap_report.get("status", "unknown"))
+            + (f" ({bootstrap_report['cache']})" if bootstrap_report.get("cache") else "")
+        )
     if report["findings"]:
         print("Findings:")
         for finding in report["findings"]:
@@ -718,6 +844,11 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="add detected supported languages unless project configuration opts out",
     )
+    parser.add_argument(
+        "--bootstrap",
+        action="store_true",
+        help="repair confirmed languages and run the selected deterministic dependency plan",
+    )
     return parser
 
 
@@ -735,11 +866,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     try:
         root = _resolve_root(args.project)
-        repair = repair_languages(root) if args.repair_languages else None
+        repair = repair_languages(root) if args.repair_languages or args.bootstrap else None
+        bootstrap_run = bootstrap.run_bootstrap(root) if args.bootstrap else None
         report = audit(root)
         if repair is not None:
             report["language_repair"] = repair
-    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+        if bootstrap_run is not None:
+            report["bootstrap_run"] = bootstrap_run
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
         print(f"serena-project-doctor: {error}", file=sys.stderr)
         return 2
     try:
@@ -750,6 +884,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(report, indent=2, sort_keys=True))
     else:
         _print_text(report)
+    if args.bootstrap and bootstrap_run is not None:
+        bootstrap_status = bootstrap.result_exit_status(bootstrap_run)
+        if bootstrap_status:
+            return bootstrap_status
+        if repair is not None and repair.get("pending_languages"):
+            return 3
     if args.strict and report["status"] != "ready":
         return 1
     return 0

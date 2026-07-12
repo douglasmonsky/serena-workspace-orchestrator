@@ -176,6 +176,14 @@ def language_decision(root: Path, language: str) -> str | None:
     return item["decision"] if isinstance(item, dict) and item.get("evidence") == language_evidence(root, language) else None
 
 
+def tracking_decision(root: Path) -> str | None:
+    item = repository_decisions(root).get("tracking:serena-files")
+    if not isinstance(item, dict) or item.get("evidence") != "tracking":
+        return None
+    decision = item.get("decision")
+    return decision if decision in {"shared", "local"} else None
+
+
 def _decision_subject(root: Path, category: str, subject: str) -> str:
     if category == "language":
         if subject not in SUPPORTED_LANGUAGES: raise ValueError("unknown language")
@@ -458,6 +466,10 @@ def _exit_status(result: dict[str, object]) -> int:
     if status == "needs-decision":
         return 3
     return 2
+
+
+def result_exit_status(result: dict[str, object]) -> int:
+    return _exit_status(result)
 
 
 def _print_result(result: dict[str, object], as_json: bool) -> None:
