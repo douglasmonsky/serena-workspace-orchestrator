@@ -1,0 +1,12 @@
+<idea-plugin>
+  <id>com.monsky.codex.pycharm.lifecycle</id>
+  <name>Codex PyCharm Lifecycle Companion</name>
+  <vendor>Monsky</vendor>
+  <idea-version since-build="261" until-build="261.*"/>
+  <depends>com.intellij.modules.platform</depends>
+  <depends>org.jetbrains.plugins.terminal</depends>
+  <extensions defaultExtensionNs="com.intellij">
+    <applicationService serviceImplementation="com.monsky.codex.pycharm.lifecycle.LifecycleService"/>
+    <postStartupActivity implementation="com.monsky.codex.pycharm.lifecycle.LifecycleStartupActivity"/>
+  </extensions>
+</idea-plugin>
