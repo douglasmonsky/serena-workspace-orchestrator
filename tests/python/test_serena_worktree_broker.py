@@ -66,6 +66,39 @@ class SerenaWorktreeBrokerTests(unittest.TestCase):
 
         self.assertNotEqual(base, queryable)
 
+    def test_owner_identity_prefers_explicit_thread_group(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"WORKSPACE_HARBOR_OWNER_ID": "parent-thread", "CODEX_THREAD_ID": "child-thread"},
+            clear=True,
+        ):
+            self.assertEqual("parent-thread", broker._owner_id())
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "direct-thread"}, clear=True):
+            self.assertEqual("direct-thread", broker._owner_id())
+
+    def test_root_ownership_rejects_another_thread_but_allows_other_roots(self) -> None:
+        first = Path(self.temporary_directory.name) / "first"; first.mkdir()
+        second = Path(self.temporary_directory.name) / "second"; second.mkdir()
+        third = Path(self.temporary_directory.name) / "third"; third.mkdir()
+        live = {
+            "pid": os.getpid(),
+            "process_started": broker._process_details(os.getpid())[0],
+            "owner_id": "thread-a",
+        }
+        state = {
+            "services": {
+                "first": {"project_root": str(first), "leases": {"one": live.copy()}},
+                "second": {"project_root": str(second), "leases": {"two": live.copy()}},
+            }
+        }
+        self.assertEqual({"thread-a"}, broker._root_owners(state, first))
+        broker._assert_root_owner(state, first, "thread-a")
+        with self.assertRaisesRegex(RuntimeError, "owned by another Codex task"):
+            broker._assert_root_owner(state, first, "thread-b")
+        with self.assertRaisesRegex(RuntimeError, "owned by another Codex task"):
+            broker._assert_root_owner(state, second, "thread-b")
+        broker._assert_root_owner(state, third, "thread-b")
+
     def test_locked_state_round_trips_with_private_permissions(self) -> None:
         with broker._locked_state() as state:
             state["services"]["example"] = {"pid": 123}
@@ -157,14 +190,14 @@ class SerenaWorktreeBrokerTests(unittest.TestCase):
         self.assertIn("--repair-languages", command)
         self.assertIn("--json", command)
 
-    def test_pycharm_launcher_timeout_exceeds_helper_ready_timeout(self) -> None:
+    def test_intellij_launcher_timeout_exceeds_helper_ready_timeout(self) -> None:
         completed = mock.Mock(returncode=0, stdout="", stderr="")
-        launcher = Path(self.temporary_directory.name) / "open-pycharm"
+        launcher = Path(self.temporary_directory.name) / "open-intellij"
         launcher.write_text("fixture", encoding="utf-8")
-        with mock.patch.object(broker, "PYCHARM_LAUNCHER", launcher), mock.patch.object(
+        with mock.patch.object(broker, "INTELLIJ_LAUNCHER", launcher), mock.patch.object(
             broker.subprocess, "run", return_value=completed
         ) as run:
-            broker._open_pycharm(Path("/tmp/example"))
+            broker._open_intellij(Path("/tmp/example"))
 
         self.assertGreaterEqual(run.call_args.kwargs["timeout"], 150)
 

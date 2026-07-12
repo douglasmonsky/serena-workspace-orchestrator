@@ -74,7 +74,7 @@ EXTENSION_LANGUAGES = {
     ".tsx": "typescript",
     ".vue": "vue",
 }
-PYCHARM_PROBE_LANGUAGE_PRIORITY = {
+INTELLIJ_PROBE_LANGUAGE_PRIORITY = {
     ".py": 0,
     ".pyi": 0,
     ".js": 1,
@@ -392,7 +392,7 @@ def _semantic_probe_file(root: Path) -> str | None:
                     source_priority = 4
                 else:
                     source_priority = 3
-                language_priority = PYCHARM_PROBE_LANGUAGE_PRIORITY.get(path.suffix.lower(), 2)
+                language_priority = INTELLIJ_PROBE_LANGUAGE_PRIORITY.get(path.suffix.lower(), 2)
                 analyzable.append(
                     ((language_priority, source_priority, relative_path), relative_path)
                 )
@@ -639,12 +639,12 @@ def audit(root: Path) -> dict[str, Any]:
         recommended_action = "Use Serena normally."
     elif semantic_status == "missing":
         recommended_action = (
-            f'Run open-codex-project-in-pycharm "{root}" once, then rerun the doctor once.'
+            f'Run open-codex-project-in-intellij "{root}" once, then rerun the doctor once.'
         )
     elif semantic_status in {"stalled", "plugin-error"}:
         recommended_action = (
             "Do not retry Serena tools repeatedly. Save any IDE edits, recover the exact "
-            "PyCharm project service, then rerun the doctor once; use native diagnostics "
+            "IntelliJ project service, then rerun the doctor once; use native diagnostics "
             "if that bounded retry is not healthy."
         )
     else:

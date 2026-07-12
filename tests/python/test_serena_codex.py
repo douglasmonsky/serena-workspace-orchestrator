@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import json
+import contextlib
+import importlib.machinery
 import importlib.util
+import io
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 
 BIN_DIR = Path(__file__).resolve().parents[2] / "bin"
@@ -16,6 +22,11 @@ if not BIN_DIR.is_dir(): BIN_DIR = Path(__file__).resolve().parents[1] / "bin"
 LAUNCHER = BIN_DIR / "serena-codex"
 PROJECT_CONFIG = 'project_name: "fixture"\nlanguages:\n- python\nlanguage_backend:\n'
 SERENA_PACKAGE_AVAILABLE = importlib.util.find_spec("serena") is not None
+LOADER = importlib.machinery.SourceFileLoader("serena_codex_launcher", str(LAUNCHER))
+SPEC = importlib.util.spec_from_loader(LOADER.name, LOADER)
+launcher = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = launcher
+LOADER.exec_module(launcher)
 
 
 class SerenaCodexLauncherTests(unittest.TestCase):
@@ -46,6 +57,41 @@ class SerenaCodexLauncherTests(unittest.TestCase):
         marker = root / ".serena" / "project.yml"
         marker.parent.mkdir(parents=True)
         marker.write_text('project_name: "fixture"\n', encoding="utf-8")
+
+    def service_status(self, root: Path, matches, owned_ports):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(
+            launcher, "matching_jetbrains_clients", return_value=matches
+        ), mock.patch.object(
+            launcher.ide, "configured_app", return_value=Path("/IntelliJ IDEA.app")
+        ), mock.patch.object(
+            launcher.ide, "app_version", return_value="2026.1.4"
+        ), mock.patch.object(
+            launcher.ide,
+            "intellij_owned_port",
+            side_effect=lambda port, app: port in owned_ports,
+        ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            status = launcher._jetbrains_service_status_command(
+                ["jetbrains-service-status", str(root)]
+            )
+        return status, stdout.getvalue(), stderr.getvalue()
+
+    def test_service_status_requires_one_intellij_owned_match(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            match = SimpleNamespace(_port=24227)
+            status, stdout, stderr = self.service_status(root, [match], {24227})
+        self.assertEqual(0, status, stderr)
+        self.assertIn("READY IntelliJ-owned Serena service", stdout)
+
+    def test_service_status_rejects_foreign_duplicate_for_same_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            matches = [SimpleNamespace(_port=24226), SimpleNamespace(_port=24227)]
+            status, stdout, stderr = self.service_status(root, matches, {24227})
+        self.assertEqual(1, status)
+        self.assertEqual("", stdout)
+        self.assertIn("AMBIGUOUS Serena services", stderr)
 
     def test_unique_nested_project_is_injected_into_mcp_command(self) -> None:
         """A task root with one nested project recovers it after a restart."""
@@ -144,9 +190,9 @@ class SerenaCodexLauncherTests(unittest.TestCase):
 
     @unittest.skipUnless(SERENA_PACKAGE_AVAILABLE, "external serena package is unavailable")
     def test_jetbrains_health_failure_returns_nonzero_status(self) -> None:
-        """A project absent from PyCharm cannot produce a false green result."""
+        """A project absent from IntelliJ cannot produce a false green result."""
         with tempfile.TemporaryDirectory() as temporary_directory:
-            project_root = Path(temporary_directory) / "not-open-in-pycharm"
+            project_root = Path(temporary_directory) / "not-open-in-intellij"
             marker = project_root / ".serena" / "project.yml"
             marker.parent.mkdir(parents=True)
             project_config = PROJECT_CONFIG.replace(
@@ -168,7 +214,7 @@ class SerenaCodexLauncherTests(unittest.TestCase):
     def test_jetbrains_service_status_reports_missing_project(self) -> None:
         """Service discovery distinguishes a closed project from a dropped link."""
         with tempfile.TemporaryDirectory() as temporary_directory:
-            project_root = Path(temporary_directory) / "not-open-in-pycharm"
+            project_root = Path(temporary_directory) / "not-open-in-intellij"
             project_root.mkdir()
 
             result = self.run_launcher(

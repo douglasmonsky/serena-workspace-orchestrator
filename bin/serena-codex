@@ -18,6 +18,11 @@ import sys
 import traceback
 from typing import Any, NoReturn, Sequence
 
+BIN_DIR = Path(__file__).resolve().parent
+if str(BIN_DIR) not in sys.path:
+    sys.path.insert(0, str(BIN_DIR))
+import workspace_harbor_ide as ide
+
 
 REAL_SERENA = Path(
     os.environ.get(
@@ -357,6 +362,18 @@ def _resolve_project_command(args: Sequence[str]) -> int:
     return 1
 
 
+def matching_jetbrains_clients(project_root: Path) -> list[Any]:
+    """Return every Serena plugin client matching the exact project root."""
+    from serena.jetbrains.jetbrains_plugin_client import JetBrainsPluginClientManager
+
+    matches = []
+    for future in JetBrainsPluginClientManager()._submit_scan():
+        client = future.result()
+        if client.matches(project_root):
+            matches.append(client)
+    return matches
+
+
 def _jetbrains_service_status_command(args: Sequence[str]) -> int:
     """Report whether the exact project root has a live Serena IDE service."""
     if len(args) > 2:
@@ -367,19 +384,28 @@ def _jetbrains_service_status_command(args: Sequence[str]) -> int:
         print(f"serena-codex: not a directory: {project_root}", file=sys.stderr)
         return 2
 
-    from serena.jetbrains.jetbrains_plugin_client import (
-        JetBrainsPluginClientManager,
-        ServerNotFoundError,
-    )
-
     resolved_root = project_root.resolve()
     try:
-        JetBrainsPluginClientManager().find_client(resolved_root)
-    except ServerNotFoundError:
+        app = ide.configured_app()
+        ide.app_version(app)
+        matches = matching_jetbrains_clients(resolved_root)
+    except (OSError, RuntimeError, ValueError) as error:
+        print(f"UNAVAILABLE IntelliJ Serena ownership check: {error}", file=sys.stderr)
+        return 1
+    if not matches:
         print(f"MISSING Serena JetBrains service: {resolved_root}", file=sys.stderr)
         return 1
-    print(f"READY Serena JetBrains service: {resolved_root}")
-    return 0
+    owned = [client for client in matches if ide.intellij_owned_port(client._port, app)]
+    foreign = [client for client in matches if client not in owned]
+    if len(owned) == 1 and not foreign:
+        print(f"READY IntelliJ-owned Serena service: {resolved_root}")
+        return 0
+    ports = sorted(client._port for client in matches)
+    print(
+        f"AMBIGUOUS Serena services for {resolved_root}: matching ports {ports}",
+        file=sys.stderr,
+    )
+    return 1
 
 
 def main(args: Sequence[str] | None = None) -> int:

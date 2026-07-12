@@ -45,10 +45,10 @@ REAL_SERENA = Path(
 MCP_PROXY = Path(
     os.environ.get("SERENA_BROKER_MCP_PROXY", Path.home() / ".local" / "bin" / "mcp-proxy")
 )
-PYCHARM_LAUNCHER = Path(
+INTELLIJ_LAUNCHER = Path(
     os.environ.get(
-        "SERENA_BROKER_PYCHARM_LAUNCHER",
-        CODEX_HOME / "bin" / "open-codex-project-in-pycharm",
+        "SERENA_BROKER_INTELLIJ_LAUNCHER",
+        CODEX_HOME / "bin" / "open-codex-project-in-intellij",
     )
 )
 PROJECT_DOCTOR = Path(
@@ -61,8 +61,8 @@ PORT_FIRST = int(os.environ.get("SERENA_BROKER_PORT_FIRST", "24320"))
 PORT_LAST = int(os.environ.get("SERENA_BROKER_PORT_LAST", "24419"))
 DEFAULT_IDLE_SECONDS = int(os.environ.get("SERENA_BROKER_IDLE_SECONDS", "900"))
 START_TIMEOUT_SECONDS = float(os.environ.get("SERENA_BROKER_START_TIMEOUT", "30"))
-PYCHARM_LAUNCH_TIMEOUT_SECONDS = float(
-    os.environ.get("SERENA_BROKER_PYCHARM_LAUNCH_TIMEOUT", "150")
+INTELLIJ_LAUNCH_TIMEOUT_SECONDS = float(
+    os.environ.get("SERENA_BROKER_INTELLIJ_LAUNCH_TIMEOUT", "150")
 )
 
 
@@ -216,6 +216,49 @@ def _prune_dead_leases(record: dict[str, Any]) -> None:
         record["idle_since"] = _now()
 
 
+def _owner_id() -> str:
+    """Return the logical Codex task group that owns a worktree lease."""
+    explicit = os.environ.get("WORKSPACE_HARBOR_OWNER_ID", "").strip()
+    thread = os.environ.get("CODEX_THREAD_ID", "").strip()
+    value = explicit or thread or f"manual-pid-{os.getpid()}"
+    if len(value) > 128 or any(character.isspace() for character in value):
+        raise RuntimeError("invalid Workspace Harbor owner identity")
+    return value
+
+
+def _root_owners(state: dict[str, Any], project_root: Path) -> set[str]:
+    """Return live logical owners for one canonical worktree root."""
+    canonical_root = str(project_root.resolve())
+    owners: set[str] = set()
+    for record in state.get("services", {}).values():
+        if not isinstance(record, dict):
+            continue
+        try:
+            record_root = str(Path(record.get("project_root", "")).resolve())
+        except (OSError, TypeError, ValueError):
+            continue
+        if record_root != canonical_root:
+            continue
+        _prune_dead_leases(record)
+        for lease in record.get("leases", {}).values():
+            if not isinstance(lease, dict):
+                continue
+            owner = lease.get("owner_id")
+            if isinstance(owner, str) and owner:
+                owners.add(owner)
+            else:
+                owners.add(f"legacy-pid-{lease.get('pid', 'unknown')}")
+    return owners
+
+
+def _assert_root_owner(state: dict[str, Any], project_root: Path, owner_id: str) -> None:
+    owners = _root_owners(state, project_root)
+    if owners and owners != {owner_id}:
+        raise RuntimeError(
+            f"worktree is owned by another Codex task: {sorted(owners)}"
+        )
+
+
 def _stop_owned_service(record: dict[str, Any]) -> bool:
     if not _process_is_owned(record):
         return False
@@ -237,19 +280,19 @@ def _stop_owned_service(record: dict[str, Any]) -> bool:
     return True
 
 
-def _open_pycharm(project_root: Path) -> None:
-    if not PYCHARM_LAUNCHER.is_file():
-        raise RuntimeError(f"PyCharm launcher not found: {PYCHARM_LAUNCHER}")
+def _open_intellij(project_root: Path) -> None:
+    if not INTELLIJ_LAUNCHER.is_file():
+        raise RuntimeError(f"IntelliJ launcher not found: {INTELLIJ_LAUNCHER}")
     result = subprocess.run(
-        [str(PYCHARM_LAUNCHER), str(project_root)],
+        [str(INTELLIJ_LAUNCHER), str(project_root)],
         check=False,
         capture_output=True,
         text=True,
-        timeout=PYCHARM_LAUNCH_TIMEOUT_SECONDS,
+        timeout=INTELLIJ_LAUNCH_TIMEOUT_SECONDS,
     )
     if result.returncode != 0:
         message = result.stderr.strip() or result.stdout.strip()
-        raise RuntimeError(f"failed to open PyCharm project: {message}")
+        raise RuntimeError(f"failed to open IntelliJ project: {message}")
 
 
 def _auto_repair_project_languages(project_root: Path) -> None:
@@ -288,7 +331,7 @@ def _start_service(
         services.pop(key, None)
 
     if backend.lower() == "jetbrains":
-        _open_pycharm(project_root)
+        _open_intellij(project_root)
 
     used_ports = {
         int(item["port"])
@@ -405,16 +448,19 @@ def _connect(args: argparse.Namespace) -> int:
         raise RuntimeError(f"mcp-proxy not found: {MCP_PROXY}")
 
     lease_id = uuid.uuid4().hex
+    owner_id = _owner_id()
     broker_details = _process_details(os.getpid())
     if broker_details is None:
         raise RuntimeError("could not identify broker process")
     with _locked_state() as state:
         _cleanup_state(state, DEFAULT_IDLE_SECONDS, stop_idle=False)
+        _assert_root_owner(state, project_root, owner_id)
         key, record = _start_service(
             state, project_root, args.backend, args.context, args.add_mode
         )
         record["leases"][lease_id] = {
             "created_at": _now(),
+            "owner_id": owner_id,
             "pid": os.getpid(),
             "process_started": broker_details[0],
         }
@@ -483,6 +529,13 @@ def _status(args: argparse.Namespace) -> int:
                 "pid": record.get("pid"),
                 "port": record.get("port"),
                 "leases": len(record.get("leases", {})),
+                "owners": sorted(
+                    {
+                        lease.get("owner_id", f"legacy-pid-{lease.get('pid', 'unknown')}")
+                        for lease in record.get("leases", {}).values()
+                        if isinstance(lease, dict)
+                    }
+                ),
                 "idle_since": record.get("idle_since"),
                 "healthy": _process_is_owned(record) and _tcp_ready(int(record.get("port", 0))),
             }
@@ -497,7 +550,8 @@ def _status(args: argparse.Namespace) -> int:
         for item in payload:
             print(
                 f"{item['key']} {item['backend']} pid={item['pid']} port={item['port']} "
-                f"leases={item['leases']} healthy={str(item['healthy']).lower()} "
+                f"leases={item['leases']} owners={','.join(item['owners']) or '-'} "
+                f"healthy={str(item['healthy']).lower()} "
                 f"root={item['project_root']}"
             )
     return 0

@@ -180,7 +180,7 @@ class SerenaProjectDoctorTests(unittest.TestCase):
         )
         self.assertEqual(client._timeout, 300)
 
-    def test_semantic_probe_prefers_pycharm_native_source_over_gradle_and_java(self) -> None:
+    def test_semantic_probe_prefers_intellij_native_source_over_gradle_and_java(self) -> None:
         (self.root / "build.gradle.kts").write_text("plugins { java }\n", encoding="utf-8")
         java = self.root / "src/main/java/example/App.java"
         java.parent.mkdir(parents=True)
