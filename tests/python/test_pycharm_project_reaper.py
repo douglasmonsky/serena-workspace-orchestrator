@@ -89,6 +89,59 @@ class RegistryTests(unittest.TestCase):
                 self.assertTrue(report["reportOnly"])
                 self.assertEqual([], report["selected"])
 
+    def test_load_registry_quarantines_invalid_project_records(self):
+        root = str(Path(self.tmp.name).resolve())
+        timestamp = "2026-01-01T00:00:00Z"
+        invalid_records = [
+            {"root": True, "registeredAt": timestamp, "lastReadyAt": timestamp},
+            {"root": root, "lastReadyAt": timestamp},
+            {"root": "", "registeredAt": timestamp, "lastReadyAt": timestamp},
+            {"root": "relative", "registeredAt": timestamp, "lastReadyAt": timestamp},
+            {"root": root + "/.", "registeredAt": timestamp, "lastReadyAt": timestamp},
+            {"root": root, "registeredAt": "bad", "lastReadyAt": timestamp},
+            {"root": root, "registeredAt": timestamp, "lastReadyAt": "bad"},
+        ]
+        for record in invalid_records:
+            with self.subTest(record=record):
+                self.state.write_text(json.dumps({"schemaVersion": 1, "projects": [record]}))
+                registry, corrupt = reaper.load_registry(self.state)
+                self.assertTrue(corrupt)
+                self.assertEqual([], registry["projects"])
+                self.assertFalse(self.state.exists())
+
+    def test_python39_cleanup_quarantines_invalid_project_records(self):
+        root = str(Path(self.tmp.name).resolve())
+        timestamp = "2026-01-01T00:00:00Z"
+        invalid_records = [
+            {"root": True, "registeredAt": timestamp, "lastReadyAt": timestamp},
+            {"root": root, "lastReadyAt": timestamp},
+            {"root": "", "registeredAt": timestamp, "lastReadyAt": timestamp},
+            {"root": "relative", "registeredAt": timestamp, "lastReadyAt": timestamp},
+            {"root": root + "/.", "registeredAt": timestamp, "lastReadyAt": timestamp},
+            {"root": root, "registeredAt": "bad", "lastReadyAt": timestamp},
+            {"root": root, "registeredAt": timestamp, "lastReadyAt": "bad"},
+        ]
+        for record in invalid_records:
+            with self.subTest(record=record):
+                self.state.write_text(json.dumps({"schemaVersion": 1, "projects": [record]}))
+                environment = os.environ | {
+                    "PYCHARM_PROJECT_REAPER_STATE_FILE": str(self.state),
+                    "PYCHARM_PROJECT_REAPER_RUNTIME_FILE": str(Path(self.tmp.name) / "invalid-runtime.json"),
+                    "PYCHARM_PROJECT_REAPER_BROKER_COMMAND": str(Path(self.tmp.name) / "missing-broker"),
+                }
+                completed = subprocess.run(
+                    ["/usr/bin/python3", SCRIPT, "cleanup"],
+                    capture_output=True,
+                    text=True,
+                    env=environment,
+                    check=False,
+                )
+                self.assertEqual(0, completed.returncode, completed.stderr)
+                self.assertFalse(self.state.exists())
+                report = json.loads(completed.stdout)
+                self.assertTrue(report["reportOnly"])
+                self.assertEqual([], report["selected"])
+
     def test_unregistered_is_unmanaged(self):
         decision = reaper.classify("/not-registered", {}, {}, now=2000)
         self.assertEqual("unmanaged", decision.classification)

@@ -47,7 +47,13 @@ def load_registry(path=STATE):
                 or not isinstance(data["projects"], list)):
             raise ValueError("schema")
         for project in data["projects"]:
-            if not isinstance(project, dict): raise ValueError("project")
+            if (not isinstance(project, dict) or set(project) != {"root", "registeredAt", "lastReadyAt"}
+                    or not all(isinstance(project[key], str) for key in project)
+                    or not project["root"] or not Path(project["root"]).is_absolute()
+                    or canonical(project["root"]) != project["root"]
+                    or not _valid_timestamp(project["registeredAt"])
+                    or not _valid_timestamp(project["lastReadyAt"])):
+                raise ValueError("project")
         return data, False
     except (OSError, ValueError, json.JSONDecodeError):
         stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
