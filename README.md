@@ -40,7 +40,11 @@ python3 -m unittest discover -s tests/python -p 'test_*.py' -v
 - `serena-codex jetbrains-service-status ROOT` requires one IntelliJ-owned
   Serena service and rejects foreign or duplicate matches.
 - `serena-project-doctor ROOT` performs one bounded health and language-coverage
-  check.
+  check; `--bootstrap` performs explicit dependency preparation after reporting
+  any one-time decisions.
+- `workspace-harbor-bootstrap status|run ROOT` plans and caches deterministic
+  repository setup; `decide` records local language, tracking, or custom-command
+  consent.
 - `serena-worktree-broker status|cleanup` reports ownership and reclaims only
   broker-owned idle services.
 
@@ -71,6 +75,51 @@ The broker exposes owners in `serena-worktree-broker status`. IntelliJ itself
 remains one application process; project-window and worktree ownership is the
 unit Workspace Harbor manages.
 
+## Persistent dependency bootstrap
+
+The IntelliJ opener runs one idempotent preparation check before its
+already-open shortcut. An unchanged worktree is a fast cache hit: no package
+manager runs when an agent stops, restarts, or reconnects. Setup runs again
+only when a selected command, manifest, lockfile, runtime/tool identity,
+required environment marker, or Harbor recipe version changes, or when
+`--force` is requested.
+
+Plan precedence is conservative:
+
+1. A conventional `bootstrap` task in `.codex/tasks.toml`, or a task selected
+   by `.serena/codex-integration.yml`.
+2. An argv-form custom command that has matching local approval.
+3. A Workspace Harbor recipe backed by an unambiguous manifest and lockfile.
+
+Harbor never scrapes prose into commands and never runs every installer found
+under a repository. Conflicting managers, source without a matching dependency
+boundary, and custom-command changes return `needs-decision`. Local decisions
+are shared by sibling Git worktrees; successful installation records remain
+per worktree.
+
+Built-in recipes currently cover npm, pnpm, Yarn Classic/Berry, Bun, uv,
+Poetry, Cargo fetch, and Go module download. Gradle and Maven remain
+IntelliJ-native model imports unless the repository configures a setup task.
+Other ecosystems are reported and require an explicit task or command.
+
+Examples:
+
+```sh
+workspace-harbor-bootstrap status "$(git rev-parse --show-toplevel)" --json
+serena-project-doctor --bootstrap "$(git rev-parse --show-toplevel)"
+workspace-harbor-bootstrap decide "$(git rev-parse --show-toplevel)" \
+  language rust enable
+workspace-harbor-bootstrap decide "$(git rev-parse --show-toplevel)" \
+  tracking local
+```
+
+Tracked integration configuration describes desired policy but does not grant
+permission to execute arbitrary custom commands. Exact custom-command approval
+is stored privately under `$CODEX_HOME/state/workspace-harbor/bootstrap` and is
+invalidated when its argv, working directory, declared inputs, or markers
+change. Installer output is bounded and redacted; raw output is not retained by
+the bootstrap helper.
+
 ## Safety and recovery
 
 Closing is fail-closed. Unsaved documents, indexing, active run/debug/terminal
@@ -80,6 +129,7 @@ broadly. Use:
 
 ```sh
 serena-project-doctor "$(git rev-parse --show-toplevel)"
+workspace-harbor-bootstrap status "$(git rev-parse --show-toplevel)" --json
 serena-worktree-broker status
 serena-worktree-broker cleanup
 ```

@@ -8,6 +8,12 @@
 
 **Tech Stack:** Python 3.9+, PyYAML, `fcntl`, `hashlib`, `subprocess`, zsh, Git, `unittest`, existing `codex-task` compact task runner.
 
+**Execution note:** After Task 2 exposed excessive serial handoff and review
+overhead, the remaining tightly coupled slices are executed by the primary
+agent with focused TDD. Subagents and delegation capsules remain optional for
+independent work or one comprehensive review; they are not required per
+micro-fix.
+
 ## Global Constraints
 
 - Run only a conventional or configured Codex task, a locally approved argv-form custom command, or a versioned built-in recipe with unambiguous manifest/lock evidence.

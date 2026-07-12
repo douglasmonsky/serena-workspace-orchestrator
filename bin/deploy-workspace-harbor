@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""Atomically deploy the reviewed Workspace Harbor command set."""
+
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timezone
+import hashlib
+import os
+from pathlib import Path
+import shutil
+import tempfile
+
+
+EXECUTABLES = (
+    "deploy-workspace-harbor",
+    "open-codex-project-in-intellij",
+    "intellij-project-trust",
+    "intellij-project-reaper",
+    "serena-codex",
+    "serena-project-doctor",
+    "serena-worktree-broker",
+    "workspace-harbor-bootstrap",
+)
+MODULES = ("workspace_harbor_ide.py", "workspace_harbor_bootstrap.py")
+SERENA_PYTHON_COMMANDS = {"serena-project-doctor", "workspace-harbor-bootstrap"}
+
+
+def _source_root() -> Path:
+    configured = os.environ.get("WORKSPACE_HARBOR_SOURCE_ROOT")
+    return Path(configured).expanduser().resolve() if configured else Path(__file__).resolve().parent.parent
+
+
+def _codex_home() -> Path:
+    return Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser().resolve()
+
+
+def _serena_python() -> Path:
+    configured = os.environ.get("WORKSPACE_HARBOR_SERENA_PYTHON")
+    default = Path.home() / ".local/share/uv/tools/serena-agent/bin/python"
+    return Path(configured).expanduser().resolve() if configured else default.resolve()
+
+
+def _expected_bytes(source: Path, name: str, serena_python: Path) -> bytes:
+    data = source.read_bytes()
+    if name not in SERENA_PYTHON_COMMANDS:
+        return data
+    lines = data.splitlines(keepends=True)
+    newline = b"\r\n" if lines and lines[0].endswith(b"\r\n") else b"\n"
+    shebang = f"#!{serena_python}".encode("utf-8") + newline
+    return shebang + b"".join(lines[1:])
+
+
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _install(dry_run: bool) -> int:
+    source_root = _source_root()
+    source_bin = source_root / "bin"
+    codex_home = _codex_home()
+    destination = codex_home / "bin"
+    serena_python = _serena_python()
+    names = (*EXECUTABLES, *MODULES)
+    sources = {name: source_bin / name for name in names}
+    missing = [str(path) for path in sources.values() if not path.is_file()]
+    if missing:
+        print("deploy-workspace-harbor: missing source file(s): " + ", ".join(missing), file=os.sys.stderr)
+        return 2
+    if not serena_python.is_file() or not os.access(serena_python, os.X_OK):
+        print(f"deploy-workspace-harbor: Serena Python unavailable: {serena_python}", file=os.sys.stderr)
+        return 2
+    expected = {
+        name: _expected_bytes(path, name, serena_python)
+        for name, path in sources.items()
+    }
+    if dry_run:
+        print(f"Workspace Harbor deployment dry run: {source_root} -> {destination}")
+        for name in names:
+            mode = "0755" if name in EXECUTABLES else "0644"
+            print(f"- {name} mode={mode} sha256={_sha256(expected[name])}")
+        return 0
+
+    codex_home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(codex_home, 0o700)
+    destination.mkdir(parents=True, exist_ok=True, mode=0o700)
+    stage = Path(tempfile.mkdtemp(prefix=".workspace-harbor-stage-", dir=codex_home))
+    os.chmod(stage, 0o700)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    backup_bin = codex_home / "backups/workspace-harbor" / timestamp / "bin"
+    originals = {name for name in names if (destination / name).is_file()}
+    replaced: list[str] = []
+    try:
+        for name in names:
+            staged = stage / name
+            staged.write_bytes(expected[name])
+            os.chmod(staged, 0o755 if name in EXECUTABLES else 0o644)
+        if originals:
+            backup_bin.mkdir(parents=True, mode=0o700)
+            os.chmod(backup_bin.parent, 0o700)
+            os.chmod(backup_bin, 0o700)
+            for name in sorted(originals):
+                backup = backup_bin / name
+                shutil.copy2(destination / name, backup)
+        for name in names:
+            os.replace(stage / name, destination / name)
+            replaced.append(name)
+        for name in names:
+            deployed = destination / name
+            if _sha256(deployed.read_bytes()) != _sha256(expected[name]):
+                raise RuntimeError(f"deployed hash mismatch: {name}")
+            required_mode = 0o755 if name in EXECUTABLES else 0o644
+            if deployed.stat().st_mode & 0o777 != required_mode:
+                raise RuntimeError(f"deployed mode mismatch: {name}")
+    except Exception as error:
+        for name in reversed(replaced):
+            deployed = destination / name
+            backup = backup_bin / name
+            if name in originals and backup.is_file():
+                temporary = destination / f".{name}.rollback-{os.getpid()}"
+                shutil.copy2(backup, temporary)
+                os.replace(temporary, deployed)
+            else:
+                deployed.unlink(missing_ok=True)
+        print(f"deploy-workspace-harbor: deployment failed and was rolled back: {error}", file=os.sys.stderr)
+        return 1
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+    print(f"Workspace Harbor deployed {len(names)} files to {destination}")
+    if originals:
+        print(f"Backup: {backup_bin.parent}")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+    return _install(args.dry_run)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
