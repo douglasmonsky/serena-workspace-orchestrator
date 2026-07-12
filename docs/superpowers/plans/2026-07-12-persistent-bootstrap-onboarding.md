@@ -40,7 +40,7 @@ micro-fix.
 - Produces `resolve_root(value: str | Path | None) -> Path`, `load_policy(root: Path) -> dict[str, object]`, `plan_repository(root: Path) -> dict[str, object]`, `language_evidence(root: Path, language: str) -> str`, and `repository_identity(root: Path) -> str`.
 - `plan_repository` returns JSON-safe keys `status`, `root`, `plans`, `decisions`, `policy_source`, and `recipe_version` without executing commands or changing files.
 
-- [ ] **Step 1: Write failing recipe and precedence tests**
+- [x] **Step 1: Write failing recipe and precedence tests**
 
 Create fixtures in `test_workspace_harbor_bootstrap.py` and add exact assertions:
 
@@ -79,13 +79,13 @@ def test_nested_example_is_ignored_until_explicitly_included(self):
 
 Also cover npm, pnpm, Yarn Berry, Yarn Classic, Bun, uv, Poetry, Rust, and Go argv; Gradle/Maven `ide-managed` reporting; ignored boundaries; a conventional `[tasks.bootstrap]` table detected through `codex-task list --json`; configured task precedence; argv custom-command precedence; malformed YAML/schema; symlink escape rejection; and disabled global/project policy.
 
-- [ ] **Step 2: Run the focused test module to verify RED**
+- [x] **Step 2: Run the focused test module to verify RED**
 
 Run: `python3 -m unittest -v tests.python.test_workspace_harbor_bootstrap`
 
 Expected: FAIL because `bin/workspace_harbor_bootstrap.py` does not exist.
 
-- [ ] **Step 3: Implement pure evidence and plan selection**
+- [x] **Step 3: Implement pure evidence and plan selection**
 
 Implement `BootstrapPlan` as a frozen dataclass with `as_dict()`. Define `RECIPE_VERSION = 1`, pruned directory names matching the doctor, and a recipe table whose commands exactly match the approved design. Read YAML mappings with strict type validation. Accept this project schema:
 
@@ -113,7 +113,7 @@ Detect a conventional task by running `codex-task list --json` with a five-secon
 
 Implement `language_evidence` with results `confirmed`, `source-only`, or `absent`. Confirm TypeScript/Svelte/Vue/Angular from source plus a JavaScript manifest/lock boundary; Python from source plus a locked Python boundary; Rust and Go from their manifest/lock pairs; Java/Kotlin from Gradle/Maven model files; and C#/PHP/Ruby/Swift from their standard project/locked boundaries. Do not weaken an explicit language ignore or bootstrap opt-out.
 
-- [ ] **Step 4: Run recipe tests to verify GREEN**
+- [x] **Step 4: Run recipe tests to verify GREEN**
 
 Run:
 
@@ -124,7 +124,7 @@ python3 -m py_compile bin/workspace_harbor_bootstrap.py
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit Task 1**
+- [x] **Step 5: Commit Task 1**
 
 ```bash
 git add -- bin/workspace_harbor_bootstrap.py tests/python/test_workspace_harbor_bootstrap.py
@@ -143,7 +143,7 @@ git commit -m "feat: plan deterministic workspace bootstrap"
 - Produces CLI `workspace-harbor-bootstrap status|run|decide` with exit codes `0` ready/pending/not-needed/disabled, `1` failed, `2` invalid input/config/state, and `3` needs-decision.
 - State paths are injectable through `WORKSPACE_HARBOR_BOOTSTRAP_STATE_DIR` and command paths through `WORKSPACE_HARBOR_CODEX_TASK` for isolated tests.
 
-- [ ] **Step 1: Write failing persistence and consent tests**
+- [x] **Step 1: Write failing persistence and consent tests**
 
 Add:
 
@@ -181,19 +181,19 @@ def test_tracked_custom_command_requires_exact_local_approval(self):
 
 Also test repository decisions shared by sibling Git worktrees; execution records separated by worktree root; language enable/ignore; tracking shared/local; corrupt state; private permissions; atomic failure behavior; protected-input mutation; missing marker; runtime/tool-version invalidation; `--force`; command timeout/missing executable; concurrent callers executing once; output truncation and redaction; no persistent raw log; and every CLI JSON/exit-code combination.
 
-- [ ] **Step 2: Run persistence tests to verify RED**
+- [x] **Step 2: Run persistence tests to verify RED**
 
 Run: `python3 -m unittest -v tests.python.test_workspace_harbor_bootstrap`
 
 Expected: FAIL on missing state, execution, decision, and CLI interfaces.
 
-- [ ] **Step 3: Implement private state and exact approvals**
+- [x] **Step 3: Implement private state and exact approvals**
 
 Derive repository keys from `git rev-parse --path-format=absolute --git-common-dir` and worktree keys from the canonical root. Store `repositories/<sha256>.json`, `worktrees/<sha256>.json`, and `locks/<sha256>.lock` under the private state directory. Use `fcntl.flock(LOCK_EX)`, strict JSON shape/version validation, same-directory mode-`0600` temporary files, `flush`, `fsync`, and `os.replace`.
 
 Store command approval against the current plan digest, not the text `approve`. Store language decisions with their current `language_evidence` value and invalidate when that evidence changes. Store tracking policy without changing Git state.
 
-- [ ] **Step 4: Implement fingerprints and bounded execution**
+- [x] **Step 4: Implement fingerprints and bounded execution**
 
 Fingerprint canonical root, recipe version, plan source/id/argv/cwd, every input path and SHA-256, integration config, executable path/version, and runtime identity. Built-in markers are `node_modules` for JavaScript and `.venv` for uv; other recipes have no required local marker. Custom markers are explicit.
 
@@ -201,7 +201,7 @@ Execute without a shell, with a sanitized inherited environment, captured output
 
 Under the worktree lock, recompute status and fingerprint, return a cache hit without execution when valid, snapshot input hashes, run plans in stable plan-id order, validate unchanged inputs and markers, then atomically write one success record. Any plan failure or protected-input change returns `failed` and writes no success record.
 
-- [ ] **Step 5: Implement the thin CLI and verify GREEN**
+- [x] **Step 5: Implement the thin CLI and verify GREEN**
 
 `bin/workspace-harbor-bootstrap` imports `workspace_harbor_bootstrap.main` and exits with its result. CLI parsing must implement these exact forms:
 
@@ -222,7 +222,7 @@ python3 -m py_compile bin/workspace_harbor_bootstrap.py bin/workspace-harbor-boo
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit Task 2**
+- [x] **Step 6: Commit Task 2**
 
 ```bash
 git add -- bin/workspace_harbor_bootstrap.py bin/workspace-harbor-bootstrap \
@@ -241,7 +241,7 @@ git commit -m "feat: cache and authorize workspace bootstrap"
 - Adds report keys `bootstrap`, `pending_language_decisions`, and `serena_file_policy`.
 - Adds `serena-project-doctor --bootstrap ROOT`; ordinary audit remains byte-for-byte read-only for repository files.
 
-- [ ] **Step 1: Write failing doctor/onboarding tests**
+- [x] **Step 1: Write failing doctor/onboarding tests**
 
 Add:
 
@@ -271,13 +271,13 @@ def test_plain_audit_reads_bootstrap_status_without_running(self):
 
 Also cover locally approved source-only language, ignored language, shared tracking warning, no policy producing one `serena_tracking_policy` decision instead of two recurring warnings, `--bootstrap` invoking the runner, bootstrap failed/needs-decision findings, JSON output, and strict exit behavior.
 
-- [ ] **Step 2: Run doctor tests to verify RED**
+- [x] **Step 2: Run doctor tests to verify RED**
 
 Run: `python3 -m unittest -v tests.python.test_serena_project_doctor`
 
 Expected: FAIL because audit and repair do not consume bootstrap evidence/decisions.
 
-- [ ] **Step 3: Implement evidence-aware language repair and tracking policy**
+- [x] **Step 3: Implement evidence-aware language repair and tracking policy**
 
 Import the bootstrap module. Filter only missing languages: add confirmed or locally enabled languages; retain configured languages; return ignored and pending lists. For a missing project config, create it only with confirmed/enabled detected languages and report pending languages separately. Preserve the existing YAML comment-safe additive rewrite and opt-out behavior.
 
@@ -285,7 +285,7 @@ Replace the two untracked warnings with one `serena_tracking_policy` `needs-deci
 
 Include read-only bootstrap status in `audit`. `--bootstrap` performs language repair and `run_bootstrap`; it returns the bootstrap exit status only after emitting the complete report. Keep semantic-health probing independent so dependency failure does not suppress Serena diagnostics.
 
-- [ ] **Step 4: Run doctor and bootstrap tests to verify GREEN**
+- [x] **Step 4: Run doctor and bootstrap tests to verify GREEN**
 
 Run:
 
@@ -298,7 +298,7 @@ python3 -m py_compile bin/serena-project-doctor
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit Task 3**
+- [x] **Step 5: Commit Task 3**
 
 ```bash
 git add -- bin/serena-project-doctor tests/python/test_serena_project_doctor.py
@@ -317,7 +317,7 @@ git commit -m "feat: make Serena onboarding decision-aware"
 - Opener consumes `WORKSPACE_HARBOR_BOOTSTRAP_COMMAND`, defaulting to `$HOME/.codex/bin/workspace-harbor-bootstrap`.
 - Broker consumes the read-only `workspace-harbor-bootstrap status ROOT --json` result and never calls `run`.
 
-- [ ] **Step 1: Write failing opener ordering and degradation tests**
+- [x] **Step 1: Write failing opener ordering and degradation tests**
 
 Add isolated fake bootstrap commands that append to a log:
 
@@ -335,7 +335,7 @@ def test_bootstrap_failure_reports_degraded_but_still_opens(self):
 
 Also prove `needs-decision` exit `3` is reported once but does not block exact-root trust/open; invalid/config exit `2` fails closed before open; cache-hit invocation occurs once per opener call; and no installer output is copied into ordinary opener output.
 
-- [ ] **Step 2: Write failing broker status-only tests**
+- [x] **Step 2: Write failing broker status-only tests**
 
 Replace broker language-only setup expectations with preparation status assertions:
 
@@ -350,7 +350,7 @@ def test_connection_checks_bootstrap_status_but_never_runs_it(self):
 
 Keep additive language repair through `serena-project-doctor --repair-languages`; bootstrap `failed` or `needs-decision` is non-blocking status, while malformed status output is reported once and cannot be treated as ready.
 
-- [ ] **Step 3: Run integration tests to verify RED**
+- [x] **Step 3: Run integration tests to verify RED**
 
 Run:
 
@@ -362,13 +362,13 @@ python3 -m unittest -v \
 
 Expected: FAIL on absent bootstrap invocation/status behavior.
 
-- [ ] **Step 4: Implement opener and broker integration**
+- [x] **Step 4: Implement opener and broker integration**
 
 Invoke `workspace-harbor-bootstrap run "$project_dir" --json` after canonical root/GitHub validation and before the first `is_ready_in_intellij` call. Capture JSON privately. Exit `0` continues silently; `1` or `3` prints one concise degraded/decision message and continues; `2` or an unreadable result exits before trust/open. Do not retry inside the opener.
 
 Add broker `_bootstrap_status(root)` with a five-second timeout and strict JSON mapping validation. Call it during `_connect` after additive language repair and before broker state acquisition; record/report status through existing error text only when invalid, but never invoke `run` and never block service startup for valid `failed`/`needs-decision` states.
 
-- [ ] **Step 5: Run integration and full Python suites to verify GREEN**
+- [x] **Step 5: Run integration and full Python suites to verify GREEN**
 
 Run:
 
@@ -381,7 +381,7 @@ python3 -m unittest discover -s tests/python -p 'test_*.py' -v
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit Task 4**
+- [x] **Step 6: Commit Task 4**
 
 ```bash
 git add -- bin/open-codex-project-in-intellij bin/serena-worktree-broker \
@@ -403,23 +403,23 @@ git commit -m "feat: prepare worktrees before IntelliJ indexing"
 - Produces `deploy-workspace-harbor [--dry-run]` using `CODEX_HOME` and `WORKSPACE_HARBOR_SOURCE_ROOT` overrides for isolated tests.
 - Installs executable commands with mode `0755` and import modules with mode `0644`, after a private timestamped backup.
 
-- [ ] **Step 1: Write failing isolated deployment tests**
+- [x] **Step 1: Write failing isolated deployment tests**
 
 Create a temporary source tree and `CODEX_HOME`. Assert dry-run changes nothing; a real run backs up preexisting destinations, installs `workspace-harbor-bootstrap` and `workspace_harbor_bootstrap.py` with correct modes, installs the opener/doctor/broker compatible set together, and exits nonzero without partial replacement when any source file is absent.
 
-- [ ] **Step 2: Run deployment tests to verify RED**
+- [x] **Step 2: Run deployment tests to verify RED**
 
 Run: `python3 -m unittest -v tests.python.test_deploy_workspace_harbor`
 
 Expected: FAIL because `bin/deploy-workspace-harbor` does not exist.
 
-- [ ] **Step 3: Implement deployment and documentation**
+- [x] **Step 3: Implement deployment and documentation**
 
 The deployment helper validates every source first, creates `$CODEX_HOME/backups/workspace-harbor/<UTC timestamp>/bin`, copies existing destinations into it, stages new files in a private temporary directory, verifies SHA-256 hashes, then atomically replaces destinations. It installs the bootstrap module/wrapper plus opener, trust, reaper, Serena launcher, doctor, broker, IDE module, and itself. It must not start/stop IntelliJ or mutate repository state.
 
 Update README with recipe precedence, decision commands, state/cache behavior, opt-outs, doctor/bootstrap usage, and troubleshooting. Update global AGENTS Serena guidance to require the opener/bootstrap path, ask only for `needs-decision`, avoid hand-running all detected installers, and explain that unchanged restarts are cache hits.
 
-- [ ] **Step 4: Run all repository verification before deployment**
+- [x] **Step 4: Run all repository verification before deployment**
 
 Run:
 
@@ -435,7 +435,7 @@ git diff --check
 
 Expected: PASS with no Python failures, Gradle BUILD SUCCESSFUL, and no whitespace errors.
 
-- [ ] **Step 5: Commit source, tests, and documentation**
+- [x] **Step 5: Commit source, tests, and documentation**
 
 ```bash
 git add -- bin/deploy-workspace-harbor tests/python/test_deploy_workspace_harbor.py \
@@ -445,17 +445,17 @@ git commit -m "docs: deploy and operate persistent bootstrap"
 
 Do not include `/Users/Monsky/.codex/AGENTS.md` in the repository commit.
 
-- [ ] **Step 6: Deploy the reviewed command set**
+- [x] **Step 6: Deploy the reviewed command set**
 
 Run `bin/deploy-workspace-harbor --dry-run`, inspect its exact file list and backup destination, then run `bin/deploy-workspace-harbor`. Compare SHA-256 hashes for every deployed/source pair and run deployed `--help` plus an isolated `status --json` fixture.
 
-- [ ] **Step 7: Record the active worktree tracking decision and dogfood**
+- [x] **Step 7: Record the active worktree tracking decision and dogfood**
 
 For `/Users/Monsky/Documents/Codex/2026-07-11/r11-compression-detectors`, record the user's chosen Serena tracking policy only after inspecting which Serena files are appropriate to share; do not stage them automatically. Run deployed doctor/bootstrap once, verify Python and TypeScript remain configured, then run the opener twice. The second run must report a bootstrap cache hit and execute no package manager.
 
 Create an isolated synthetic Git repository under `/Users/Monsky/Documents/Codex` containing Rust source without Cargo files. Verify doctor/bootstrap returns `needs-decision` without adding Rust or running Cargo; record `language rust enable`, verify Serena config adds Rust on the next explicit repair, then remove only the synthetic repository created for this test.
 
-- [ ] **Step 8: Final review, publish, and report**
+- [x] **Step 8: Final review, publish, and report**
 
 Inspect `git status --short --branch`, `git diff --stat` over the implementation commits, every committed diff, deployed/source hashes, state permissions, and staged/committed files for secrets or private data. Run a fresh complete Python suite and relevant live doctor checks. Push `main` only after verification because this public repository is already configured for publishing.
 
