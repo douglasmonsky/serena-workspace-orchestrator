@@ -105,6 +105,10 @@ def _repository_path(root: Path) -> Path:
     return _state_dir() / "repositories" / (repository_identity(root) + ".json")
 
 
+def _worktree_path(root: Path) -> Path:
+    return _state_dir() / "worktrees" / (hashlib.sha256(str(resolve_root(root)).encode()).hexdigest() + ".json")
+
+
 def _read_state(path: Path) -> dict[str, object]:
     if not path.exists(): return {"version": STATE_VERSION, "decisions": {}}
     try:
@@ -174,6 +178,63 @@ def record_decision(root: Path, category: str, subject: str, decision: str) -> d
         decisions[f"{category}:{subject}"] = {"decision": decision, "evidence": key, "digest": key}
         _write_state(path, state)
     return {"repository": repository_identity(root), "category": category, "subject": subject, "decision": decision}
+
+
+def _sha256(path: Path) -> str:
+    try: return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError: return "missing"
+
+
+def _version(argv: list[str]) -> str:
+    try:
+        result = subprocess.run(argv + ["--version"], capture_output=True, text=True, timeout=5, check=False)
+        return (result.stdout or result.stderr).strip()[:512] if result.returncode == 0 else "unavailable"
+    except (OSError, subprocess.SubprocessError): return "unavailable"
+
+
+def _markers(plan: dict[str, object]) -> list[Path]:
+    if plan["source"] == "command": return [Path(v) for v in plan["markers"]]
+    cwd = Path(plan["cwd"])
+    return [cwd / "node_modules"] if str(plan["ecosystem"]).startswith(("npm", "pnpm", "yarn", "bun")) else [cwd / ".venv"] if plan["ecosystem"] == "uv" else []
+
+
+def bootstrap_fingerprint(root: Path, plans: list[dict[str, object]]) -> str:
+    material: dict[str, object] = {"root": str(resolve_root(root)), "recipe_version": RECIPE_VERSION, "plans": []}
+    for plan in sorted(plans, key=lambda p: p["plan_id"]):
+        executable = plan["argv"][0] if plan["argv"] else "ide-managed"
+        material["plans"].append({"plan": plan, "inputs": [(value, _sha256(Path(value))) for value in plan["inputs"]], "tool": executable, "tool_version": _version([executable]) if executable != "ide-managed" else "native", "markers": [str(p) for p in _markers(plan)]})
+    for config in (resolve_root(root) / ".serena/codex-integration.yml", resolve_root(root) / ".codex/tasks.toml"):
+        material.setdefault("config", []).append((str(config), _sha256(config)))
+    material["runtime"] = {"python": os.sys.version, "platform": os.sys.platform}
+    return hashlib.sha256(json.dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _read_worktree_success(root: Path) -> dict[str, object] | None:
+    path = _worktree_path(root)
+    if not path.exists(): return None
+    try: data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error: raise ValueError("corrupt worktree state") from error
+    if not isinstance(data, dict) or set(data) != {"version", "fingerprint"} or data["version"] != STATE_VERSION or not isinstance(data["fingerprint"], str): raise ValueError("invalid worktree state")
+    return data
+
+
+def write_worktree_success(root: Path, fingerprint: str) -> None:
+    _write_state(_worktree_path(root), {"version": STATE_VERSION, "fingerprint": fingerprint})
+
+
+def bootstrap_status(root: Path) -> dict[str, object]:
+    root = resolve_root(root); planned = plan_repository(root)
+    if planned["status"] != "ready": return planned
+    plans = planned["plans"]
+    for plan in plans:
+        if plan["source"] == "command":
+            decision = repository_decisions(root).get("command:current")
+            if not isinstance(decision, dict) or decision.get("decision") != "approve" or decision.get("digest") != _decision_subject(root, "command", "current"):
+                return {**planned, "status": "needs-decision", "decisions": [{"code": "custom-command-approval"}]}
+    fingerprint = bootstrap_fingerprint(root, plans)
+    record = _read_worktree_success(root)
+    markers_ready = all(marker.exists() for plan in plans for marker in _markers(plan))
+    return {**planned, "status": "ready" if record and record["fingerprint"] == fingerprint and markers_ready else "pending", "fingerprint": fingerprint, "cache": "hit" if record and record["fingerprint"] == fingerprint and markers_ready else "miss"}
 
 
 def _contains_source(root: Path, suffixes: set[str]) -> bool:

@@ -195,6 +195,33 @@ class BootstrapPlansTests(unittest.TestCase):
             path.parent.mkdir(parents=True); path.write_text('{"version":1,"decisions":{"tracking:current":{"decision":"local","evidence":"x","digest":"x"}}}')
             with self.assertRaises(ValueError): bootstrap.repository_decisions(self.root)
 
+    def test_status_fingerprint_cache_invalidates_lock_tool_runtime_and_marker(self):
+        state = Path(self.tmp.name) / "state"; self.write("package.json", "{}"); self.write("package-lock.json", "one")
+        (self.root / "node_modules").mkdir()
+        with patch.dict(os.environ, {"WORKSPACE_HARBOR_BOOTSTRAP_STATE_DIR": str(state)}, clear=False), patch.object(bootstrap, "_version", return_value="v1"):
+            first = bootstrap.bootstrap_status(self.root); self.assertEqual("pending", first["status"])
+            bootstrap.write_worktree_success(self.root, first["fingerprint"])
+            self.assertEqual("ready", bootstrap.bootstrap_status(self.root)["status"])
+            self.write("package-lock.json", "two")
+            self.assertEqual("pending", bootstrap.bootstrap_status(self.root)["status"])
+            self.write("package-lock.json", "one"); bootstrap.write_worktree_success(self.root, bootstrap.bootstrap_status(self.root)["fingerprint"])
+            (self.root / "node_modules").rmdir()
+            self.assertEqual("pending", bootstrap.bootstrap_status(self.root)["status"])
+
+    def test_status_requires_custom_approval_and_worktree_records_are_separate_and_strict(self):
+        state = Path(self.tmp.name) / "state"; sibling = Path(self.tmp.name) / "sibling"; sibling.mkdir()
+        for directory in (self.root, sibling):
+            (directory / "setup.lock").write_text("x"); (directory / ".serena").mkdir(); (directory / ".serena/codex-integration.yml").write_text("bootstrap:\n  command: {argv: [tool, setup], inputs: [setup.lock]}\n")
+        with patch.dict(os.environ, {"WORKSPACE_HARBOR_BOOTSTRAP_STATE_DIR": str(state)}, clear=False), patch.object(bootstrap, "_version", return_value="v1"):
+            self.assertEqual("needs-decision", bootstrap.bootstrap_status(self.root)["status"])
+            bootstrap.record_decision(self.root, "command", "current", "approve")
+            first = bootstrap.bootstrap_status(self.root); self.assertEqual("pending", first["status"])
+            bootstrap.write_worktree_success(self.root, first["fingerprint"])
+            bootstrap.record_decision(sibling, "command", "current", "approve")
+            self.assertEqual("pending", bootstrap.bootstrap_status(sibling)["status"])
+            bootstrap._worktree_path(self.root).write_text("bad")
+            with self.assertRaises(ValueError): bootstrap.bootstrap_status(self.root)
+
     def test_command_approval_digest_covers_declared_inputs_and_markers_and_lock_is_separate(self):
         state = Path(self.tmp.name) / "state"; self.write("setup.lock", "one")
         self.write(".serena/codex-integration.yml", "bootstrap:\n  command: {argv: [tool, setup], inputs: [setup.lock], markers: [.ready]}\n")
