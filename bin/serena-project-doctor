@@ -339,6 +339,7 @@ def _semantic_probe_file(root: Path) -> str | None:
             if len(candidates) >= 500:
                 break
 
+    analyzable: list[tuple[tuple[int, str], str]] = []
     seen: set[str] = set()
     for relative_path in candidates:
         if relative_path in seen:
@@ -349,10 +350,21 @@ def _semantic_probe_file(root: Path) -> str | None:
             continue
         try:
             if path.stat().st_size <= 2_000_000:
-                return relative_path
+                parts = Path(relative_path).parts
+                if len(parts) >= 2 and parts[:2] == ("src", "main"):
+                    source_priority = 0
+                elif len(parts) >= 2 and parts[:2] == ("src", "test"):
+                    source_priority = 1
+                elif parts and parts[0] == "src":
+                    source_priority = 2
+                elif path.name in {"build.gradle.kts", "settings.gradle.kts"}:
+                    source_priority = 4
+                else:
+                    source_priority = 3
+                analyzable.append(((source_priority, relative_path), relative_path))
         except OSError:
             continue
-    return None
+    return min(analyzable)[1] if analyzable else None
 
 
 def _probe_jetbrains_client(client: Any, relative_path: str) -> dict[str, Any]:

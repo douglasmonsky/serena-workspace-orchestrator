@@ -180,6 +180,14 @@ class SerenaProjectDoctorTests(unittest.TestCase):
         )
         self.assertEqual(client._timeout, 300)
 
+    def test_semantic_probe_prefers_source_file_over_gradle_kotlin_dsl(self) -> None:
+        (self.root / "build.gradle.kts").write_text("plugins { java }\n", encoding="utf-8")
+        java = self.root / "src/main/java/example/App.java"
+        java.parent.mkdir(parents=True)
+        java.write_text("package example; public final class App {}\n", encoding="utf-8")
+
+        self.assertEqual("src/main/java/example/App.java", doctor._semantic_probe_file(self.root))
+
     def test_semantic_timeout_is_classified_as_stalled(self) -> None:
         class Client:
             _timeout = 300
