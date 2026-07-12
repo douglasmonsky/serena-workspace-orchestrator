@@ -1,12 +1,16 @@
 package com.monsky.workspaceharbor.lifecycle;
 
 import com.intellij.openapi.externalSystem.service.execution.ExternalSystemJdkUtil;
+import com.intellij.openapi.externalSystem.service.execution.ProgressExecutionMode;
+import com.intellij.openapi.externalSystem.importing.ImportSpecBuilder;
+import com.intellij.openapi.externalSystem.util.ExternalSystemUtil;
 import com.intellij.openapi.project.Project;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import org.jetbrains.plugins.gradle.settings.GradleProjectSettings;
 import org.jetbrains.plugins.gradle.settings.GradleSettings;
+import org.jetbrains.plugins.gradle.util.GradleConstants;
 
 /** Ensures native Gradle import uses IntelliJ's bundled runtime without a download prompt. */
 final class GradleModelProvisioner {
@@ -28,8 +32,12 @@ final class GradleModelProvisioner {
             linked.setExternalProjectPath(root.toString());
             linked.setGradleJvm(ExternalSystemJdkUtil.USE_INTERNAL_JAVA);
             settings.linkProject(linked);
-            return;
+        } else {
+            linked.setGradleJvm(ExternalSystemJdkUtil.USE_INTERNAL_JAVA);
         }
-        linked.setGradleJvm(ExternalSystemJdkUtil.USE_INTERNAL_JAVA);
+        ExternalSystemUtil.refreshProject(
+                root.toString(),
+                new ImportSpecBuilder(project, GradleConstants.SYSTEM_ID)
+                        .use(ProgressExecutionMode.IN_BACKGROUND_ASYNC));
     }
 }
