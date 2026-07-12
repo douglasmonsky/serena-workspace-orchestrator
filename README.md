@@ -4,6 +4,13 @@ Safely manages idle IDE project windows using fail-closed lifecycle checks.
 
 Run tests with `JAVA_HOME=/Applications/PyCharm.app/Contents/jbr/Contents/Home ./gradlew test`.
 
+## Idle-project reaper
+
+`bin/pycharm-project-reaper` owns the local managed-project registry and only
+closes projects after its broker and plugin safety checks succeed. Its Python
+implementation supports the macOS system Python 3.9 used by LaunchAgents.
+Run its focused checks with `python3 -m unittest tests/python/test_pycharm_project_reaper.py`.
+
 ## Managed PyCharm project trust
 
 New projects opened through the managed opener are trusted only after their

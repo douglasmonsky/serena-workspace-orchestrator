@@ -1,0 +1,264 @@
+#!/usr/bin/env python3
+"""Fail-closed registry and policy for managed PyCharm projects."""
+import argparse, datetime as dt, fcntl, json, os, stat, subprocess, sys, tempfile, time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal
+from urllib.parse import quote
+from urllib.request import Request, urlopen
+
+STATE = Path.home() / ".codex/state/pycharm-projects/managed.json"
+RUNTIME = STATE.with_name("plugin-runtime.json")
+CAP, IDLE = 4, 1800
+BROKER = Path.home() / ".codex/bin/serena-worktree-broker"
+
+@dataclass(frozen=True)
+class Decision:
+    root: str
+    classification: Literal["eligible", "protected", "unmanaged"]
+    reasons: tuple[str, ...]
+    selected: bool = False
+
+def canonical(root): return str(Path(root).expanduser().resolve(strict=False))
+def utc_now(): return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+def epoch(value):
+    try: return dt.datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError, AttributeError): raise ValueError("invalid timestamp")
+def same_start(left, right):
+    try: return abs(epoch(left) - epoch(right)) <= 1
+    except ValueError: return False
+def process_start(pid):
+    # Darwin supplies a stable process start time through ps; failure is unsafe.
+    import subprocess
+    try:
+        value = subprocess.check_output(["ps", "-o", "lstart=", "-p", str(int(pid))], text=True).strip()
+        local = dt.datetime.strptime(value, "%a %b %d %H:%M:%S %Y").astimezone()
+        return local.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+    except Exception: return None
+
+def empty_registry(): return {"schemaVersion": 1, "projects": []}
+def load_registry(path=STATE):
+    path = Path(path)
+    if not path.exists(): return empty_registry(), False
+    try:
+        data = json.loads(path.read_text())
+        if data.get("schemaVersion") != 1 or not isinstance(data.get("projects"), list): raise ValueError("schema")
+        return data, False
+    except (OSError, ValueError, json.JSONDecodeError):
+        stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        quarantine = path.with_name("managed.corrupt-" + stamp + ".json")
+        try: os.replace(path, quarantine)
+        except OSError: pass
+        return empty_registry(), True
+
+def write_registry(registry, path=STATE):
+    path = Path(path); path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix="managed-", suffix=".tmp", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as file:
+            json.dump(registry, file, sort_keys=True); file.flush(); os.fsync(file.fileno())
+        os.replace(name, path); os.chmod(path, 0o600)
+    finally:
+        if os.path.exists(name): os.unlink(name)
+
+def locked(path):
+    Path(path).parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return open(str(path) + ".lock", "a+")
+def register_root(root, path=STATE, now=None):
+    root, now = canonical(root), now or utc_now()
+    with locked(path) as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX); data, corrupt = load_registry(path)
+        if corrupt: return False
+        projects = [p for p in data["projects"] if p.get("root") != root]
+        projects.append({"root": root, "registeredAt": now, "lastReadyAt": now})
+        data["projects"] = projects; write_registry(data, path); return True
+def touch_root(root, path=STATE, now=None):
+    root, now = canonical(root), now or utc_now()
+    with locked(path) as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX); data, corrupt = load_registry(path)
+        if corrupt: return False
+        for project in data["projects"]:
+            if project.get("root") == root:
+                project["lastReadyAt"] = now; write_registry(data, path); return True
+    return False
+def remove_root(root, path=STATE, expected=None):
+    """Remove an unchanged record from the latest locked registry."""
+    root = canonical(root)
+    with locked(path) as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX); data, corrupt = load_registry(path)
+        if corrupt: return False
+        current = next((p for p in data["projects"] if p.get("root") == root), None)
+        if expected is not None and current != expected: return False
+        original = len(data["projects"])
+        data["projects"] = [p for p in data["projects"] if p.get("root") != root]
+        if len(data["projects"]) == original: return False
+        write_registry(data, path); return True
+
+def classify(root, records, leases, now=None, plugins=None, idle=IDLE):
+    root = canonical(root); now = time.time() if now is None else now
+    record = records.get(root)
+    if not record: return Decision(root, "unmanaged", ("not-registered",))
+    reasons = []
+    if root in leases: reasons.append("live-lease")
+    try:
+        if now - epoch(record.get("lastReadyAt")) < idle: reasons.append("idle-under-%d" % idle)
+    except ValueError: reasons.append("timestamp-unknown")
+    if plugins is not None:
+        item = plugins.get(root)
+        if item is None: reasons.append("plugin-unknown")
+        elif item.get("safe") is not True: reasons.append("plugin-unsafe")
+    return Decision(root, "protected" if reasons else "eligible", tuple(reasons))
+
+def select_cleanup(records, leases, plugins, now=None, cap=CAP, idle=IDLE):
+    decisions = {root: classify(root, records, leases, now, plugins, idle) for root in records}
+    # Only positively known open managed projects contribute to the cap.
+    open_roots = set(plugins or ())
+    eligible = [d for d in decisions.values() if d.classification == "eligible" and d.root in open_roots]
+    eligible.sort(key=lambda d: (Path(d.root).exists(), epoch(records[d.root]["lastReadyAt"])))
+    count = sum(root in open_roots for root in records)
+    selected = [d.root for d in eligible[:max(0, count-cap)]]
+    decisions = {r: Decision(d.root, d.classification, d.reasons, r in selected) for r, d in decisions.items()}
+    return selected, decisions
+
+def runtime_client(runtime_path=RUNTIME):
+    try:
+        mode = stat.S_IMODE(Path(runtime_path).stat().st_mode)
+        runtime = json.loads(Path(runtime_path).read_text())
+        if (mode != 0o600 or runtime.get("schemaVersion") != 1 or not isinstance(runtime.get("token"), str)
+                or not runtime["token"] or not isinstance(runtime.get("port"), int) or not isinstance(runtime.get("pid"), int)
+                or not same_start(process_start(runtime["pid"]), runtime.get("processStartInstant"))): raise ValueError()
+        return runtime
+    except Exception: return None
+def http_request(method, path, runtime, root=None):
+    url = "http://127.0.0.1:%s%s" % (runtime["port"], path)
+    if root is not None: url += "?root=" + quote(canonical(root), safe="")
+    request = Request(url, method=method, headers={"Authorization": "Bearer " + runtime["token"]})
+    with urlopen(request, timeout=2) as response: return response.status, json.loads(response.read() or b"{}")
+def project_roots(body):
+    if not isinstance(body, dict) or not isinstance(body.get("projects"), list): raise ValueError("malformed project response")
+    roots = body["projects"]
+    if not all(isinstance(root, str) and root for root in roots): raise ValueError("malformed project entry")
+    return {canonical(root) for root in roots}
+def project_status(body):
+    if not isinstance(body, dict) or set(body) != {"projects"} or not isinstance(body["projects"], list): raise ValueError("malformed status response")
+    known_keys = {"unsavedDocuments", "indexing", "run", "terminal", "debugger", "modal", "closing"}; count_keys = {"unsavedDocuments", "run", "terminal", "debugger"}; active_keys = {"indexing", "modal", "closing"}
+    result = {}
+    for item in body["projects"]:
+        if not isinstance(item, dict) or set(item) != {"root", "safeToClose", "reasons", "known", "counts", "active"}: raise ValueError("malformed status entry")
+        root = item["root"]
+        if not isinstance(root, str) or not root or canonical(root) != root or type(item["safeToClose"]) is not bool or not isinstance(item["reasons"], list) or set(item["known"]) != known_keys or set(item["counts"]) != count_keys or set(item["active"]) != active_keys: raise ValueError("malformed status fields")
+        if any(type(v) is not bool for v in item["known"].values()) or any(type(v) is not int or v < 0 for v in item["counts"].values()) or any(type(v) is not bool for v in item["active"].values()) or any(not isinstance(v, str) for v in item["reasons"]) or root in result: raise ValueError("malformed status values")
+        expected = []
+        for key, reason in (("unsavedDocuments", "unsaved-documents"), ("run", "run-active"), ("terminal", "terminal-active"), ("debugger", "debugger-active")):
+            expected += [reason + "-unknown"] if not item["known"][key] else ([reason] if item["counts"][key] else [])
+        for key, reason in (("indexing", "indexing"), ("modal", "modal-active"), ("closing", "closing")):
+            expected += [reason + "-unknown"] if not item["known"][key] else ([reason] if item["active"][key] else [])
+        if item["reasons"] != expected or item["safeToClose"] != (not expected): raise ValueError("contradictory status")
+        result[root] = {"safe": item["safeToClose"]}
+    return result
+
+def plugin_inventory(runtime):
+    if runtime is None: return None
+    try:
+        status, body = http_request("GET", "/v1/projects/status", runtime)
+        return project_status(body) if status == 200 else None
+    except Exception: return None
+
+def status_report(records, plugins, leases, corrupt=False, idle=IDLE):
+    broker_unknown = leases is None
+    report_only = corrupt or plugins is None or broker_unknown
+    roots = set(records) | set(plugins or ())
+    decisions = {root: classify(root, records, leases or set(), plugins=plugins, idle=idle) for root in roots}
+    return {"reportOnly": report_only, "decisions": {root: decision.__dict__ for root, decision in decisions.items()}}
+
+def environment():
+    values = {"state": STATE, "runtime": RUNTIME, "broker": BROKER, "cap": CAP, "idle": IDLE}
+    mapping = {"state": "PYCHARM_PROJECT_REAPER_STATE_FILE", "runtime": "PYCHARM_PROJECT_REAPER_RUNTIME_FILE", "broker": "PYCHARM_PROJECT_REAPER_BROKER_COMMAND"}
+    try:
+        for key, name in mapping.items():
+            if name in os.environ:
+                value = Path(os.environ[name]).expanduser()
+                if not value.is_absolute(): raise ValueError(name)
+                values[key] = value
+        for key, name in (("cap", "PYCHARM_PROJECT_REAPER_CAP"), ("idle", "PYCHARM_PROJECT_REAPER_IDLE_SECONDS")):
+            if name in os.environ:
+                values[key] = int(os.environ[name])
+                if values[key] < 0: raise ValueError(name)
+        return values
+    except (TypeError, ValueError): return None
+def broker_live_roots(command=BROKER):
+    """Return live broker roots, or None when the lease boundary is unsafe."""
+    try:
+        completed = subprocess.run([str(command), "leases", "--json"], capture_output=True, text=True, timeout=5, check=False)
+        if completed.returncode != 0: return None
+        snapshot = json.loads(completed.stdout)
+        if not isinstance(snapshot, dict): return None
+        live = set()
+        for root, item in snapshot.items():
+            if not isinstance(root, str) or canonical(root) != root or not isinstance(item, dict): return None
+            if item.get("project_root") != root or not isinstance(item.get("backend"), str): return None
+            if type(item.get("live_leases")) is not int or item["live_leases"] < 0: return None
+            if set(item) != {"project_root", "backend", "live_leases", "idle_since", "last_used_at"}: return None
+            for timestamp in (item["idle_since"], item["last_used_at"]):
+                if timestamp is not None and (not isinstance(timestamp, str) or not _valid_timestamp(timestamp)): return None
+            if item["live_leases"]: live.add(root)
+        return live
+    except (OSError, subprocess.SubprocessError, ValueError, json.JSONDecodeError): return None
+def _valid_timestamp(value):
+    try: epoch(value); return True
+    except ValueError: return False
+def close_verified(root, runtime, request=http_request, dry_run=False, sleep=time.sleep):
+    if dry_run: return True
+    try: status, _ = request("POST", "/v1/projects/close", runtime, root)
+    except Exception: return False
+    if status != 202: return False
+    deadline = time.monotonic() + 10
+    while time.monotonic() <= deadline:
+        try: status, body = request("GET", "/v1/projects", runtime)
+        except Exception: return False
+        try: projects = project_roots(body) if status == 200 else None
+        except (TypeError, ValueError): return False
+        if projects is not None and canonical(root) not in projects: return True
+        sleep(.25)
+    return False
+
+def main_with_environment(argv=None):
+    config = environment()
+    if config is None: return 2
+    parser = argparse.ArgumentParser(); sub = parser.add_subparsers(dest="command", required=True)
+    for name in ("register", "touch"):
+        p = sub.add_parser(name); p.add_argument("root")
+    status = sub.add_parser("status"); status.add_argument("--json", action="store_true")
+    is_open = sub.add_parser("is-open"); is_open.add_argument("root")
+    cleanup = sub.add_parser("cleanup"); cleanup.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args(argv)
+    if args.command == "register": return 0 if register_root(args.root, config["state"]) else 1
+    if args.command == "touch": return 0 if touch_root(args.root, config["state"]) else 1
+    runtime = runtime_client(config["runtime"])
+    plugins = plugin_inventory(runtime)
+    if args.command == "is-open":
+        if plugins is None: return 2
+        return 0 if canonical(args.root) in plugins else 1
+    data, corrupt = load_registry(config["state"]); records = {p.get("root"): p for p in data["projects"] if p.get("root")}
+    leases = broker_live_roots(config["broker"])
+    if args.command == "status":
+        report = status_report(records, plugins, leases, corrupt, idle=config["idle"])
+        print(json.dumps(report, default=list) if args.json else "open/managed: %d" % len(report["decisions"]))
+        return 0
+    broker_unknown = leases is None
+    selected, decisions = select_cleanup(records, leases or set(), plugins, cap=config["cap"], idle=config["idle"])
+    if corrupt or plugins is None or broker_unknown: selected = []
+    for root in selected:
+        current_leases = broker_live_roots(config["broker"])
+        current_plugins = plugin_inventory(runtime)
+        if current_leases is None or current_plugins is None or root in current_leases:
+            continue
+        current_plugin = current_plugins.get(root)
+        if current_plugin is None or current_plugin.get("safe") is not True:
+            continue
+        if close_verified(root, runtime, dry_run=args.dry_run):
+            if not args.dry_run: remove_root(root, config["state"], expected=records[root])
+    print(json.dumps({"selected": selected, "reportOnly": corrupt or plugins is None or broker_unknown, "decisions": {k: d.__dict__ for k,d in decisions.items()}}, default=list)); return 0
+def main(): return main_with_environment()
+if __name__ == "__main__": sys.exit(main())
