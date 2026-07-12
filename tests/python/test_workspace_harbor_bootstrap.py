@@ -3,6 +3,7 @@ import importlib.util
 import tempfile
 import unittest
 import sys
+from unittest.mock import patch
 from pathlib import Path
 
 
@@ -70,6 +71,27 @@ class BootstrapPlansTests(unittest.TestCase):
     def test_bad_configuration_and_symlink_escape_need_decision(self):
         self.write(".serena/codex-integration.yml", "bootstrap:\n  task: bootstrap\n  command: {argv: [x]}\n")
         self.assertEqual("needs-decision", bootstrap.plan_repository(self.root)["status"])
+
+    def test_custom_command_beats_conventional_task_and_builtin_opt_out_is_honored(self):
+        self.write("package.json", "{}"); self.write("package-lock.json", "{}")
+        self.write(".serena/codex-integration.yml", "bootstrap:\n  command: {argv: [safe, setup]}\n  use_builtin_recipes: false\n")
+        with patch.object(bootstrap, "_task_plan", return_value=bootstrap.BootstrapPlan("task", "task", "task", ".", ("task",), (), ())):
+            result = bootstrap.plan_repository(self.root)
+        self.assertEqual(["safe", "setup"], result["plans"][0]["argv"])
+        self.write(".serena/codex-integration.yml", "bootstrap:\n  use_builtin_recipes: false\n")
+        self.assertEqual("not-needed", bootstrap.plan_repository(self.root)["status"])
+
+    def test_configured_missing_task_and_invalid_command_inputs_fail_closed(self):
+        self.write(".serena/codex-integration.yml", "bootstrap:\n  task: absent\n")
+        with patch.object(bootstrap, "_task_plan", return_value=None):
+            self.assertEqual("missing-configured-task", bootstrap.plan_repository(self.root)["decisions"][0]["code"])
+        self.write(".serena/codex-integration.yml", "bootstrap:\n  command: {argv: [safe], inputs: [/escape]}\n")
+        self.assertEqual("needs-decision", bootstrap.plan_repository(self.root)["status"])
+
+    def test_ignore_excludes_explicit_nested_boundary(self):
+        self.write("examples/demo/package.json", "{}"); self.write("examples/demo/package-lock.json", "{}")
+        self.write(".serena/codex-integration.yml", "bootstrap:\n  boundaries:\n    include: [examples/demo]\n    ignore: [examples/demo]\n")
+        self.assertEqual("not-needed", bootstrap.plan_repository(self.root)["status"])
         (self.root / "outside").mkdir()
         self.write(".serena/codex-integration.yml", "bootstrap:\n  boundaries:\n    include: [missing]\n")
         self.assertEqual("needs-decision", bootstrap.plan_repository(self.root)["status"])

@@ -13,7 +13,8 @@ from typing import Any
 import yaml
 
 RECIPE_VERSION = 1
-CODEX_TASK = Path(os.environ.get("CODEX_TASK", Path.home() / ".codex/bin/codex-task"))
+CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+CODEX_TASK = Path(os.environ.get("CODEX_TASK", CODEX_HOME / "bin/codex-task"))
 PRUNED_DIRECTORIES = {".git", ".idea", ".serena", ".venv", "venv", "node_modules", "target", "build", "dist", "vendor", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
 
 
@@ -50,22 +51,37 @@ def _mapping(path: Path) -> dict[str, object]:
 def load_policy(root: Path) -> dict[str, object]:
     root = resolve_root(root)
     policy: dict[str, object] = {}
-    global_config = Path.home() / ".codex/serena-integration.yml"
+    global_config = CODEX_HOME / "serena-integration.yml"
     for path in (global_config, root / ".serena/codex-integration.yml"):
         data = _mapping(path)
-        policy.update(data)
+        for key, value in data.items():
+            policy[key] = {**policy.get(key, {}), **value} if isinstance(policy.get(key), dict) and isinstance(value, dict) else value
     bootstrap = policy.get("bootstrap", {})
     if not isinstance(bootstrap, dict): raise ValueError("bootstrap must be a mapping")
     if "task" in bootstrap and "command" in bootstrap: raise ValueError("bootstrap task and command are mutually exclusive")
     if "enabled" in bootstrap and type(bootstrap["enabled"]) is not bool: raise ValueError("bootstrap enabled must be boolean")
+    if "use_builtin_recipes" in bootstrap and type(bootstrap["use_builtin_recipes"]) is not bool: raise ValueError("use_builtin_recipes must be boolean")
+    for key in ("task",):
+        if key in bootstrap and (not isinstance(bootstrap[key], str) or not bootstrap[key]): raise ValueError("task must be a non-empty string")
+    if "command" in bootstrap:
+        command = bootstrap["command"]
+        if not isinstance(command, dict) or set(command) - {"argv", "cwd", "inputs", "markers"}: raise ValueError("invalid command schema")
+        if not isinstance(command.get("argv"), list) or not command["argv"] or not all(isinstance(v, str) and v for v in command["argv"]): raise ValueError("command argv must be non-empty strings")
+        for key in ("inputs", "markers"):
+            if key in command and (not isinstance(command[key], list) or not all(isinstance(v, str) and v for v in command[key])): raise ValueError(f"command {key} must be strings")
+        if "cwd" in command and not isinstance(command["cwd"], str): raise ValueError("command cwd must be string")
+    boundaries = bootstrap.get("boundaries", {})
+    if not isinstance(boundaries, dict) or set(boundaries) - {"include", "ignore"}: raise ValueError("invalid boundaries schema")
+    for value in boundaries.values():
+        if not isinstance(value, list): raise ValueError("boundary values must be lists")
     return policy
 
 
 def repository_identity(root: Path) -> str:
     root = resolve_root(root)
     try:
-        output = subprocess.run(["git", "-C", str(root), "rev-parse", "--git-common-dir"], capture_output=True, text=True, timeout=5, check=False)
-        common = (root / output.stdout.strip()).resolve() if output.returncode == 0 else root
+        output = subprocess.run(["git", "-C", str(root), "rev-parse", "--path-format=absolute", "--git-common-dir"], capture_output=True, text=True, timeout=5, check=False)
+        common = Path(output.stdout.strip()).resolve() if output.returncode == 0 else root
     except (OSError, subprocess.SubprocessError): common = root
     return hashlib.sha256(str(common).encode()).hexdigest()
 
@@ -99,9 +115,8 @@ def language_evidence(root: Path, language: str) -> str:
 
 
 def _plan(source: str, ecosystem: str, cwd: Path, argv: list[str], inputs: list[Path], markers: list[str] | None = None) -> BootstrapPlan:
-    relative = "." if cwd == cwd.anchor and False else str(cwd)
     digest = hashlib.sha256((source + ecosystem + str(cwd) + "\0".join(argv)).encode()).hexdigest()[:16]
-    return BootstrapPlan(digest, source, ecosystem, relative, tuple(argv), tuple(str(p) for p in inputs), tuple(markers or ()))
+    return BootstrapPlan(digest, source, ecosystem, str(cwd), tuple(argv), tuple(str(p) for p in inputs), tuple(markers or ()))
 
 
 def _boundary(root: Path, value: object) -> Path:
@@ -119,11 +134,13 @@ def _builtin(boundary: Path) -> tuple[list[BootstrapPlan], list[dict[str, str]]]
     if present("package.json") and len({"bun" if n.startswith("bun") else n for n in js}) > 1:
         return [], [{"code": "ambiguous-javascript-manager", "path": str(boundary)}]
     if present("package.json") and js:
-        lock = js[0]; package = (boundary / "package.json").read_text(encoding="utf-8", errors="ignore")
+        lock = js[0]
+        try: package = json.loads((boundary / "package.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError): return [], [{"code": "invalid-package-json", "path": str(boundary)}]
         if lock == "package-lock.json": argv, eco = ["npm", "ci"], "npm"
         elif lock == "pnpm-lock.yaml": argv, eco = ["pnpm", "install", "--frozen-lockfile"], "pnpm"
         elif lock.startswith("bun"): argv, eco = ["bun", "install", "--frozen-lockfile"], "bun"
-        elif "packageManager" in package and "yarn@" in package or (boundary / ".yarnrc.yml").is_file(): argv, eco = ["yarn", "install", "--immutable"], "yarn-berry"
+        elif (isinstance(package.get("packageManager"), str) and package["packageManager"].startswith("yarn@")) or (boundary / ".yarnrc.yml").is_file(): argv, eco = ["yarn", "install", "--immutable"], "yarn-berry"
         else: argv, eco = ["yarn", "install", "--frozen-lockfile"], "yarn-classic"
         plans.append(_plan("recipe", eco, boundary, argv, [boundary / "package.json", boundary / lock]))
     if present("pyproject.toml") and present("uv.lock"): plans.append(_plan("recipe", "uv", boundary, ["uv", "sync", "--frozen"], [boundary / "pyproject.toml", boundary / "uv.lock"]))
@@ -145,6 +162,13 @@ def _task_plan(root: Path, name: str) -> BootstrapPlan | None:
     return _plan("task", "task", root, [str(CODEX_TASK), name, "--json"], [taskfile])
 
 
+def _input(root: Path, value: str) -> Path:
+    if Path(value).is_absolute(): raise ValueError("input must be relative")
+    candidate = (root / value).resolve(strict=False)
+    if candidate != root and root not in candidate.parents: raise ValueError("input escapes root")
+    return candidate
+
+
 def plan_repository(root: Path) -> dict[str, object]:
     root = resolve_root(root)
     try: policy = load_policy(root)
@@ -152,24 +176,35 @@ def plan_repository(root: Path) -> dict[str, object]:
     bootstrap = policy.get("bootstrap", {}); assert isinstance(bootstrap, dict)
     base = {"root": str(root), "decisions": [], "policy_source": str(root / ".serena/codex-integration.yml"), "recipe_version": RECIPE_VERSION}
     if bootstrap.get("enabled") is False: return {"status": "disabled", "plans": [], **base}
-    task = bootstrap.get("task", "bootstrap")
-    if isinstance(task, str):
-        planned = _task_plan(root, task)
-        if planned: return {"status": "ready", "plans": [planned.as_dict()], **base}
     command = bootstrap.get("command")
     if command is not None:
-        if not isinstance(command, dict) or not isinstance(command.get("argv"), list) or not all(isinstance(v, str) and v for v in command["argv"]): return {"status": "needs-decision", "plans": [], "decisions": [{"code": "invalid-command"}], **{k:v for k,v in base.items() if k != "decisions"}}
+        assert isinstance(command, dict)
         cwd = root / command.get("cwd", ".")
         if not cwd.is_dir() or cwd.resolve() != root and root not in cwd.resolve().parents: return {"status": "needs-decision", "plans": [], "decisions": [{"code": "invalid-command"}], **{k:v for k,v in base.items() if k != "decisions"}}
-        inputs = [root / p for p in command.get("inputs", []) if isinstance(p, str)]
-        return {"status": "ready", "plans": [_plan("command", "custom", cwd.resolve(), command["argv"], inputs, command.get("markers", [])).as_dict()], **base}
+        try: inputs = [_input(root, p) for p in command.get("inputs", [])]; markers = [_input(root, p) for p in command.get("markers", [])]
+        except ValueError: return {"status": "needs-decision", "plans": [], "decisions": [{"code": "invalid-command"}], **{k:v for k,v in base.items() if k != "decisions"}}
+        plans = [_plan("command", "custom", cwd.resolve(), command["argv"], inputs, [str(p) for p in markers])]
+        if not bootstrap.get("use_builtin_recipes", False): return {"status": "ready", "plans": [p.as_dict() for p in plans], **base}
+    else: plans = []
+    if "task" in bootstrap:
+        planned = _task_plan(root, bootstrap["task"])
+        if not planned: return {"status": "needs-decision", "plans": [], "decisions": [{"code": "missing-configured-task"}], **{k:v for k,v in base.items() if k != "decisions"}}
+        if not bootstrap.get("use_builtin_recipes", False): return {"status": "ready", "plans": [planned.as_dict()], **base}
+        plans.append(planned)
+    elif command is None:
+        planned = _task_plan(root, "bootstrap")
+        if planned: return {"status": "ready", "plans": [planned.as_dict()], **base}
+    if bootstrap.get("use_builtin_recipes") is False: return {"status": "not-needed", "plans": [p.as_dict() for p in plans], **base}
     boundaries = [root]
     try:
         config_boundaries = bootstrap.get("boundaries", {})
         if not isinstance(config_boundaries, dict): raise ValueError("boundaries must be mapping")
-        for value in config_boundaries.get("include", []): boundaries.append(_boundary(root, value))
+        ignored = {_boundary(root, value) for value in config_boundaries.get("ignore", [])}
+        for value in config_boundaries.get("include", []):
+            candidate = _boundary(root, value)
+            if candidate not in ignored: boundaries.append(candidate)
     except (TypeError, ValueError) as error: return {"status": "needs-decision", "plans": [], "decisions": [{"code": "invalid-boundary", "message": str(error)}], **{k:v for k,v in base.items() if k != "decisions"}}
-    plans: list[BootstrapPlan] = []; decisions: list[dict[str, str]] = []
+    decisions: list[dict[str, str]] = []
     for item in boundaries:
         found, requested = _builtin(item); plans.extend(found); decisions.extend(requested)
     if decisions: return {"status": "needs-decision", "plans": [], "decisions": decisions, **{k:v for k,v in base.items() if k != "decisions"}}
