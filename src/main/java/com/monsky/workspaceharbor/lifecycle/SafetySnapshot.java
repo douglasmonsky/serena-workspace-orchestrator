@@ -1,4 +1,4 @@
-package com.monsky.codex.pycharm.lifecycle;
+package com.monsky.workspaceharbor.lifecycle;
 
 /** Immutable observations used to determine whether it is safe to close PyCharm. */
 public record SafetySnapshot(

@@ -1,4 +1,4 @@
-package com.monsky.codex.pycharm.lifecycle;
+package com.monsky.workspaceharbor.lifecycle;
 
 import com.intellij.ide.plugins.PluginManagerCore;
 import com.intellij.openapi.Disposable;

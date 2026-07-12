@@ -1,4 +1,4 @@
-package com.monsky.codex.pycharm.lifecycle;
+package com.monsky.workspaceharbor.lifecycle;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;

@@ -1,4 +1,4 @@
-package com.monsky.codex.pycharm.lifecycle;
+package com.monsky.workspaceharbor.lifecycle;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;

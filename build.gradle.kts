@@ -5,7 +5,11 @@ plugins {
     id("org.jetbrains.intellij.platform") version "2.18.1"
 }
 
-version = "0.1.1"
+version = "0.1.2"
+
+val intellijAppPath = providers.environmentVariable("INTELLIJ_APP_PATH")
+    .orElse("${System.getProperty("user.home")}/Applications/IntelliJ IDEA.app")
+    .get()
 
 java {
     sourceCompatibility = JavaVersion.VERSION_21
@@ -15,7 +19,7 @@ java {
 tasks.withType<JavaCompile>().configureEach {
     options.release.set(21)
     options.isFork = true
-    options.forkOptions.executable = "/Applications/PyCharm.app/Contents/jbr/Contents/Home/bin/javac"
+    options.forkOptions.executable = "$intellijAppPath/Contents/jbr/Contents/Home/bin/javac"
 }
 
 repositories {
@@ -25,7 +29,7 @@ repositories {
 
 dependencies {
     intellijPlatform {
-        local("/Applications/PyCharm.app")
+        local(intellijAppPath)
         bundledPlugin("org.jetbrains.plugins.terminal")
     }
     testImplementation("org.junit.jupiter:junit-jupiter:5.13.4")
@@ -35,7 +39,7 @@ dependencies {
 intellijPlatform {
     pluginVerification {
         ides {
-            local("/Applications/PyCharm.app")
+            local(intellijAppPath)
         }
     }
 }
