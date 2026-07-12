@@ -170,6 +170,32 @@ class PyCharmProjectTrustTests(unittest.TestCase):
         ):
             self.assertEqual(registries["2026.1"], TRUST._config())
 
+    def test_invalid_app_metadata_or_missing_registry_fails_closed(self):
+        live_home = self.base / "invalid-app-home"
+        registry = live_home / "Library/Application Support/JetBrains/PyCharm2026.1/options/trusted-paths.xml"
+        registry.parent.mkdir(parents=True)
+        registry.write_text("<application/>")
+        app = self.base / "InvalidPyCharm.app"
+        info = app / "Contents/Info.plist"
+        info.parent.mkdir(parents=True)
+
+        with mock.patch.object(TRUST, "_account_home", return_value=live_home), mock.patch.dict(
+            os.environ, {"PYCHARM_APP_PATH": str(app)}, clear=True
+        ):
+            with info.open("wb") as handle:
+                plistlib.dump({"CFBundleShortVersionString": "2026.1evil"}, handle)
+            with self.assertRaises(RuntimeError):
+                TRUST._config()
+
+            with info.open("wb") as handle:
+                plistlib.dump({"CFBundleShortVersionString": "2027.1.2"}, handle)
+            with self.assertRaises(RuntimeError):
+                TRUST._config()
+
+            info.write_bytes(b"not a plist")
+            with self.assertRaises(RuntimeError):
+                TRUST._config()
+
     def test_missing_live_and_isolated_registries_fail_closed(self):
         isolated = self.base / "missing" / "trusted-paths.xml"
         repo = self.git_repo(self.allowed / "missing-state")
