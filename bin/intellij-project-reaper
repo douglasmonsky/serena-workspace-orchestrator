@@ -238,7 +238,7 @@ def main_with_environment(argv=None):
     config = environment()
     if config is None: return 2
     parser = argparse.ArgumentParser(); sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("register", "touch"):
+    for name in ("register", "touch", "unregister"):
         p = sub.add_parser(name); p.add_argument("root")
     status = sub.add_parser("status"); status.add_argument("--json", action="store_true")
     is_open = sub.add_parser("is-open"); is_open.add_argument("root")
@@ -246,6 +246,7 @@ def main_with_environment(argv=None):
     args = parser.parse_args(argv)
     if args.command == "register": return 0 if register_root(args.root, config["state"]) else 1
     if args.command == "touch": return 0 if touch_root(args.root, config["state"]) else 1
+    if args.command == "unregister": return 0 if remove_root(args.root, config["state"]) else 1
     runtime = runtime_client(config["runtime"])
     plugins = plugin_inventory(runtime)
     if args.command == "is-open":

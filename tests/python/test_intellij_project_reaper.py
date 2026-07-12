@@ -49,6 +49,18 @@ class RegistryTests(unittest.TestCase):
         self.assertTrue(corrupt); self.assertEqual([], registry["projects"])
         self.assertEqual(1, len(list(self.state.parent.glob("managed.corrupt-*.json"))))
 
+    def test_unregister_removes_only_the_requested_managed_root(self):
+        first = Path(self.tmp.name) / "first"; first.mkdir()
+        second = Path(self.tmp.name) / "second"; second.mkdir()
+        reaper.register_root(str(first), self.state, now="2026-01-01T00:00:00Z")
+        reaper.register_root(str(second), self.state, now="2026-01-01T00:00:00Z")
+        config = {"state": self.state, "runtime": self.state.parent / "runtime.json",
+                  "broker": self.state.parent / "broker", "idle": 1800, "cap": 4}
+        with patch.object(reaper, "environment", return_value=config):
+            self.assertEqual(0, reaper.main_with_environment(["unregister", str(first)]))
+        projects = json.loads(self.state.read_text())["projects"]
+        self.assertEqual([str(second.resolve())], [item["root"] for item in projects])
+
     def test_python39_cleanup_quarantines_malformed_isolated_registry(self):
         self.state.write_text("not json")
         environment = os.environ | {

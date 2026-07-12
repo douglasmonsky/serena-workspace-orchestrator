@@ -32,7 +32,8 @@ python3 -m unittest discover -s tests/python -p 'test_*.py' -v
 - `intellij-project-trust allow|status ROOT` and `audit` manage only the active
   IntelliJ trusted-path registry.
 - `intellij-project-reaper status --json` reports lifecycle state;
-  `cleanup` closes only fully eligible managed projects.
+  `cleanup` closes only fully eligible managed projects, and `unregister ROOT`
+  removes the registry record after a worktree has been safely closed and removed.
 - `serena-codex jetbrains-service-status ROOT` requires one IntelliJ-owned
   Serena service and rejects foreign or duplicate matches.
 - `serena-project-doctor ROOT` performs one bounded health and language-coverage
