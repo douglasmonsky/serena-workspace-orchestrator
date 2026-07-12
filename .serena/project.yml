@@ -33,6 +33,7 @@ project_name: "workspace-harbor"
 # Note that when using the JetBrains backend, language servers are not used and this list is correspondingly ignored.
 languages:
 - java
+- python
 - kotlin
 
 # the encoding used by text files in the project
