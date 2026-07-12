@@ -10,6 +10,7 @@ import fcntl
 from pathlib import Path
 import subprocess
 import tempfile
+import shutil
 from typing import Any
 
 import yaml
@@ -192,6 +193,11 @@ def _version(argv: list[str]) -> str:
     except (OSError, subprocess.SubprocessError): return "unavailable"
 
 
+def _tool_identity(executable: str) -> dict[str, object]:
+    path = Path(executable) if Path(executable).is_absolute() else (Path(shutil.which(executable)) if shutil.which(executable) else None)
+    return {"path": str(path) if path and path.is_file() else None, "version": _version([str(path)]) if path and path.is_file() else "unavailable"}
+
+
 def _markers(plan: dict[str, object]) -> list[Path]:
     if plan["source"] == "command": return [Path(v) for v in plan["markers"]]
     cwd = Path(plan["cwd"])
@@ -202,8 +208,8 @@ def bootstrap_fingerprint(root: Path, plans: list[dict[str, object]]) -> str:
     material: dict[str, object] = {"root": str(resolve_root(root)), "recipe_version": RECIPE_VERSION, "plans": []}
     for plan in sorted(plans, key=lambda p: p["plan_id"]):
         executable = plan["argv"][0] if plan["argv"] else "ide-managed"
-        material["plans"].append({"plan": plan, "inputs": [(value, _sha256(Path(value))) for value in plan["inputs"]], "tool": executable, "tool_version": _version([executable]) if executable != "ide-managed" else "native", "markers": [str(p) for p in _markers(plan)]})
-    for config in (resolve_root(root) / ".serena/codex-integration.yml", resolve_root(root) / ".codex/tasks.toml"):
+        material["plans"].append({"plan": plan, "inputs": [(value, _sha256(Path(value))) for value in plan["inputs"]], "tool": _tool_identity(executable) if executable != "ide-managed" else {"path": "native", "version": "native"}, "markers": [str(p) for p in _markers(plan)]})
+    for config in (CODEX_HOME / "serena-integration.yml", resolve_root(root) / ".serena/codex-integration.yml", resolve_root(root) / ".codex/tasks.toml"):
         material.setdefault("config", []).append((str(config), _sha256(config)))
     material["runtime"] = {"python": os.sys.version, "platform": os.sys.platform}
     return hashlib.sha256(json.dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -234,7 +240,8 @@ def bootstrap_status(root: Path) -> dict[str, object]:
     fingerprint = bootstrap_fingerprint(root, plans)
     record = _read_worktree_success(root)
     markers_ready = all(marker.exists() for plan in plans for marker in _markers(plan))
-    return {**planned, "status": "ready" if record and record["fingerprint"] == fingerprint and markers_ready else "pending", "fingerprint": fingerprint, "cache": "hit" if record and record["fingerprint"] == fingerprint and markers_ready else "miss"}
+    tools_ready = all(plan["argv"] == [] or _tool_identity(plan["argv"][0])["path"] is not None for plan in plans)
+    return {**planned, "status": "ready" if record and record["fingerprint"] == fingerprint and markers_ready and tools_ready else "pending", "fingerprint": fingerprint, "cache": "hit" if record and record["fingerprint"] == fingerprint and markers_ready and tools_ready else "miss"}
 
 
 def _contains_source(root: Path, suffixes: set[str]) -> bool:

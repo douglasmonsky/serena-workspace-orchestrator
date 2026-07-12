@@ -222,6 +222,25 @@ class BootstrapPlansTests(unittest.TestCase):
             bootstrap._worktree_path(self.root).write_text("bad")
             with self.assertRaises(ValueError): bootstrap.bootstrap_status(self.root)
 
+    def test_global_policy_and_resolved_tool_path_invalidate_cache(self):
+        state = Path(self.tmp.name) / "state"; codex = Path(self.tmp.name) / "codex"; codex.mkdir()
+        self.write("package.json", "{}"); self.write("package-lock.json", ""); (self.root / "node_modules").mkdir()
+        identities = [{"path": "/tools/npm-a", "version": "v1"}, {"path": "/tools/npm-b", "version": "v1"}]
+        with patch.dict(os.environ, {"WORKSPACE_HARBOR_BOOTSTRAP_STATE_DIR": str(state)}, clear=False), patch.object(bootstrap, "CODEX_HOME", codex), patch.object(bootstrap, "_tool_identity", side_effect=lambda _: identities[0]):
+            first = bootstrap.bootstrap_status(self.root); bootstrap.write_worktree_success(self.root, first["fingerprint"])
+            self.assertEqual("ready", bootstrap.bootstrap_status(self.root)["status"])
+            (codex / "serena-integration.yml").write_text("bootstrap: {}\n")
+            self.assertEqual("pending", bootstrap.bootstrap_status(self.root)["status"])
+            current = bootstrap.bootstrap_status(self.root); bootstrap.write_worktree_success(self.root, current["fingerprint"])
+            identities[0] = identities[1]
+            self.assertEqual("pending", bootstrap.bootstrap_status(self.root)["status"])
+
+    def test_missing_executable_never_reports_a_cache_hit(self):
+        state = Path(self.tmp.name) / "state"; self.write("package.json", "{}"); self.write("package-lock.json", ""); (self.root / "node_modules").mkdir()
+        with patch.dict(os.environ, {"WORKSPACE_HARBOR_BOOTSTRAP_STATE_DIR": str(state)}, clear=False), patch.object(bootstrap, "_tool_identity", return_value={"path": None, "version": "unavailable"}):
+            result = bootstrap.bootstrap_status(self.root); bootstrap.write_worktree_success(self.root, result["fingerprint"])
+            self.assertEqual("pending", bootstrap.bootstrap_status(self.root)["status"])
+
     def test_command_approval_digest_covers_declared_inputs_and_markers_and_lock_is_separate(self):
         state = Path(self.tmp.name) / "state"; self.write("setup.lock", "one")
         self.write(".serena/codex-integration.yml", "bootstrap:\n  command: {argv: [tool, setup], inputs: [setup.lock], markers: [.ready]}\n")
