@@ -7,7 +7,9 @@ import tempfile
 import unittest
 
 
-HELPER = Path(__file__).resolve().parents[2] / "bin/open-codex-project-in-pycharm"
+TEST_FILE = Path(__file__).resolve()
+ROOT = TEST_FILE.parent.parent if TEST_FILE.parent.name == "tests" else TEST_FILE.parents[2]
+HELPER = ROOT / "bin/open-codex-project-in-pycharm"
 DEFAULT_TRUST_COMMAND = Path(tempfile.gettempdir()) / "open-codex-project-in-pycharm-test-trust"
 DEFAULT_TRUST_COMMAND.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
 DEFAULT_TRUST_COMMAND.chmod(0o755)

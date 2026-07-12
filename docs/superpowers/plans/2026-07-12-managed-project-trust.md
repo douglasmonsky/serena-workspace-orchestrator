@@ -176,11 +176,11 @@ git commit -m "feat: trust managed projects before opening"
 **Interfaces:**
 - Documents `allow`, `status`, `audit`, approved parents, and the separate broad-trust migration gate.
 
-- [ ] **Step 1: Update README with exact commands and safety rules**
+- [x] **Step 1: Update README with exact commands and safety rules**
 
 Document that managed new opens auto-trust exact Git roots within the two approved parents, while already-open roots remain usable if trust state is temporarily unavailable. Include `pycharm-project-trust audit` and state that broad entries are reported but not removed.
 
-- [ ] **Step 2: Run repository verification before deployment**
+- [x] **Step 2: Run repository verification before deployment**
 
 ```bash
 python3 -m unittest discover -s tests/python -p 'test_*.py'
@@ -192,21 +192,21 @@ git diff --check
 
 Expected: all commands exit `0`.
 
-- [ ] **Step 3: Deploy reviewed copies without changing live trust state**
+- [x] **Step 3: Deploy reviewed copies without changing live trust state**
 
 Back up the two existing deployed files, then copy the source-controlled files to `~/.codex/bin` with mode `0755` and copy tests to `~/.codex/tests`. Do not invoke `allow`, edit the real XML, restart PyCharm, or remove broad trust.
 
-- [ ] **Step 4: Verify deployed files against isolated state**
+- [x] **Step 4: Verify deployed files against isolated state**
 
 Point `PYCHARM_TRUST_CONFIG_FILE` and `PYCHARM_TRUST_ALLOWED_ROOTS` at temporary fixtures. Run deployed helper `allow`, `status`, and `audit`; run the global unittest discovery suite; compare source and deployed SHA-256 hashes.
 
-- [ ] **Step 5: Commit documentation**
+- [x] **Step 5: Commit documentation**
 
 ```bash
 git add -- README.md docs/superpowers/plans/2026-07-12-managed-project-trust.md
 git commit -m "docs: explain managed project trust"
 ```
 
-- [ ] **Step 6: Record the operational gate**
+- [x] **Step 6: Record the operational gate**
 
 Report that live no-prompt testing and removal of `$USER_HOME$/Documents` remain pending because repository guidance prohibits live IDE interaction. Provide the exact later audit command, but do not change live trust state.

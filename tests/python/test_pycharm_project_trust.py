@@ -8,7 +8,8 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[2]
+TEST_FILE = Path(__file__).resolve()
+ROOT = TEST_FILE.parent.parent if TEST_FILE.parent.name == "tests" else TEST_FILE.parents[2]
 CLI = ROOT / "bin" / "pycharm-project-trust"
 
 
