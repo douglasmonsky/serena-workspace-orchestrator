@@ -214,16 +214,19 @@ private dependency URLs. Persistent raw installer output is not retained.
 Possible overall states are:
 
 - `ready`: every required plan is a cache hit or completed successfully;
+- `pending`: every required plan is deterministic/approved, but no matching
+  success record exists yet;
 - `not-needed`: no supported dependency boundary requires setup;
 - `needs-decision`: ambiguity, unconfirmed language, local approval, or Serena
   tracking policy requires user input;
 - `failed`: a selected setup command failed or changed protected inputs; and
 - `disabled`: global or repository policy opted out.
 
-CLI exit status is `0` for `ready`, `not-needed`, or `disabled`; `3` for
-`needs-decision`; `1` for a failed selected plan; and `2` for invalid input,
-configuration, or state. JSON mode always emits one result object before
-returning the corresponding status.
+CLI exit status is `0` for `ready`, `pending`, `not-needed`, or `disabled`;
+`3` for `needs-decision`; `1` for a failed selected plan; and `2` for invalid
+input, configuration, or state. JSON mode always emits one result object
+before returning the corresponding status. `run` never returns `pending`: it
+executes the selected plan and returns `ready` or `failed`.
 
 Bootstrap failure does not close IntelliJ, launch a second IDE, or repeatedly
 retry through Serena. The opener continues to make the exact trusted project
