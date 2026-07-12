@@ -15,15 +15,14 @@ import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-DEFAULT_ALLOWED_ROOTS = (
-    Path("/Users/Monsky/Documents/Codex"),
-    Path("/Users/Monsky/.codex/src"),
-)
-
-
 def _account_home() -> Path:
     """Return the authenticated OS account home, ignoring caller environment."""
     return Path(pwd.getpwuid(os.getuid()).pw_dir)
+
+
+def _default_allowed_roots() -> tuple[Path, ...]:
+    home = _account_home()
+    return (home / "Documents/Codex", home / ".codex/src")
 
 
 def canonical_git_root(value: str, allowed: tuple[Path, ...]) -> Path:
@@ -118,7 +117,7 @@ def _is_live_registry(config: Path) -> bool:
 def _allowed(config: Path) -> tuple[Path, ...]:
     raw = os.environ.get("PYCHARM_TRUST_ALLOWED_ROOTS", "")
     if _is_live_registry(config) or not raw:
-        return DEFAULT_ALLOWED_ROOTS
+        return _default_allowed_roots()
     return tuple(Path(item).expanduser() for item in raw.split(os.pathsep) if item)
 
 

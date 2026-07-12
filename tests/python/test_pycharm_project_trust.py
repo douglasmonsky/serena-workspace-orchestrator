@@ -110,7 +110,7 @@ class PyCharmProjectTrustTests(unittest.TestCase):
             os.environ, {"PYCHARM_TRUST_CONFIG_FILE": str(live_registry), "PYCHARM_TRUST_ALLOWED_ROOTS": str(self.other)}, clear=False
         ):
             self.assertTrue(TRUST._is_live_registry(live_registry))
-            self.assertEqual(TRUST.DEFAULT_ALLOWED_ROOTS, TRUST._allowed(live_registry))
+            self.assertEqual(TRUST._default_allowed_roots(), TRUST._allowed(live_registry))
 
     def test_allowed_override_cannot_target_default_registry(self):
         live_home = self.base / "default-home"
@@ -126,7 +126,17 @@ class PyCharmProjectTrustTests(unittest.TestCase):
             os.environ, {"PYCHARM_TRUST_ALLOWED_ROOTS": str(self.other), "PYCHARM_APP_PATH": str(app)}, clear=False
         ):
             self.assertEqual(live_registry, TRUST._config())
-            self.assertEqual(TRUST.DEFAULT_ALLOWED_ROOTS, TRUST._allowed(live_registry))
+            self.assertEqual(TRUST._default_allowed_roots(), TRUST._allowed(live_registry))
+
+    def test_default_allowed_roots_use_authenticated_account_home(self):
+        account_home = self.base / "account-home"
+        with mock.patch.object(TRUST, "_account_home", return_value=account_home), mock.patch.dict(
+            os.environ, {"HOME": str(self.base / "spoofed-home")}, clear=False
+        ):
+            self.assertEqual(
+                (account_home / "Documents/Codex", account_home / ".codex/src"),
+                TRUST._default_allowed_roots(),
+            )
 
     def test_isolated_config_can_use_allowed_override(self):
         repo = self.git_repo(self.other / "isolated")
@@ -255,7 +265,7 @@ class PyCharmProjectTrustTests(unittest.TestCase):
         live = account_home / "Library/Application Support/JetBrains/PyCharm2099.1/options/trusted-paths.xml"
         with mock.patch.dict(os.environ, {"HOME": str(self.base / "spoofed-home"), "PYCHARM_TRUST_ALLOWED_ROOTS": str(self.other)}):
             self.assertTrue(TRUST._is_live_registry(live))
-            self.assertEqual(TRUST.DEFAULT_ALLOWED_ROOTS, TRUST._allowed(live))
+            self.assertEqual(TRUST._default_allowed_roots(), TRUST._allowed(live))
 
     def test_audit_is_evaluated_once(self):
         payload = {"exact": [], "broad": [], "outsideAllowed": [], "malformed": False}
