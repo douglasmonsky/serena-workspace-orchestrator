@@ -50,14 +50,14 @@ python3 -m unittest discover -s tests/python -p 'test_*.py' -v
 
 ## Trust model
 
-Managed roots must be exact canonical Git top levels beneath either
-`$HOME/Documents/Codex` or `$HOME/.codex/src`. The trust helper rejects nested
-paths, non-Git directories, symlink escapes, malformed state, and roots outside
-those parents. It writes IntelliJ's native registry with locking, backup, and
-atomic replacement. When IntelliJ is running, it also calls Workspace Harbor's
-authenticated loopback endpoint so the in-memory trust state changes before
-the project is opened; this prevents a stale live registry from producing a
-GUI trust prompt.
+Managed roots must be exact canonical Git top levels beneath
+`$HOME/Documents/Codex`, `$HOME/Developer/Codex`, or `$HOME/.codex/src`. The
+trust helper rejects nested paths, non-Git directories, symlink escapes,
+malformed state, and roots outside those parents. It writes IntelliJ's native
+registry with locking, backup, and atomic replacement. When IntelliJ is
+running, it also calls Workspace Harbor's authenticated loopback endpoint so
+the in-memory trust state changes before the project is opened; this prevents
+a stale live registry from producing a GUI trust prompt.
 
 `intellij-project-trust audit` reports broad and out-of-scope entries but never
 removes them automatically.

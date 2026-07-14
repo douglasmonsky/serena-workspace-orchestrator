@@ -73,6 +73,7 @@ public final class LifecycleService implements Disposable, LifecycleHttpServer.A
             requested = requested.toRealPath();
             Path home = Path.of(System.getProperty("user.home")).toRealPath();
             if (!requested.startsWith(home.resolve("Documents/Codex"))
+                    && !requested.startsWith(home.resolve("Developer/Codex"))
                     && !requested.startsWith(home.resolve(".codex/src"))) return false;
         } catch (IOException | RuntimeException exception) {
             return false;

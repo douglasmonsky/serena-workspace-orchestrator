@@ -144,7 +144,11 @@ class IntelliJProjectTrustTests(unittest.TestCase):
             os.environ, {"HOME": str(self.base / "spoofed-home")}, clear=False
         ):
             self.assertEqual(
-                (account_home / "Documents/Codex", account_home / ".codex/src"),
+                (
+                    account_home / "Documents/Codex",
+                    account_home / "Developer/Codex",
+                    account_home / ".codex/src",
+                ),
                 TRUST._default_allowed_roots(),
             )
 

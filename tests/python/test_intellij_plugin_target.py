@@ -18,7 +18,7 @@ class IntelliJPluginTargetTests(unittest.TestCase):
         self.assertIn('environmentVariable("INTELLIJ_APP_PATH")', build)
         self.assertIn("Applications/IntelliJ IDEA.app", build)
         self.assertNotIn("/Applications/PyCharm.app", build)
-        self.assertIn('version = "0.1.6"', build)
+        self.assertIn('version = "0.1.7"', build)
 
     def test_java_sources_live_in_product_neutral_package(self):
         expected_main = ROOT / "src/main/java/com/monsky/workspaceharbor/lifecycle"
@@ -32,6 +32,11 @@ class IntelliJPluginTargetTests(unittest.TestCase):
         service = (ROOT / "src/main/java/com/monsky/workspaceharbor/lifecycle/LifecycleService.java").read_text()
         self.assertIn('"intellij-projects"', service)
         self.assertNotIn('"pycharm-projects"', service)
+
+    def test_plugin_trusts_both_codex_workspace_parents(self):
+        service = (ROOT / "src/main/java/com/monsky/workspaceharbor/lifecycle/LifecycleService.java").read_text()
+        self.assertIn('home.resolve("Documents/Codex")', service)
+        self.assertIn('home.resolve("Developer/Codex")', service)
 
     def test_gradle_projects_use_intellij_bundled_runtime_before_import(self):
         build = (ROOT / "build.gradle.kts").read_text()
