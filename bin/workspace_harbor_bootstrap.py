@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
+import errno
 import hashlib
 import json
 import os
@@ -346,20 +347,20 @@ def _timeout_seconds() -> int:
     return value
 
 
-def _execute(plan: dict[str, object]) -> tuple[int, str]:
+def _execute(plan: dict[str, object]) -> tuple[int, str, str | None]:
     argv_value = plan.get("argv")
     cwd_value = plan.get("cwd")
     if not isinstance(argv_value, list) or not all(isinstance(item, str) for item in argv_value):
-        return 2, "invalid bootstrap argv"
+        return 2, "invalid bootstrap argv", "invalid-plan"
     if not argv_value:
-        return 0, ""
+        return 0, "", None
     if not isinstance(cwd_value, str):
-        return 2, "invalid bootstrap working directory"
+        return 2, "invalid bootstrap working directory", "invalid-plan"
     cwd = Path(cwd_value)
     identity = _tool_identity(argv_value[0], cwd)
     executable = identity.get("path")
     if not isinstance(executable, str):
-        return 127, f"command unavailable: {Path(argv_value[0]).name}"
+        return 127, f"command unavailable: {Path(argv_value[0]).name}", "process-error"
     argv = [executable, *argv_value[1:]]
     try:
         completed = subprocess.run(
@@ -373,11 +374,15 @@ def _execute(plan: dict[str, object]) -> tuple[int, str]:
         )
     except subprocess.TimeoutExpired as error:
         output = "\n".join(part for part in (_sanitized_tail(error.stdout), _sanitized_tail(error.stderr)) if part)
-        return 124, output or "bootstrap command timed out"
+        return 124, output or "bootstrap command timed out", "process-error"
+    except subprocess.SubprocessError as error:
+        return 127, _sanitized_tail(error), "process-error"
     except OSError as error:
-        return 127, _sanitized_tail(error)
+        return 127, _sanitized_tail(error), "process-error"
     output = "\n".join(part for part in (completed.stdout, completed.stderr) if part)
-    return completed.returncode, "" if completed.returncode == 0 else _sanitized_tail(output)
+    if completed.returncode == 0:
+        return 0, "", None
+    return completed.returncode, _sanitized_tail(output), "command-failed"
 
 
 def _failure_result(
@@ -405,56 +410,110 @@ def _failure_result(
     return result
 
 
+def _operational_failure(
+    error: BaseException,
+    *,
+    operation: str,
+    started: float,
+    status: dict[str, object] | None = None,
+    kind: str | None = None,
+) -> dict[str, object]:
+    error_number = getattr(error, "errno", None)
+    failure_kind = kind
+    if failure_kind is None:
+        if isinstance(error, PermissionError) or error_number in {errno.EACCES, errno.EPERM}:
+            failure_kind = "permission-denied"
+        elif isinstance(error, subprocess.SubprocessError):
+            failure_kind = "process-error"
+        else:
+            failure_kind = "io-error"
+    result: dict[str, object] = {
+        **(status or {}),
+        "status": "failed",
+        "cache": "miss",
+        "failure_kind": failure_kind,
+        "operation": operation,
+        "elapsed_ms": round((time.monotonic() - started) * 1000),
+    }
+    detail = _sanitized_tail(error)
+    if detail:
+        result["error"] = detail
+    return result
+
+
 def run_bootstrap(root: Path, force: bool = False) -> dict[str, object]:
     root = resolve_root(root)
-    with _worktree_lock(root):
+    started = time.monotonic()
+    status: dict[str, object] | None = None
+    try:
         status = bootstrap_status(root)
         if status["status"] in {"disabled", "not-needed", "needs-decision"}:
             return status
         if status["status"] == "ready" and not force:
             return status
-        started = time.monotonic()
-        plans = status.get("plans")
-        fingerprint = status.get("fingerprint")
-        if not isinstance(plans, list) or not isinstance(fingerprint, str):
-            return _failure_result(status, kind="invalid-plan", started=started)
-        _remove_worktree_success(root)
-        executed: list[str] = []
-        for plan in sorted(plans, key=lambda item: str(item.get("plan_id"))):
-            if not isinstance(plan, dict):
+
+        with _worktree_lock(root):
+            status = bootstrap_status(root)
+            if status["status"] in {"disabled", "not-needed", "needs-decision"}:
+                return status
+            if status["status"] == "ready" and not force:
+                return status
+            plans = status.get("plans")
+            fingerprint = status.get("fingerprint")
+            if not isinstance(plans, list) or not isinstance(fingerprint, str):
                 return _failure_result(status, kind="invalid-plan", started=started)
-            if not plan.get("argv"):
-                continue
-            return_code, output = _execute(plan)
-            if return_code != 0:
+            _remove_worktree_success(root)
+            executed: list[str] = []
+            for plan in sorted(plans, key=lambda item: str(item.get("plan_id"))):
+                if not isinstance(plan, dict):
+                    return _failure_result(status, kind="invalid-plan", started=started)
+                if not plan.get("argv"):
+                    continue
+                return_code, output, failure_kind = _execute(plan)
+                if return_code != 0:
+                    return _failure_result(
+                        status,
+                        kind=failure_kind or "command-failed",
+                        started=started,
+                        plan=plan,
+                        exit_code=return_code,
+                        context=output,
+                    )
+                executed.append(str(plan.get("plan_id")))
+            after = plan_repository(root)
+            if after.get("status") != "ready" or bootstrap_fingerprint(root, after["plans"]) != fingerprint:
+                return _failure_result(status, kind="inputs-changed", started=started)
+            missing_markers = [str(marker) for plan in plans for marker in _markers(plan) if not marker.exists()]
+            if missing_markers:
                 return _failure_result(
                     status,
-                    kind="command-failed",
+                    kind="missing-marker",
                     started=started,
-                    plan=plan,
-                    exit_code=return_code,
-                    context=output,
+                    context="missing environment marker: " + ", ".join(missing_markers),
                 )
-            executed.append(str(plan.get("plan_id")))
-        after = plan_repository(root)
-        if after.get("status") != "ready" or bootstrap_fingerprint(root, after["plans"]) != fingerprint:
-            return _failure_result(status, kind="inputs-changed", started=started)
-        missing_markers = [str(marker) for plan in plans for marker in _markers(plan) if not marker.exists()]
-        if missing_markers:
-            return _failure_result(
-                status,
-                kind="missing-marker",
-                started=started,
-                context="missing environment marker: " + ", ".join(missing_markers),
-            )
-        write_worktree_success(root, fingerprint)
-        return {
-            **status,
-            "status": "ready",
-            "cache": "executed",
-            "executed_plans": executed,
-            "elapsed_ms": round((time.monotonic() - started) * 1000),
-        }
+            write_worktree_success(root, fingerprint)
+            return {
+                **status,
+                "status": "ready",
+                "cache": "executed",
+                "executed_plans": executed,
+                "elapsed_ms": round((time.monotonic() - started) * 1000),
+            }
+    except subprocess.SubprocessError as error:
+        return _operational_failure(
+            error,
+            operation="bootstrap-process",
+            started=started,
+            status=status,
+            kind="process-error",
+        )
+    except OSError as error:
+        return _operational_failure(
+            error,
+            operation="bootstrap-state",
+            started=started,
+            status=status,
+        )
 
 
 def _exit_status(result: dict[str, object]) -> int:
@@ -509,24 +568,42 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         root = resolve_root(args.root)
-        if args.command == "status":
-            result = bootstrap_status(root)
-        elif args.command == "run":
-            result = run_bootstrap(root, force=args.force)
-        else:
-            values = list(args.values)
-            if args.category == "language" and len(values) == 2:
-                subject, decision = values
-            elif args.category == "tracking" and len(values) == 1:
-                subject, decision = "serena-files", values[0]
-            elif args.category == "command" and len(values) == 1:
-                subject, decision = "current", values[0]
-            else:
-                raise ValueError("invalid decision arguments")
-            result = record_decision(root, args.category, subject, decision)
-            result = {"status": "ready", **result}
-    except (OSError, ValueError, subprocess.SubprocessError) as error:
+    except (OSError, ValueError) as error:
         result = {"status": "invalid", "error": _sanitized_tail(error)}
+    else:
+        started = time.monotonic()
+        try:
+            if args.command == "status":
+                result = bootstrap_status(root)
+            elif args.command == "run":
+                result = run_bootstrap(root, force=args.force)
+            else:
+                values = list(args.values)
+                if args.category == "language" and len(values) == 2:
+                    subject, decision = values
+                elif args.category == "tracking" and len(values) == 1:
+                    subject, decision = "serena-files", values[0]
+                elif args.category == "command" and len(values) == 1:
+                    subject, decision = "current", values[0]
+                else:
+                    raise ValueError("invalid decision arguments")
+                result = record_decision(root, args.category, subject, decision)
+                result = {"status": "ready", **result}
+        except ValueError as error:
+            result = {"status": "invalid", "error": _sanitized_tail(error)}
+        except subprocess.SubprocessError as error:
+            result = _operational_failure(
+                error,
+                operation=f"bootstrap-{args.command}",
+                started=started,
+                kind="process-error",
+            )
+        except OSError as error:
+            result = _operational_failure(
+                error,
+                operation=f"bootstrap-{args.command}",
+                started=started,
+            )
     _print_result(result, args.json)
     return _exit_status(result)
 

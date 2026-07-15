@@ -1,6 +1,7 @@
 import importlib.machinery
 import importlib.util
 from contextlib import redirect_stdout
+import errno
 import io
 import json
 import os
@@ -291,7 +292,7 @@ class BootstrapPlansTests(unittest.TestCase):
         identity = {"path": "/tools/go", "version": "go1"}
         with patch.dict(os.environ, {"WORKSPACE_HARBOR_BOOTSTRAP_STATE_DIR": str(state)}, clear=False), \
              patch.object(bootstrap, "_tool_identity", return_value=identity), \
-             patch.object(bootstrap, "_execute", side_effect=lambda plan: calls.append(plan["plan_id"]) or (0, "")):
+             patch.object(bootstrap, "_execute", side_effect=lambda plan: calls.append(plan["plan_id"]) or (0, "", None)):
             first = bootstrap.run_bootstrap(self.root)
             second = bootstrap.run_bootstrap(self.root)
             self.write("go.sum", "changed\n")
@@ -301,20 +302,92 @@ class BootstrapPlansTests(unittest.TestCase):
         self.assertEqual(("ready", "executed"), (third["status"], third["cache"]))
         self.assertEqual(2, len(calls))
 
+    def test_ready_cache_hit_does_not_acquire_mutating_lock(self):
+        self.make_go_fixture()
+        state = Path(self.tmp.name) / "state"
+        identity = {"path": "/tools/go", "version": "go1"}
+        with patch.dict(
+            os.environ,
+            {"WORKSPACE_HARBOR_BOOTSTRAP_STATE_DIR": str(state)},
+            clear=False,
+        ), patch.object(
+            bootstrap, "_tool_identity", return_value=identity
+        ), patch.object(
+            bootstrap, "_execute", return_value=(0, "", None)
+        ):
+            first = bootstrap.run_bootstrap(self.root)
+            with patch.object(
+                bootstrap,
+                "_worktree_lock",
+                side_effect=PermissionError(errno.EPERM, "Operation not permitted"),
+            ) as lock:
+                cached = bootstrap.run_bootstrap(self.root)
+
+        self.assertEqual(("ready", "executed"), (first["status"], first["cache"]))
+        self.assertEqual(("ready", "hit"), (cached["status"], cached["cache"]))
+        lock.assert_not_called()
+
+    def test_nonexecuting_statuses_do_not_acquire_mutating_lock(self):
+        packets = (
+            {"status": "disabled", "plans": []},
+            {"status": "not-needed", "plans": []},
+            {
+                "status": "needs-decision",
+                "plans": [],
+                "decisions": [{"code": "fixture"}],
+            },
+        )
+        for packet in packets:
+            with self.subTest(status=packet["status"]), patch.object(
+                bootstrap, "bootstrap_status", return_value=packet
+            ), patch.object(
+                bootstrap,
+                "_worktree_lock",
+                side_effect=AssertionError("read-only result attempted a lock"),
+            ) as lock:
+                self.assertEqual(packet, bootstrap.run_bootstrap(self.root))
+                lock.assert_not_called()
+
+    def test_mutation_boundary_failures_are_operational_and_typed(self):
+        self.make_go_fixture()
+        state = Path(self.tmp.name) / "state"
+        identity = {"path": "/tools/go", "version": "go1"}
+        failures = (
+            (PermissionError(errno.EPERM, "Operation not permitted"), "permission-denied"),
+            (PermissionError(errno.EACCES, "Permission denied"), "permission-denied"),
+            (OSError(errno.EIO, "I/O error"), "io-error"),
+        )
+        for error, expected_kind in failures:
+            with self.subTest(kind=expected_kind, errno=error.errno), patch.dict(
+                os.environ,
+                {"WORKSPACE_HARBOR_BOOTSTRAP_STATE_DIR": str(state)},
+                clear=False,
+            ), patch.object(
+                bootstrap, "_tool_identity", return_value=identity
+            ), patch.object(
+                bootstrap, "_worktree_lock", side_effect=error
+            ):
+                result = bootstrap.run_bootstrap(self.root)
+
+            self.assertEqual("failed", result["status"])
+            self.assertEqual(expected_kind, result["failure_kind"])
+            self.assertEqual("bootstrap-state", result["operation"])
+            self.assertEqual(1, bootstrap.result_exit_status(result))
+
     def test_force_reruns_and_failure_removes_success_record_with_redaction(self):
         self.make_go_fixture()
         state = Path(self.tmp.name) / "state"
         identity = {"path": "/tools/go", "version": "go1"}
         with patch.dict(os.environ, {"WORKSPACE_HARBOR_BOOTSTRAP_STATE_DIR": str(state)}, clear=False), \
              patch.object(bootstrap, "_tool_identity", return_value=identity), \
-             patch.object(bootstrap, "_execute", return_value=(0, "")) as execute:
+             patch.object(bootstrap, "_execute", return_value=(0, "", None)) as execute:
             bootstrap.run_bootstrap(self.root)
             forced = bootstrap.run_bootstrap(self.root, force=True)
             self.assertEqual("executed", forced["cache"])
             self.assertEqual(2, execute.call_count)
         with patch.dict(os.environ, {"WORKSPACE_HARBOR_BOOTSTRAP_STATE_DIR": str(state)}, clear=False), \
              patch.object(bootstrap, "_tool_identity", return_value=identity), \
-             patch.object(bootstrap, "_execute", return_value=(9, "api_key=supersecret\nAuthorization: Bearer abc.def")):
+             patch.object(bootstrap, "_execute", return_value=(9, "api_key=supersecret\nAuthorization: Bearer abc.def", "command-failed")):
             failed = bootstrap.run_bootstrap(self.root, force=True)
         self.assertEqual("failed", failed["status"])
         self.assertNotIn("supersecret", json.dumps(failed))
@@ -328,7 +401,7 @@ class BootstrapPlansTests(unittest.TestCase):
 
         def mutate(_plan):
             self.write("go.sum", "mutated\n")
-            return 0, ""
+            return 0, "", None
 
         with patch.dict(os.environ, {"WORKSPACE_HARBOR_BOOTSTRAP_STATE_DIR": str(state)}, clear=False), \
              patch.object(bootstrap, "_tool_identity", return_value=identity), \
@@ -341,7 +414,7 @@ class BootstrapPlansTests(unittest.TestCase):
         self.write("package.json", "{}\n"); self.write("package-lock.json", "{}\n")
         with patch.dict(os.environ, {"WORKSPACE_HARBOR_BOOTSTRAP_STATE_DIR": str(state)}, clear=False), \
              patch.object(bootstrap, "_tool_identity", return_value={"path": "/tools/npm", "version": "10"}), \
-             patch.object(bootstrap, "_execute", return_value=(0, "")):
+             patch.object(bootstrap, "_execute", return_value=(0, "", None)):
             missing = bootstrap.run_bootstrap(self.root)
         self.assertEqual("missing-marker", missing["failure_kind"])
         self.assertFalse(bootstrap._worktree_path(self.root).exists())
@@ -367,6 +440,37 @@ class BootstrapPlansTests(unittest.TestCase):
                 status = bootstrap.main(["status", str(self.root / "missing"), "--json"])
             self.assertEqual(2, status)
             self.assertEqual("invalid", json.loads(output.getvalue())["status"])
+
+    def test_run_cli_preserves_invalid_vs_operational_exit_codes(self):
+        state = Path(self.tmp.name) / "state"
+        self.make_go_fixture()
+        with patch.dict(
+            os.environ,
+            {"WORKSPACE_HARBOR_BOOTSTRAP_STATE_DIR": str(state)},
+            clear=False,
+        ), patch.object(
+            bootstrap,
+            "_tool_identity",
+            return_value={"path": "/tools/go", "version": "go1"},
+        ), patch.object(
+            bootstrap,
+            "_worktree_lock",
+            side_effect=PermissionError(errno.EPERM, "Operation not permitted"),
+        ):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                exit_code = bootstrap.main(["run", str(self.root), "--json"])
+
+        packet = json.loads(output.getvalue())
+        self.assertEqual(1, exit_code)
+        self.assertEqual("failed", packet["status"])
+        self.assertEqual("permission-denied", packet["failure_kind"])
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            exit_code = bootstrap.main(["status", str(self.root / "missing"), "--json"])
+        self.assertEqual(2, exit_code)
+        self.assertEqual("invalid", json.loads(output.getvalue())["status"])
 
     def test_concurrent_cli_runs_execute_installer_once(self):
         self.make_go_fixture()
@@ -423,8 +527,8 @@ class BootstrapPlansTests(unittest.TestCase):
             "markers": [],
         }
         with patch.object(bootstrap, "_tool_identity", return_value={"path": None, "version": "unavailable"}):
-            code, output = bootstrap._execute(plan)
-        self.assertEqual(127, code)
+            code, output, failure_kind = bootstrap._execute(plan)
+        self.assertEqual((127, "process-error"), (code, failure_kind))
         self.assertIn("unavailable", output)
 
         timeout = subprocess.TimeoutExpired(
@@ -435,8 +539,8 @@ class BootstrapPlansTests(unittest.TestCase):
         )
         with patch.object(bootstrap, "_tool_identity", return_value={"path": "/tools/tool", "version": "1"}), \
              patch.object(bootstrap.subprocess, "run", side_effect=timeout):
-            code, output = bootstrap._execute(plan)
-        self.assertEqual(124, code)
+            code, output, failure_kind = bootstrap._execute(plan)
+        self.assertEqual((124, "process-error"), (code, failure_kind))
         self.assertNotIn("secret-value", output)
         self.assertNotIn("abc.def", output)
 
