@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -18,10 +19,14 @@ from unittest import mock
 BIN_DIR = Path(__file__).resolve().parents[2] / "bin"
 if not BIN_DIR.is_dir(): BIN_DIR = Path(__file__).resolve().parents[1] / "bin"
 BROKER_PATH = BIN_DIR / "serena-worktree-broker"
+ROOT_ID = "11111111-1111-4111-8111-111111111111"
+PARENT_ID = "22222222-2222-4222-8222-222222222222"
+CHILD_ID = "33333333-3333-4333-8333-333333333333"
 LOADER = importlib.machinery.SourceFileLoader("serena_worktree_broker", str(BROKER_PATH))
 SPEC = importlib.util.spec_from_loader(LOADER.name, LOADER)
 assert SPEC is not None
 broker = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = broker
 LOADER.exec_module(broker)
 
 
@@ -31,6 +36,7 @@ class SerenaWorktreeBrokerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
         state_dir = Path(self.temporary_directory.name) / "state"
+        self.session_dir = Path(self.temporary_directory.name) / "sessions"
         self.path_patches = mock.patch.multiple(
             broker,
             STATE_DIR=state_dir,
@@ -39,10 +45,51 @@ class SerenaWorktreeBrokerTests(unittest.TestCase):
             LOG_DIR=state_dir / "logs",
         )
         self.path_patches.start()
+        self.session_patch = mock.patch.object(
+            broker, "SESSION_DIR", self.session_dir, create=True
+        )
+        self.session_patch.start()
 
     def tearDown(self) -> None:
+        self.session_patch.stop()
         self.path_patches.stop()
         self.temporary_directory.cleanup()
+
+    def write_session(
+        self,
+        thread_id: str,
+        parent_id: str | None = None,
+        *,
+        nested_parent_id: str | None = None,
+        day: str = "14",
+        thread_source: str | None = None,
+    ) -> Path:
+        directory = self.session_dir / "2026" / "07" / day
+        directory.mkdir(parents=True, exist_ok=True)
+        nested_parent = parent_id if nested_parent_id is None else nested_parent_id
+        payload = {
+            "id": thread_id,
+            "parent_thread_id": parent_id,
+            "source": (
+                {
+                    "subagent": {
+                        "thread_spawn": {
+                            "parent_thread_id": nested_parent,
+                            "depth": 1,
+                        }
+                    }
+                }
+                if parent_id is not None
+                else {}
+            ),
+            "thread_source": thread_source or ("subagent" if parent_id else "cli"),
+        }
+        path = directory / f"rollout-2026-07-{day}T00-00-00-{thread_id}.jsonl"
+        path.write_text(
+            json.dumps({"type": "session_meta", "payload": payload}) + "\n",
+            encoding="utf-8",
+        )
+        return path
 
     def test_service_key_uses_canonical_project_root(self) -> None:
         root = Path(self.temporary_directory.name) / "root"
@@ -75,6 +122,109 @@ class SerenaWorktreeBrokerTests(unittest.TestCase):
             self.assertEqual("parent-thread", broker._owner_id())
         with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "direct-thread"}, clear=True):
             self.assertEqual("direct-thread", broker._owner_id())
+
+    def test_nested_subagent_resolves_to_root_parent(self) -> None:
+        self.write_session(ROOT_ID)
+        self.write_session(PARENT_ID, ROOT_ID)
+        self.write_session(CHILD_ID, PARENT_ID)
+
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": CHILD_ID}, clear=True):
+            result = broker._owner_resolution()
+
+        self.assertEqual(ROOT_ID, result.owner_id)
+        self.assertEqual(CHILD_ID, result.thread_id)
+        self.assertEqual("subagent-lineage", result.source)
+        self.assertIsNone(result.reason)
+
+    def test_root_thread_and_explicit_override_resolution(self) -> None:
+        self.write_session(ROOT_ID)
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": ROOT_ID}, clear=True):
+            root = broker._owner_resolution()
+        self.assertEqual(
+            (ROOT_ID, ROOT_ID, "root-thread", None),
+            (root.thread_id, root.owner_id, root.source, root.reason),
+        )
+
+        with mock.patch.dict(
+            os.environ,
+            {"CODEX_THREAD_ID": CHILD_ID, "WORKSPACE_HARBOR_OWNER_ID": "chosen-owner"},
+            clear=True,
+        ):
+            explicit = broker._owner_resolution()
+        self.assertEqual("chosen-owner", explicit.owner_id)
+        self.assertEqual("explicit", explicit.source)
+
+    def test_invalid_lineage_falls_back_to_child(self) -> None:
+        self.write_session(
+            CHILD_ID,
+            PARENT_ID,
+            nested_parent_id=ROOT_ID,
+        )
+
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": CHILD_ID}, clear=True):
+            result = broker._owner_resolution()
+
+        self.assertEqual(CHILD_ID, result.owner_id)
+        self.assertEqual("inconsistent-parent", result.reason)
+
+    def test_missing_malformed_oversized_and_ambiguous_metadata_fail_closed(self) -> None:
+        cases: list[tuple[str, str]] = []
+        cases.append((CHILD_ID, "missing-session"))
+
+        malformed_id = "44444444-4444-4444-8444-444444444444"
+        malformed = self.session_dir / "2026/07/14" / f"rollout-x-{malformed_id}.jsonl"
+        malformed.parent.mkdir(parents=True, exist_ok=True)
+        malformed.write_text("not-json\n", encoding="utf-8")
+        cases.append((malformed_id, "invalid-session-meta"))
+
+        oversized_id = "55555555-5555-4555-8555-555555555555"
+        oversized = self.session_dir / "2026/07/14" / f"rollout-x-{oversized_id}.jsonl"
+        oversized.write_text("x" * 65_537 + "\n", encoding="utf-8")
+        cases.append((oversized_id, "oversized-session-meta"))
+
+        ambiguous_id = "66666666-6666-4666-8666-666666666666"
+        self.write_session(ambiguous_id, day="13")
+        self.write_session(ambiguous_id, day="14")
+        cases.append((ambiguous_id, "ambiguous-session"))
+
+        for thread_id, reason in cases:
+            with self.subTest(reason=reason), mock.patch.dict(
+                os.environ, {"CODEX_THREAD_ID": thread_id}, clear=True
+            ):
+                result = broker._owner_resolution()
+            self.assertEqual(thread_id, result.owner_id)
+            self.assertEqual(reason, result.reason)
+
+    def test_invalid_thread_cycles_and_over_depth_lineage_fail_closed(self) -> None:
+        invalid = "not-a-thread-id"
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": invalid}, clear=True):
+            invalid_result = broker._owner_resolution()
+        self.assertEqual(invalid, invalid_result.owner_id)
+        self.assertEqual("invalid-thread-id", invalid_result.reason)
+
+        self.write_session(CHILD_ID, CHILD_ID)
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": CHILD_ID}, clear=True):
+            self_link = broker._owner_resolution()
+        self.assertEqual(CHILD_ID, self_link.owner_id)
+        self.assertEqual("lineage-cycle", self_link.reason)
+
+        cycle_child = "77777777-7777-4777-8777-777777777777"
+        cycle_parent = "88888888-8888-4888-8888-888888888888"
+        self.write_session(cycle_child, cycle_parent)
+        self.write_session(cycle_parent, cycle_child)
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": cycle_child}, clear=True):
+            cycle = broker._owner_resolution()
+        self.assertEqual(cycle_child, cycle.owner_id)
+        self.assertEqual("lineage-cycle", cycle.reason)
+
+        chain = [f"{index:08x}-0000-4000-8000-{index:012x}" for index in range(10)]
+        self.write_session(chain[-1])
+        for index in range(9):
+            self.write_session(chain[index], chain[index + 1])
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": chain[0]}, clear=True):
+            over_depth = broker._owner_resolution()
+        self.assertEqual(chain[0], over_depth.owner_id)
+        self.assertEqual("lineage-too-deep", over_depth.reason)
 
     def test_root_ownership_rejects_another_thread_but_allows_other_roots(self) -> None:
         first = Path(self.temporary_directory.name) / "first"; first.mkdir()

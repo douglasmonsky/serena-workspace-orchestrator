@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import socket
 import subprocess
@@ -27,6 +29,9 @@ import uuid
 
 
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+SESSION_DIR = Path(
+    os.environ.get("WORKSPACE_HARBOR_SESSION_DIR", CODEX_HOME / "sessions")
+)
 STATE_DIR = Path(
     os.environ.get("SERENA_BROKER_STATE_DIR", CODEX_HOME / "state" / "serena-broker")
 )
@@ -70,6 +75,19 @@ START_TIMEOUT_SECONDS = float(os.environ.get("SERENA_BROKER_START_TIMEOUT", "30"
 INTELLIJ_LAUNCH_TIMEOUT_SECONDS = float(
     os.environ.get("SERENA_BROKER_INTELLIJ_LAUNCH_TIMEOUT", "150")
 )
+THREAD_ID_PATTERN = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+MAX_SESSION_META_BYTES = 65_536
+MAX_LINEAGE_DEPTH = 8
+
+
+@dataclass(frozen=True)
+class OwnerResolution:
+    thread_id: str | None
+    owner_id: str
+    source: str
+    reason: str | None = None
 
 
 def _now() -> str:
@@ -222,14 +240,99 @@ def _prune_dead_leases(record: dict[str, Any]) -> None:
         record["idle_since"] = _now()
 
 
-def _owner_id() -> str:
-    """Return the logical Codex task group that owns a worktree lease."""
-    explicit = os.environ.get("WORKSPACE_HARBOR_OWNER_ID", "").strip()
-    thread = os.environ.get("CODEX_THREAD_ID", "").strip()
-    value = explicit or thread or f"manual-pid-{os.getpid()}"
+def _validate_owner_value(value: str) -> None:
     if len(value) > 128 or any(character.isspace() for character in value):
         raise RuntimeError("invalid Workspace Harbor owner identity")
-    return value
+
+
+def _session_meta(thread_id: str) -> tuple[dict[str, Any] | None, str | None]:
+    matches = [
+        path
+        for path in SESSION_DIR.glob(f"*/*/*/*-{thread_id}.jsonl")
+        if path.is_file()
+    ]
+    if not matches:
+        return None, "missing-session"
+    if len(matches) != 1:
+        return None, "ambiguous-session"
+    try:
+        with matches[0].open("rb") as handle:
+            line = handle.readline(MAX_SESSION_META_BYTES + 1)
+        if len(line) > MAX_SESSION_META_BYTES or not line.endswith(b"\n"):
+            return None, "oversized-session-meta"
+        record = json.loads(line.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None, "invalid-session-meta"
+    if not isinstance(record, dict) or record.get("type") != "session_meta":
+        return None, "invalid-session-meta"
+    payload = record.get("payload")
+    if not isinstance(payload, dict) or payload.get("id") != thread_id:
+        return None, "invalid-session-meta"
+    return payload, None
+
+
+def _lineage_owner(thread_id: str) -> OwnerResolution:
+    current = thread_id
+    visited: set[str] = set()
+    transitions = 0
+    while True:
+        if current in visited:
+            return OwnerResolution(thread_id, thread_id, "root-thread", "lineage-cycle")
+        visited.add(current)
+        payload, reason = _session_meta(current)
+        if payload is None:
+            return OwnerResolution(thread_id, thread_id, "root-thread", reason)
+
+        parent = payload.get("parent_thread_id")
+        thread_source = payload.get("thread_source")
+        if parent is None:
+            if thread_source == "subagent":
+                return OwnerResolution(thread_id, thread_id, "root-thread", "missing-parent")
+            source = "subagent-lineage" if transitions else "root-thread"
+            return OwnerResolution(thread_id, current, source)
+        if thread_source != "subagent":
+            return OwnerResolution(
+                thread_id, thread_id, "root-thread", "invalid-thread-source"
+            )
+        source = payload.get("source")
+        subagent = source.get("subagent") if isinstance(source, dict) else None
+        spawn = subagent.get("thread_spawn") if isinstance(subagent, dict) else None
+        nested_parent = spawn.get("parent_thread_id") if isinstance(spawn, dict) else None
+        if not isinstance(parent, str) or nested_parent != parent:
+            return OwnerResolution(
+                thread_id, thread_id, "root-thread", "inconsistent-parent"
+            )
+        if not THREAD_ID_PATTERN.fullmatch(parent):
+            return OwnerResolution(
+                thread_id, thread_id, "root-thread", "invalid-parent-id"
+            )
+        if transitions >= MAX_LINEAGE_DEPTH:
+            return OwnerResolution(
+                thread_id, thread_id, "root-thread", "lineage-too-deep"
+            )
+        transitions += 1
+        current = parent
+
+
+def _owner_resolution() -> OwnerResolution:
+    """Resolve a Codex subagent to its root logical task without weakening isolation."""
+    explicit = os.environ.get("WORKSPACE_HARBOR_OWNER_ID", "").strip()
+    thread = os.environ.get("CODEX_THREAD_ID", "").strip()
+    if explicit:
+        _validate_owner_value(explicit)
+        return OwnerResolution(thread or None, explicit, "explicit")
+    if thread:
+        _validate_owner_value(thread)
+        if not THREAD_ID_PATTERN.fullmatch(thread):
+            return OwnerResolution(thread, thread, "root-thread", "invalid-thread-id")
+        return _lineage_owner(thread)
+    fallback = f"manual-pid-{os.getpid()}"
+    return OwnerResolution(None, fallback, "process-fallback")
+
+
+def _owner_id() -> str:
+    """Return the logical Codex task group that owns a worktree lease."""
+    return _owner_resolution().owner_id
 
 
 def _root_owners(state: dict[str, Any], project_root: Path) -> set[str]:
