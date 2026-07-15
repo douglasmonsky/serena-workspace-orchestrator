@@ -155,6 +155,82 @@ class SerenaWorktreeBrokerTests(unittest.TestCase):
         self.assertEqual("chosen-owner", explicit.owner_id)
         self.assertEqual("explicit", explicit.source)
 
+    def test_parent_pid_parses_ps_output_and_rejects_invalid_rows(self) -> None:
+        completed = SimpleNamespace(returncode=0, stdout="  50\n")
+        with mock.patch.object(broker.subprocess, "run", return_value=completed):
+            self.assertEqual(50, broker._parent_pid(101))
+
+        for result in (
+            SimpleNamespace(returncode=1, stdout="50\n"),
+            SimpleNamespace(returncode=0, stdout="not-a-pid\n"),
+        ):
+            with self.subTest(result=result), mock.patch.object(
+                broker.subprocess, "run", return_value=result
+            ):
+                self.assertIsNone(broker._parent_pid(101))
+
+    def test_codex_host_owner_is_stable_across_broker_subprocesses(self) -> None:
+        host_command = (
+            "/Applications/ChatGPT.app/Contents/Resources/codex "
+            "-c features.code_mode_host=true app-server"
+        )
+        with mock.patch.object(broker, "_parent_pid", return_value=50), mock.patch.object(
+            broker, "_process_details", return_value=("host-start", host_command)
+        ):
+            first = broker._codex_host_identity(101)
+            second = broker._codex_host_identity(102)
+
+        self.assertIsNotNone(first)
+        self.assertEqual(first, second)
+        assert first is not None
+        self.assertTrue(first.owner_id.startswith("codex-host-"))
+
+    def test_codex_host_owner_separates_restarted_hosts(self) -> None:
+        host_command = "/Applications/ChatGPT.app/Contents/Resources/codex app-server"
+        with mock.patch.object(broker, "_parent_pid", return_value=50), mock.patch.object(
+            broker,
+            "_process_details",
+            side_effect=[
+                ("first-start", host_command),
+                ("second-start", host_command),
+            ],
+        ):
+            first = broker._codex_host_identity(101)
+            second = broker._codex_host_identity(102)
+
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        assert first is not None and second is not None
+        self.assertNotEqual(first.owner_id, second.owner_id)
+
+    def test_owner_resolution_uses_validated_codex_host(self) -> None:
+        host = broker.CodexHostIdentity(50, "host-start", "codex-host-shared")
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            broker, "_codex_host_identity", return_value=host
+        ):
+            resolution = broker._owner_resolution()
+
+        self.assertEqual("codex-host-shared", resolution.owner_id)
+        self.assertEqual("codex-host", resolution.source)
+        self.assertIsNone(resolution.thread_id)
+
+    def test_unrecognized_parent_uses_process_fallback(self) -> None:
+        cases = (
+            "/usr/bin/python codex-helper.py",
+            "/tmp/codex app-server",
+            "/Applications/ChatGPT.app/Contents/Resources/codex unrelated-command",
+        )
+        for command in cases:
+            with self.subTest(command=command), mock.patch.dict(
+                os.environ, {}, clear=True
+            ), mock.patch.object(broker, "_parent_pid", return_value=50), mock.patch.object(
+                broker, "_process_details", return_value=("host-start", command)
+            ):
+                resolution = broker._owner_resolution()
+
+            self.assertEqual(f"manual-pid-{os.getpid()}", resolution.owner_id)
+            self.assertEqual("process-fallback", resolution.source)
+
     def test_invalid_lineage_falls_back_to_child(self) -> None:
         self.write_session(
             CHILD_ID,

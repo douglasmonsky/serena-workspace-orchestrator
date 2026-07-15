@@ -19,6 +19,8 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
+import shutil
 import signal
 import socket
 import subprocess
@@ -88,6 +90,13 @@ class OwnerResolution:
     owner_id: str
     source: str
     reason: str | None = None
+
+
+@dataclass(frozen=True)
+class CodexHostIdentity:
+    pid: int
+    process_started: str
+    owner_id: str
 
 
 def _now() -> str:
@@ -179,6 +188,60 @@ def _process_details(pid: int) -> tuple[str, str] | None:
     if len(parts) < 6:
         return None
     return " ".join(parts[:5]), parts[5]
+
+
+def _parent_pid(pid: int) -> int | None:
+    result = subprocess.run(
+        ["ps", "-p", str(pid), "-o", "ppid="],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        return int(result.stdout.strip())
+    except ValueError:
+        return None
+
+
+def _command_tokens(command: str) -> list[str]:
+    try:
+        return shlex.split(command)
+    except ValueError:
+        return []
+
+
+def _trusted_codex_executables() -> set[Path]:
+    candidates = {
+        Path("/Applications/ChatGPT.app/Contents/Resources/codex").resolve()
+    }
+    command = shutil.which("codex")
+    if command:
+        candidates.add(Path(command).resolve())
+    return candidates
+
+
+def _codex_host_identity(child_pid: int) -> CodexHostIdentity | None:
+    parent_pid = _parent_pid(child_pid)
+    if parent_pid is None:
+        return None
+    details = _process_details(parent_pid)
+    if details is None:
+        return None
+    process_started, command = details
+    tokens = _command_tokens(command)
+    if not tokens:
+        return None
+    executable = Path(tokens[0]).expanduser().resolve()
+    if executable not in _trusted_codex_executables():
+        return None
+    if not ({"app-server", "exec"} & set(tokens[1:])):
+        return None
+    digest = hashlib.sha256(
+        f"{parent_pid}\0{process_started}\0{executable}".encode("utf-8")
+    ).hexdigest()[:24]
+    return CodexHostIdentity(parent_pid, process_started, f"codex-host-{digest}")
 
 
 def _process_is_owned(record: dict[str, Any]) -> bool:
@@ -326,8 +389,10 @@ def _owner_resolution() -> OwnerResolution:
         if not THREAD_ID_PATTERN.fullmatch(thread):
             return OwnerResolution(thread, thread, "root-thread", "invalid-thread-id")
         return _lineage_owner(thread)
-    fallback = f"manual-pid-{os.getpid()}"
-    return OwnerResolution(None, fallback, "process-fallback")
+    host = _codex_host_identity(os.getpid())
+    if host is not None:
+        return OwnerResolution(None, host.owner_id, "codex-host")
+    return OwnerResolution(None, f"manual-pid-{os.getpid()}", "process-fallback")
 
 
 def _owner_id() -> str:
