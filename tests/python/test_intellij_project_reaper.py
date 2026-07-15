@@ -681,6 +681,24 @@ class ClientTests(unittest.TestCase):
         self.assertTrue(reaper.close_verified("/r", runtime, request, dry_run=False, sleep=lambda _: None))
         self.assertEqual("POST", calls[0][0])
 
+    def test_close_verification_retries_transient_inventory_failure(self):
+        runtime = {"port": 1, "token": "t"}
+        replies = iter([
+            (202, {}),
+            TimeoutError("project disposal temporarily blocked inventory"),
+            (200, {"projects": []}),
+        ])
+
+        def request(*_args):
+            reply = next(replies)
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
+
+        self.assertTrue(
+            reaper.close_verified("/target", runtime, request, sleep=lambda _: None)
+        )
+
     def test_plugin_string_payload_and_refusals_are_fail_closed(self):
         runtime = {"port": 1, "token": "t"}
         replies = iter([(202, {}), (200, {"projects": ["/other"]})])

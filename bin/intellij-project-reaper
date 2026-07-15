@@ -315,7 +315,9 @@ def close_verified(root, runtime, request=http_request, dry_run=False, sleep=tim
     deadline = time.monotonic() + 10
     while time.monotonic() <= deadline:
         try: status, body = request("GET", "/v1/projects", runtime)
-        except Exception: return False
+        except Exception:
+            sleep(.25)
+            continue
         try: projects = project_roots(body) if status == 200 else None
         except (TypeError, ValueError): return False
         if projects is not None and canonical(root) not in projects: return True
