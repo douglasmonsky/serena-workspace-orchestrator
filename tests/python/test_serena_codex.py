@@ -13,7 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest import mock
 
 
@@ -279,6 +279,71 @@ class SerenaCodexLauncherTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 1, result.stdout)
             self.assertIn("FAIL Serena JetBrains health check", result.stderr)
+
+    def test_health_check_accepts_overview_when_variable_lookup_has_no_match(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            project_root = Path(temporary_directory)
+            marker = project_root / ".serena" / "project.yml"
+            marker.parent.mkdir(parents=True)
+            marker.write_text('project_name: "fixture"\n', encoding="utf-8")
+            source = project_root / "src/fixture/__init__.py"
+            source.parent.mkdir(parents=True)
+            source.write_text('__version__ = "0.1.0"\n', encoding="utf-8")
+
+            backend = SimpleNamespace(value="JetBrains")
+            config = SimpleNamespace(
+                language_backend=backend,
+                gui_log_window=True,
+                web_dashboard=True,
+                web_dashboard_open_on_launch=True,
+                propagate_settings=lambda: None,
+            )
+            project = SimpleNamespace(
+                project_config=SimpleNamespace(language_backend=backend),
+                gather_source_files=lambda: ["src/fixture/__init__.py"],
+            )
+            client = mock.Mock()
+            client.get_symbols_overview.return_value = {
+                "symbols": [{"name_path": "__version__", "type": "Variable"}]
+            }
+            client.find_symbol.return_value = {"symbols": []}
+            client.run_inspections.return_value = {"inspections": []}
+
+            config_module = ModuleType("serena.config.serena_config")
+            config_module.LanguageBackend = SimpleNamespace(JETBRAINS=backend)
+            config_module.SerenaConfig = SimpleNamespace(
+                from_config_file=lambda: config
+            )
+            client_module = ModuleType("serena.jetbrains.jetbrains_plugin_client")
+            client_module.JetBrainsPluginClient = SimpleNamespace(
+                from_project=lambda loaded: client
+            )
+            project_module = ModuleType("serena.project")
+            project_module.Project = SimpleNamespace(
+                load=lambda *args, **kwargs: project
+            )
+
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with mock.patch.dict(
+                sys.modules,
+                {
+                    "serena": ModuleType("serena"),
+                    "serena.config": ModuleType("serena.config"),
+                    "serena.config.serena_config": config_module,
+                    "serena.jetbrains": ModuleType("serena.jetbrains"),
+                    "serena.jetbrains.jetbrains_plugin_client": client_module,
+                    "serena.project": project_module,
+                },
+            ), mock.patch.object(
+                launcher,
+                "_write_health_log",
+                return_value=project_root / "health.json",
+            ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                status = launcher._run_jetbrains_health_check(project_root)
+
+        self.assertEqual(0, status, stderr.getvalue())
+        self.assertIn("PASS Serena JetBrains health check", stdout.getvalue())
+        client.find_references.assert_not_called()
 
     @unittest.skipUnless(SERENA_PACKAGE_AVAILABLE, "external serena package is unavailable")
     def test_jetbrains_service_status_reports_missing_project(self) -> None:

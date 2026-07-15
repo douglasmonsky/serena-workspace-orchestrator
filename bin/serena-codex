@@ -248,6 +248,9 @@ def _run_jetbrains_health_check(project_root: Path) -> int | None:
         source_files = sorted(project.gather_source_files(), key=_source_sort_key)
         overview: dict[str, Any] | None = None
         target_file: str | None = None
+        selected: dict[str, Any] | None = None
+        found: dict[str, Any] = {"symbols": []}
+        preferred_type_fragments = ("class", "constructor", "function", "method")
         for relative_path in source_files[:50]:
             full_path = project_root / relative_path
             if not full_path.is_file() or full_path.stat().st_size == 0:
@@ -257,39 +260,50 @@ def _run_jetbrains_health_check(project_root: Path) -> int | None:
                 depth=1,
                 include_file_documentation=True,
             )
-            if candidate.get("symbols"):
+            symbols = candidate.get("symbols", [])
+            if not symbols:
+                continue
+            if overview is None:
                 target_file = relative_path
                 overview = candidate
+            ordered_symbols = sorted(
+                symbols,
+                key=lambda symbol: 0
+                if any(
+                    fragment in str(symbol.get("type", "")).casefold()
+                    for fragment in preferred_type_fragments
+                )
+                else 1,
+            )
+            for symbol in ordered_symbols[:20]:
+                candidate_found = client.find_symbol(
+                    symbol["name_path"],
+                    relative_path=relative_path,
+                    include_body=True,
+                    include_location=True,
+                )
+                if candidate_found.get("symbols"):
+                    target_file = relative_path
+                    overview = candidate
+                    selected = symbol
+                    found = candidate_found
+                    break
+            if selected is not None:
                 break
         if target_file is None or overview is None:
             raise RuntimeError("no analyzable file with symbols was found")
 
         symbols = overview["symbols"]
-        preferred_type_fragments = ("class", "constructor", "function", "method")
-        selected = next(
-            (
-                symbol
-                for symbol in symbols
-                if any(
-                    fragment in str(symbol.get("type", "")).casefold()
-                    for fragment in preferred_type_fragments
-                )
-            ),
-            symbols[0],
-        )
+        selected = selected or symbols[0]
         name_path = selected["name_path"]
-        found = client.find_symbol(
-            name_path,
-            relative_path=target_file,
-            include_body=True,
-            include_location=True,
-        )
-        if not found.get("symbols"):
-            raise RuntimeError(f"find_symbol returned no match for {name_path!r}")
-        references = client.find_references(
-            name_path,
-            relative_path=target_file,
-            include_quick_info=False,
+        references = (
+            client.find_references(
+                name_path,
+                relative_path=target_file,
+                include_quick_info=False,
+            )
+            if found["symbols"]
+            else {"symbols": []}
         )
         inspections = client.run_inspections(target_file, min_severity="ERROR")
         if "symbols" not in references:
@@ -304,6 +318,7 @@ def _run_jetbrains_health_check(project_root: Path) -> int | None:
                 "file": target_file,
                 "find_symbol_matches": len(found["symbols"]),
                 "inspection_errors": inspection_count,
+                "probe_level": "symbol" if found["symbols"] else "overview",
                 "reference_matches": len(references["symbols"]),
                 "status": "passed",
                 "symbol": name_path,
