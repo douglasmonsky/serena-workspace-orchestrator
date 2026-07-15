@@ -361,6 +361,180 @@ class SerenaWorktreeBrokerTests(unittest.TestCase):
             broker._assert_root_owner(state, second, "thread-b")
         broker._assert_root_owner(state, third, "thread-b")
 
+    def test_same_host_legacy_lease_migrates_atomically(self) -> None:
+        root = Path(self.temporary_directory.name) / "project"; root.mkdir()
+        state = {
+            "services": {
+                "example": {
+                    "project_root": str(root),
+                    "leases": {
+                        "legacy": {
+                            "pid": 101,
+                            "process_started": "broker-start",
+                            "owner_id": "manual-pid-101",
+                        }
+                    },
+                }
+            }
+        }
+        resolution = broker.OwnerResolution(
+            None, "codex-host-shared", "codex-host"
+        )
+        host = broker.CodexHostIdentity(50, "host-start", "codex-host-shared")
+        command = f"python3 {BROKER_PATH} connect --project {root}"
+
+        with mock.patch.object(broker, "_prune_dead_leases"), mock.patch.object(
+            broker, "_process_details", return_value=("broker-start", command)
+        ), mock.patch.object(
+            broker, "_codex_host_identity", return_value=host
+        ):
+            migrated = broker._migrate_legacy_host_leases(
+                state, root, resolution
+            )
+
+        self.assertTrue(migrated)
+        self.assertEqual(
+            "codex-host-shared",
+            state["services"]["example"]["leases"]["legacy"]["owner_id"],
+        )
+
+    def test_mixed_owner_state_does_not_partially_migrate(self) -> None:
+        root = Path(self.temporary_directory.name) / "project"; root.mkdir()
+        state = {
+            "services": {
+                "example": {
+                    "project_root": str(root),
+                    "leases": {
+                        "legacy": {
+                            "pid": 101,
+                            "process_started": "broker-start",
+                            "owner_id": "manual-pid-101",
+                        },
+                        "other": {
+                            "pid": 202,
+                            "process_started": "other-start",
+                            "owner_id": "thread-other",
+                        },
+                    },
+                }
+            }
+        }
+        resolution = broker.OwnerResolution(
+            None, "codex-host-shared", "codex-host"
+        )
+        host = broker.CodexHostIdentity(50, "host-start", "codex-host-shared")
+        command = f"python3 {BROKER_PATH} connect --project {root}"
+
+        with mock.patch.object(broker, "_prune_dead_leases"), mock.patch.object(
+            broker, "_process_details", return_value=("broker-start", command)
+        ), mock.patch.object(
+            broker, "_codex_host_identity", return_value=host
+        ):
+            migrated = broker._migrate_legacy_host_leases(
+                state, root, resolution
+            )
+
+        self.assertFalse(migrated)
+        self.assertEqual(
+            "manual-pid-101",
+            state["services"]["example"]["leases"]["legacy"]["owner_id"],
+        )
+        with mock.patch.object(broker, "_prune_dead_leases"):
+            with self.assertRaisesRegex(RuntimeError, "owned by another Codex task"):
+                broker._assert_root_owner(state, root, resolution.owner_id)
+
+    def test_invalid_legacy_lease_evidence_fails_closed(self) -> None:
+        root = Path(self.temporary_directory.name) / "project"; root.mkdir()
+        resolution = broker.OwnerResolution(
+            None, "codex-host-shared", "codex-host"
+        )
+        matching_host = broker.CodexHostIdentity(
+            50, "host-start", "codex-host-shared"
+        )
+        different_host = broker.CodexHostIdentity(
+            60, "other-start", "codex-host-other"
+        )
+        valid_command = f"python3 {BROKER_PATH} connect --project {root}"
+        cases = (
+            ("manual-pid-102", "broker-start", valid_command, matching_host),
+            ("manual-pid-101", "reused-start", valid_command, matching_host),
+            ("manual-pid-101", "broker-start", "python3 unrelated.py", matching_host),
+            ("manual-pid-101", "broker-start", valid_command, different_host),
+        )
+
+        for owner_id, live_start, command, host in cases:
+            with self.subTest(owner_id=owner_id, command=command, host=host):
+                state = {
+                    "services": {
+                        "example": {
+                            "project_root": str(root),
+                            "leases": {
+                                "legacy": {
+                                    "pid": 101,
+                                    "process_started": "broker-start",
+                                    "owner_id": owner_id,
+                                }
+                            },
+                        }
+                    }
+                }
+                with mock.patch.object(
+                    broker, "_prune_dead_leases"
+                ), mock.patch.object(
+                    broker, "_process_details", return_value=(live_start, command)
+                ), mock.patch.object(
+                    broker, "_codex_host_identity", return_value=host
+                ):
+                    migrated = broker._migrate_legacy_host_leases(
+                        state, root, resolution
+                    )
+
+                self.assertFalse(migrated)
+                self.assertEqual(
+                    owner_id,
+                    state["services"]["example"]["leases"]["legacy"]["owner_id"],
+                )
+
+    def test_connect_migrates_before_asserting_root_ownership(self) -> None:
+        root = Path(self.temporary_directory.name) / "project"; root.mkdir()
+        proxy = Path(self.temporary_directory.name) / "mcp-proxy"
+        proxy.write_text("fixture", encoding="utf-8")
+        args = SimpleNamespace(
+            project=str(root), backend="JetBrains", context="codex", add_mode=()
+        )
+        resolution = broker.OwnerResolution(
+            None, "codex-host-shared", "codex-host"
+        )
+        events: list[str] = []
+
+        with mock.patch.object(
+            broker, "_resolve_project", return_value=root
+        ), mock.patch.object(
+            broker, "_auto_repair_project_languages"
+        ), mock.patch.object(
+            broker, "_bootstrap_status", return_value={"status": "ready"}
+        ), mock.patch.object(
+            broker, "MCP_PROXY", proxy
+        ), mock.patch.object(
+            broker, "_owner_resolution", return_value=resolution
+        ), mock.patch.object(
+            broker, "_cleanup_state"
+        ), mock.patch.object(
+            broker,
+            "_migrate_legacy_host_leases",
+            side_effect=lambda *_: events.append("migrate"),
+        ), mock.patch.object(
+            broker,
+            "_assert_root_owner",
+            side_effect=lambda *_: events.append("assert"),
+        ), mock.patch.object(
+            broker, "_start_service", side_effect=RuntimeError("stop after ownership")
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stop after ownership"):
+                broker._connect(args)
+
+        self.assertEqual(["migrate", "assert"], events)
+
     def test_locked_state_round_trips_with_private_permissions(self) -> None:
         with broker._locked_state() as state:
             state["services"]["example"] = {"pid": 123}
