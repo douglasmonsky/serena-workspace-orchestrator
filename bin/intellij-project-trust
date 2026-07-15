@@ -60,16 +60,23 @@ def canonical_git_root(value: str, allowed: tuple[Path, ...]) -> Path:
 
 
 def _trust_map(tree: ET.ElementTree) -> ET.Element:
-    for component in tree.getroot().findall(".//component"):
-        if component.get("name") == "Trusted.Paths":
+    components = [
+        component
+        for component in tree.getroot().findall(".//component")
+        if component.get("name") == "Trusted.Paths"
+    ]
+    for option_name in ("TRUSTED_PROJECT_PATHS", "TRUSTED_PATHS"):
+        for component in components:
             for option in component.findall("option"):
-                if option.get("name") == "TRUSTED_PATHS":
+                if option.get("name") == option_name:
                     found = option.find("map")
                     if found is not None:
                         return found
                     return ET.SubElement(option, "map")
-    component = ET.SubElement(tree.getroot(), "component", {"name": "Trusted.Paths"})
-    option = ET.SubElement(component, "option", {"name": "TRUSTED_PATHS"})
+    component = components[0] if components else ET.SubElement(
+        tree.getroot(), "component", {"name": "Trusted.Paths"}
+    )
+    option = ET.SubElement(component, "option", {"name": "TRUSTED_PROJECT_PATHS"})
     return ET.SubElement(option, "map")
 
 
@@ -301,7 +308,9 @@ def main(argv: list[str]) -> int:
         if _is_live_registry(config):
             activate_live(root)
         return 0
-    except (OSError, RuntimeError, ET.ParseError, ValueError):
+    except (OSError, RuntimeError, ET.ParseError, ValueError) as error:
+        detail = " ".join(str(error).split())[:400] or type(error).__name__
+        print(f"intellij-project-trust: {detail}", file=sys.stderr)
         return 2
 
 

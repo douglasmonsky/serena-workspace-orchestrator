@@ -11,9 +11,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import errno
 import json
 import os
 from pathlib import Path
+import socket
 import sys
 import time
 import traceback
@@ -51,6 +53,27 @@ PRUNED_DIRECTORIES = frozenset(
         "venv",
     }
 )
+
+
+def _loopback_access_denied() -> bool:
+    """Distinguish a restricted caller from an absent JetBrains service."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.settimeout(0.2)
+            result = probe.connect_ex(("127.0.0.1", 1))
+    except OSError as error:
+        return error.errno in {errno.EACCES, errno.EPERM}
+    return result in {errno.EACCES, errno.EPERM}
+
+
+def _report_loopback_denied(operation: str) -> int:
+    print(
+        f"UNAVAILABLE {operation}: local loopback access is denied by the caller "
+        "sandbox; this is not evidence that the plugin is missing. Rerun this "
+        "exact command with local loopback permission.",
+        file=sys.stderr,
+    )
+    return 2
 
 
 @dataclass(frozen=True)
@@ -384,6 +407,8 @@ def _jetbrains_service_status_command(args: Sequence[str]) -> int:
     if not project_root.is_dir():
         print(f"serena-codex: not a directory: {project_root}", file=sys.stderr)
         return 2
+    if _loopback_access_denied():
+        return _report_loopback_denied("Serena JetBrains service status")
 
     resolved_root = project_root.resolve()
     try:
@@ -427,6 +452,17 @@ def _semantic_probe_command(args: Sequence[str]) -> int:
         return 2
     if not target.is_file():
         print(f"serena-codex: semantic probe file is missing: {target}", file=sys.stderr)
+        return 2
+    if _loopback_access_denied():
+        print(
+            json.dumps(
+                {
+                    "failure_kind": "loopback-denied",
+                    "status": "unavailable",
+                },
+                sort_keys=True,
+            )
+        )
         return 2
 
     started = time.monotonic()
@@ -484,6 +520,8 @@ def main(args: Sequence[str] | None = None) -> int:
         return 0
 
     if rewritten[:2] == ["project", "health-check"] and len(rewritten) <= 3:
+        if _loopback_access_denied():
+            return _report_loopback_denied("Serena JetBrains health check")
         project_root = Path(rewritten[2] if len(rewritten) == 3 else Path.cwd()).resolve()
         result = _run_jetbrains_health_check(project_root)
         if result is not None:

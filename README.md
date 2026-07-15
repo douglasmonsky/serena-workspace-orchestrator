@@ -33,7 +33,9 @@ python3 -m unittest discover -s tests/python -p 'test_*.py' -v
 - `open-codex-project-in-intellij ROOT` validates, trusts, opens, and registers
   one exact Git root.
 - `intellij-project-trust allow|status ROOT` and `audit` manage only the active
-  IntelliJ trusted-path registry.
+  IntelliJ trusted-path registry. The helper preserves both the current
+  `TRUSTED_PROJECT_PATHS` schema and the legacy `TRUSTED_PATHS` schema, and
+  reports bounded failure details instead of returning an unexplained status.
 - `intellij-project-reaper status --json` reports lifecycle state; `inspect ROOT`
   returns the exact project's indexing, modal, activity, and safety snapshot.
   `recycle ROOT` closes only that registered project using the task-owned window
@@ -44,7 +46,10 @@ python3 -m unittest discover -s tests/python -p 'test_*.py' -v
   `cleanup` retains its normal fully-eligible policy, and `unregister ROOT`
   removes a record only after a worktree has been safely closed and removed.
 - `serena-codex jetbrains-service-status ROOT` requires one IntelliJ-owned
-  Serena service and rejects foreign or duplicate matches.
+  Serena service and rejects foreign or duplicate matches. Its service,
+  semantic-probe, and health-check commands first distinguish denied local
+  loopback access from a genuinely missing plugin service; sandbox denial is
+  reported as unavailable and never as evidence that IntelliJ must be reopened.
 - `serena-project-doctor ROOT` performs one read-only bounded health and
   language-coverage check. `--recover` opens a missing exact project, waits
   through indexing, retries semantics, then may recycle its managed owned window

@@ -72,6 +72,8 @@ class SerenaCodexLauncherTests(unittest.TestCase):
     def service_status(self, root: Path, matches, owned_ports):
         stdout, stderr = io.StringIO(), io.StringIO()
         with mock.patch.object(
+            launcher, "_loopback_access_denied", return_value=False
+        ), mock.patch.object(
             launcher, "matching_jetbrains_clients", return_value=matches
         ), mock.patch.object(
             launcher.ide, "configured_app", return_value=Path("/IntelliJ IDEA.app")
@@ -103,6 +105,63 @@ class SerenaCodexLauncherTests(unittest.TestCase):
         self.assertEqual(1, status)
         self.assertEqual("", stdout)
         self.assertIn("AMBIGUOUS Serena services", stderr)
+
+    def test_health_check_reports_denied_loopback_without_claiming_plugin_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with mock.patch.object(
+                launcher, "_loopback_access_denied", return_value=True, create=True
+            ), mock.patch.object(
+                launcher, "_run_jetbrains_health_check", return_value=1
+            ) as health_check, contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(
+                stderr
+            ):
+                status = launcher.main(["project", "health-check", str(root)])
+
+        self.assertEqual(2, status)
+        health_check.assert_not_called()
+        self.assertEqual("", stdout.getvalue())
+        self.assertIn("loopback access is denied", stderr.getvalue())
+        self.assertIn("not evidence that the plugin is missing", stderr.getvalue())
+
+    def test_service_status_reports_denied_loopback_before_scanning(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with mock.patch.object(
+                launcher, "_loopback_access_denied", return_value=True
+            ), mock.patch.object(
+                launcher, "matching_jetbrains_clients", return_value=[]
+            ) as scan, contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(
+                stderr
+            ):
+                status = launcher._jetbrains_service_status_command(
+                    ["jetbrains-service-status", str(root)]
+                )
+
+        self.assertEqual(2, status)
+        scan.assert_not_called()
+        self.assertEqual("", stdout.getvalue())
+        self.assertIn("loopback access is denied", stderr.getvalue())
+
+    def test_semantic_probe_types_denied_loopback_as_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            target = root / "example.py"
+            target.write_text("VALUE = 1\n", encoding="utf-8")
+            stdout = io.StringIO()
+            with mock.patch.object(
+                launcher, "_loopback_access_denied", return_value=True
+            ), contextlib.redirect_stdout(stdout):
+                status = launcher._semantic_probe_command(
+                    ["semantic-probe", str(root), target.name]
+                )
+
+        self.assertEqual(2, status)
+        result = json.loads(stdout.getvalue())
+        self.assertEqual("unavailable", result["status"])
+        self.assertEqual("loopback-denied", result["failure_kind"])
 
     def test_unique_nested_project_is_injected_into_mcp_command(self) -> None:
         """A task root with one nested project recovers it after a restart."""

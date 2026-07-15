@@ -77,12 +77,59 @@ class IntelliJProjectTrustTests(unittest.TestCase):
         self.assertIsNotNone(tree.find('.//component[@name="Other"]'))
         self.assertEqual(0o600, stat.S_IMODE(self.registry.stat().st_mode))
 
+    def test_current_intellij_trust_schema_is_recognized_and_preserved(self):
+        repo = self.git_repo(self.allowed / "repo")
+        encoded = TRUST.encode_path(repo)
+        self.registry.write_text(
+            '<application><component name="Trusted.Paths">'
+            '<option name="TRUSTED_PROJECT_PATHS"><map>'
+            f'<entry key="{encoded}" value="true" />'
+            '</map></option></component></application>'
+        )
+
+        self.assertEqual("trusted", self.run_cli("status", repo, capture=True))
+        self.assertEqual(0, self.run_cli("allow", repo))
+
+        tree = ET.parse(self.registry)
+        components = tree.findall('.//component[@name="Trusted.Paths"]')
+        current_maps = tree.findall(
+            './/component[@name="Trusted.Paths"]'
+            '/option[@name="TRUSTED_PROJECT_PATHS"]/map'
+        )
+        legacy_maps = tree.findall(
+            './/component[@name="Trusted.Paths"]'
+            '/option[@name="TRUSTED_PATHS"]/map'
+        )
+        self.assertEqual(1, len(components))
+        self.assertEqual(1, len(current_maps))
+        self.assertEqual([], legacy_maps)
+
     def test_malformed_xml_is_not_replaced(self):
         repo = self.git_repo(self.allowed / "repo")
         original = b"<application>"
         self.registry.write_bytes(original)
         self.assertEqual(2, self.run_cli("allow", repo))
         self.assertEqual(original, self.registry.read_bytes())
+
+    def test_cli_reports_a_bounded_failure_reason(self):
+        repo = self.git_repo(self.allowed / "repo")
+        self.registry.write_text("<application>")
+        result = subprocess.run(
+            [str(CLI), "allow", str(repo)],
+            env=os.environ
+            | {
+                "INTELLIJ_TRUST_CONFIG_FILE": str(self.registry),
+                "INTELLIJ_TRUST_ALLOWED_ROOTS": str(self.allowed),
+            },
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+        self.assertEqual(2, result.returncode)
+        self.assertIn("intellij-project-trust:", result.stderr)
+        self.assertLessEqual(len(result.stderr), 500)
 
     def test_audit_reports_documents_as_broad_without_removing_it(self):
         repo = self.git_repo(self.allowed / "repo")
