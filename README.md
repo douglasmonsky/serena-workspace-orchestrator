@@ -64,18 +64,27 @@ removes them automatically.
 
 ## Ownership model
 
-Ownership is one logical Codex task per canonical worktree. Workspace Harbor
-reads the bounded `session_meta` record for a Codex subagent and resolves its
-validated ancestry to the root parent task automatically. No capsule, prompt
-token, or manual environment export is required for ordinary Codex subagents.
+The canonical worktree is the ownership boundary. When Codex supplies
+`CODEX_THREAD_ID`, Workspace Harbor reads the bounded `session_meta` record and
+resolves validated subagent ancestry to the root parent task automatically. No
+capsule, prompt token, or manual environment export is required for ordinary
+Codex subagents.
+
+The desktop MCP launcher currently supplies only its long-lived Codex host
+identity. Workspace Harbor validates the exact Codex executable, process ID,
+and process start time so broker reloads under that host reuse the same Serena
+service. Unrelated concurrent desktop tasks must use separate canonical
+worktrees because host fallback cannot distinguish their task identities.
 `WORKSPACE_HARBOR_OWNER_ID` remains available as an explicit override for
 non-Codex callers and custom integrations.
 
-Different tasks may use different worktrees or repositories concurrently in
-separate IntelliJ project windows. A second logical owner is rejected for an
-already-owned worktree, preventing two tasks from racing the same project
-model or Serena service. Missing, malformed, ambiguous, cyclic, or inconsistent
-lineage fails closed to the child's own thread ID instead of granting reuse.
+Different worktrees or repositories may run concurrently in separate IntelliJ
+project windows. When task identity is available, a second logical owner is
+rejected for an already-owned worktree. Missing, malformed, ambiguous, cyclic,
+or inconsistent lineage fails closed to the child's own thread ID instead of
+granting reuse. A live legacy process-scoped lease is migrated only when its
+PID, start time, exact broker command, and validated parent Codex host all
+match; mixed or cross-host ownership remains rejected without partial changes.
 
 The broker exposes owners in `serena-worktree-broker status`. IntelliJ itself
 remains one application process; project-window and worktree ownership is the

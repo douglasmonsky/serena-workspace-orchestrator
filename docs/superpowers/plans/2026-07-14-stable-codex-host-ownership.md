@@ -31,7 +31,7 @@
 - Consumes: `_process_details(pid: int) -> tuple[str, str] | None`, `OwnerResolution`.
 - Produces: `CodexHostIdentity`, `_parent_pid(pid: int) -> int | None`, `_codex_host_identity(child_pid: int) -> CodexHostIdentity | None`, and owner source `codex-host`.
 
-- [ ] **Step 1: Write failing tests for stable and isolated host identities**
+- [x] **Step 1: Write failing tests for stable and isolated host identities**
 
 Add focused tests that patch process inspection rather than spawning processes:
 
@@ -77,7 +77,7 @@ def test_unrecognized_parent_uses_process_fallback(self) -> None:
     self.assertEqual("process-fallback", resolution.source)
 ```
 
-- [ ] **Step 2: Run the focused tests and verify RED**
+- [x] **Step 2: Run the focused tests and verify RED**
 
 Run:
 
@@ -88,7 +88,7 @@ python -m unittest discover -s tests/python -p 'test_serena_worktree_broker.py' 
 
 Expected: FAIL because `CodexHostIdentity`, `_parent_pid`, and `_codex_host_identity` do not exist and the current resolver returns `manual-pid-*`.
 
-- [ ] **Step 3: Implement validated host resolution**
+- [x] **Step 3: Implement validated host resolution**
 
 Add `shlex`, the frozen identity type, exact token validation, and opaque owner hashing:
 
@@ -165,7 +165,7 @@ Extend `_owner_resolution()` only after explicit and thread resolution:
     return OwnerResolution(None, f"manual-pid-{os.getpid()}", "process-fallback")
 ```
 
-- [ ] **Step 4: Run focused and broker tests and verify GREEN**
+- [x] **Step 4: Run focused and broker tests and verify GREEN**
 
 Run:
 
@@ -175,7 +175,7 @@ python -m unittest discover -s tests/python -p 'test_serena_worktree_broker.py'
 
 Expected: all broker tests PASS, including existing explicit-owner and lineage precedence tests.
 
-- [ ] **Step 5: Commit stable host resolution**
+- [x] **Step 5: Commit stable host resolution**
 
 ```bash
 git add -- bin/serena-worktree-broker tests/python/test_serena_worktree_broker.py
@@ -192,7 +192,7 @@ git commit -m "fix: stabilize Serena ownership per Codex host"
 - Consumes: `CodexHostIdentity`, `_codex_host_identity`, `_process_details`, `_prune_dead_leases`, `_root_owners`.
 - Produces: `_migrate_legacy_host_leases(state: dict[str, Any], project_root: Path, resolution: OwnerResolution) -> bool` and an `_connect` path that resolves once, migrates under lock, then enforces ownership.
 
-- [ ] **Step 1: Write failing migration tests**
+- [x] **Step 1: Write failing migration tests**
 
 Use synthetic state and patched process evidence:
 
@@ -290,7 +290,7 @@ def test_invalid_legacy_lease_evidence_fails_closed(self) -> None:
             self.assertEqual(owner, lease["owner_id"])
 ```
 
-- [ ] **Step 2: Run migration tests and verify RED**
+- [x] **Step 2: Run migration tests and verify RED**
 
 Run:
 
@@ -300,7 +300,7 @@ python -m unittest discover -s tests/python -p 'test_serena_worktree_broker.py' 
 
 Expected: FAIL because `_migrate_legacy_host_leases` does not exist.
 
-- [ ] **Step 3: Implement all-or-nothing migration**
+- [x] **Step 3: Implement all-or-nothing migration**
 
 Add exact broker-command and legacy-owner validation. Validate every candidate before mutating any lease:
 
@@ -372,7 +372,7 @@ Resolve once in `_connect` and migrate only while holding `_locked_state()`:
         _assert_root_owner(state, project_root, owner_id)
 ```
 
-- [ ] **Step 4: Run broker and full Python tests and verify GREEN**
+- [x] **Step 4: Run broker and full Python tests and verify GREEN**
 
 Run:
 
@@ -383,7 +383,7 @@ python -m unittest discover -s tests/python -p 'test_*.py'
 
 Expected: broker tests PASS; full suite PASS with only the repository's documented external-Serena skips.
 
-- [ ] **Step 5: Commit migration**
+- [x] **Step 5: Commit migration**
 
 ```bash
 git add -- bin/serena-worktree-broker tests/python/test_serena_worktree_broker.py
@@ -399,9 +399,9 @@ git commit -m "fix: migrate same-host Serena broker leases"
 
 **Interfaces:**
 - Consumes: deployed `serena-worktree-broker`, `serena-worktree-broker owner --json`, `serena-worktree-broker status --json`, `bin/deploy-workspace-harbor`.
-- Produces: documented host fallback, deployed broker, and evidence that a fresh Codex MCP client exposes `mcp__serena__initial_instructions` without a manual owner override.
+- Produces: documented host fallback, deployed broker, and post-restart evidence that a desktop Codex MCP client exposes Serena without a manual owner override.
 
-- [ ] **Step 1: Update source and global ownership guidance**
+- [x] **Step 1: Update source and global ownership guidance**
 
 Replace the absolute “one logical task per worktree” wording with the two supported cases:
 
@@ -415,7 +415,7 @@ concurrent desktop tasks must use separate canonical worktrees.
 
 Keep the explicit override, fail-closed lineage, separate-root, and privacy wording.
 
-- [ ] **Step 2: Run documentation and complete source gates**
+- [x] **Step 2: Run documentation and complete source gates**
 
 Run:
 
@@ -427,7 +427,7 @@ python -m unittest discover -s tests/python -p 'test_*.py'
 
 Expected: `git diff --check` exits 0, Python tests PASS with documented skips, and Gradle reports `BUILD SUCCESSFUL`.
 
-- [ ] **Step 3: Commit documentation**
+- [x] **Step 3: Commit documentation**
 
 ```bash
 git add -- README.md docs/superpowers/plans/2026-07-14-stable-codex-host-ownership.md
@@ -445,19 +445,25 @@ shasum -a 256 bin/serena-worktree-broker /Users/Monsky/.codex/bin/serena-worktre
 
 Expected: deployment creates a timestamped backup and both broker hashes match.
 
-- [ ] **Step 5: Verify live migration and Serena MCP exposure**
+- [ ] **Step 5: Verify live migration and Serena MCP exposure after desktop restart**
 
-Capture the service count, then run a bounded fresh Codex client from the already-owned Usage Tracker root without `WORKSPACE_HARBOR_OWNER_ID`:
+Do not use standalone `codex exec` as a substitute for the desktop host. It has
+a different validated parent process and must remain isolated. After deploying,
+restart Codex desktop once so its MCP launcher loads the new broker, then open a
+normal task on an already-configured repository without
+`WORKSPACE_HARBOR_OWNER_ID`. Confirm Serena is listed and call
+`initial_instructions` once. Capture status before and after:
 
 ```bash
 /Users/Monsky/.codex/bin/serena-worktree-broker status --json
-/Applications/ChatGPT.app/Contents/Resources/codex exec --json --sandbox read-only \
-  -C /Users/Monsky/Developer/Codex/codex-usage-tracker \
-  'Diagnostic only. Do not read repository files or run shell commands. Call mcp__serena__initial_instructions exactly once if available, then answer exactly SERENA_EXPOSED; otherwise answer exactly SERENA_NOT_EXPOSED.'
 /Users/Monsky/.codex/bin/serena-worktree-broker status --json
 ```
 
-Expected: the diagnostic emits one completed Serena `initial_instructions` tool call and `SERENA_EXPOSED`; the canonical root retains one healthy persistent service rather than spawning a duplicate.
+Expected: the desktop task exposes Serena, `initial_instructions` succeeds, and
+the canonical root retains one healthy persistent service rather than spawning
+a duplicate. A legacy lease changes owner only during a same-host reload that
+proves the full process lineage; after a full desktop restart, older leases are
+dead and are pruned instead of migrated.
 
 - [ ] **Step 6: Run final repository and installation review**
 
