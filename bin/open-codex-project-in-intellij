@@ -15,6 +15,7 @@ reaper_command="${INTELLIJ_PROJECT_REAPER_COMMAND:-$HOME/.codex/bin/intellij-pro
 model_ready_command="${INTELLIJ_MODEL_READY_COMMAND:-$reaper_command}"
 project_trust_command="${INTELLIJ_PROJECT_TRUST_COMMAND:-$HOME/.codex/bin/intellij-project-trust}"
 bootstrap_command="${WORKSPACE_HARBOR_BOOTSTRAP_COMMAND:-$HOME/.codex/bin/workspace-harbor-bootstrap}"
+bootstrap_opener_timeout="${WORKSPACE_HARBOR_BOOTSTRAP_OPENER_TIMEOUT_SECONDS:-1860}"
 
 usage() {
   print -u2 "Usage: open-codex-project-in-intellij [--require-github] [PROJECT_DIR]"
@@ -88,6 +89,137 @@ print(encoded.decode("utf-8", errors="ignore"))
 ' "$result_code"
 }
 
+run_bootstrap_bounded() {
+  local dir="$1"
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    print -r -- '{"status":"failed","failure_kind":"runtime-unavailable","operation":"bootstrap-opener","error":"python3 unavailable for bounded bootstrap"}'
+    return 124
+  fi
+  python3 - "$bootstrap_opener_timeout" "$bootstrap_command" "$dir" <<'PY'
+import json
+import math
+import os
+import selectors
+import signal
+import subprocess
+import sys
+import time
+
+try:
+    timeout = float(sys.argv[1])
+except (TypeError, ValueError):
+    timeout = 0
+if not math.isfinite(timeout) or timeout <= 0:
+    print(json.dumps({
+        "status": "failed",
+        "failure_kind": "invalid-timeout",
+        "operation": "bootstrap-opener",
+        "error": "bootstrap opener timeout must be a positive finite number",
+    }))
+    raise SystemExit(124)
+
+command = [sys.argv[2], "run", sys.argv[3], "--json"]
+BOOTSTRAP_OUTPUT_LIMIT_BYTES = 65536
+output_tail = bytearray()
+try:
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+except OSError as error:
+    print(json.dumps({
+        "status": "failed",
+        "failure_kind": "process-error",
+        "operation": "bootstrap-opener",
+        "error": str(error),
+    }))
+    raise SystemExit(127)
+
+assert process.stdout is not None
+pipe = process.stdout
+os.set_blocking(pipe.fileno(), False)
+selector = selectors.DefaultSelector()
+selector.register(pipe, selectors.EVENT_READ)
+pipe_open = True
+
+def drain_once(wait_seconds):
+    global pipe_open
+    if not pipe_open:
+        time.sleep(max(0, wait_seconds))
+        return
+    for key, _ in selector.select(max(0, wait_seconds)):
+        while True:
+            try:
+                chunk = os.read(key.fd, 65536)
+            except BlockingIOError:
+                break
+            if not chunk:
+                pipe_open = False
+                selector.unregister(pipe)
+                return
+            output_tail.extend(chunk)
+            excess = len(output_tail) - BOOTSTRAP_OUTPUT_LIMIT_BYTES
+            if excess > 0:
+                del output_tail[:excess]
+
+def drain_until(deadline):
+    while pipe_open and time.monotonic() < deadline:
+        drain_once(min(0.05, deadline - time.monotonic()))
+
+def signal_group(group_signal):
+    try:
+        os.killpg(process.pid, group_signal)
+        return True
+    except ProcessLookupError:
+        return False
+
+def stop_remaining_group():
+    if not signal_group(signal.SIGTERM):
+        return
+    deadline = time.monotonic() + 5
+    while (process.poll() is None or pipe_open) and time.monotonic() < deadline:
+        drain_once(min(0.05, deadline - time.monotonic()))
+    if process.poll() is None or pipe_open:
+        signal_group(signal.SIGKILL)
+        deadline = time.monotonic() + 5
+        while (process.poll() is None or pipe_open) and time.monotonic() < deadline:
+            drain_once(min(0.05, deadline - time.monotonic()))
+
+deadline = time.monotonic() + timeout
+while process.poll() is None and time.monotonic() < deadline:
+    drain_once(min(0.05, deadline - time.monotonic()))
+timed_out = process.poll() is None
+if timed_out:
+    stop_remaining_group()
+    if process.poll() is None:
+        try:
+            process.wait(timeout=0.1)
+        except subprocess.TimeoutExpired:
+            pass
+else:
+    return_code = process.returncode
+    stop_remaining_group()
+drain_until(time.monotonic() + 0.5)
+selector.close()
+pipe.close()
+
+if timed_out:
+    print(json.dumps({
+        "status": "failed",
+        "failure_kind": "timeout",
+        "operation": "bootstrap-opener",
+        "error": f"dependency bootstrap exceeded {timeout:g}s",
+    }))
+    raise SystemExit(124)
+sys.stdout.buffer.write(bytes(output_tail))
+raise SystemExit(return_code)
+PY
+}
+
 prepare_project_dependencies() {
   local dir="$1" result_code result_payload diagnostic category
 
@@ -95,7 +227,7 @@ prepare_project_dependencies() {
     print -u2 "open-codex-project-in-intellij: dependency bootstrap command unavailable; continuing with IntelliJ and Serena"
     return 0
   fi
-  if result_payload="$("$bootstrap_command" run "$dir" --json 2>&1)"; then
+  if result_payload="$(run_bootstrap_bounded "$dir" 2>&1)"; then
     return 0
   else
     result_code=$?
@@ -105,6 +237,7 @@ prepare_project_dependencies() {
     1) category="is degraded" ;;
     2) category="validation failed" ;;
     3) category="needs a repository decision" ;;
+    124) category="timed out" ;;
     *) category="returned an unexpected result" ;;
   esac
   print -u2 "open-codex-project-in-intellij: dependency bootstrap $category ($diagnostic); continuing with IntelliJ and Serena available for diagnosis"

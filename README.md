@@ -123,6 +123,20 @@ degradation never authorizes a fallback installer and does not prevent the
 separately guarded IntelliJ opener from making Serena semantics available for
 diagnosis.
 
+The opener also applies an outer 1,860-second guard to the bootstrap helper,
+slightly longer than the bootstrap runner's own 1,800-second command limit.
+This covers failures before command execution, including a wedged state lock
+or helper process. On timeout it terminates only that helper's new process
+group, reports a bounded diagnostic, and continues opening IntelliJ. Tests and
+operators can shorten the outer guard with
+`WORKSPACE_HARBOR_BOOTSTRAP_OPENER_TIMEOUT_SECONDS`. The broker and doctor
+derive and enforce a minimum opener timeout from that guard, its ten-second
+termination grace, the opener-lock window, the IntelliJ readiness window, and
+a 30-second margin. A shorter parent override is clamped to that safe minimum,
+so a parent recovery request cannot expire before its bounded child phases.
+Bootstrap output is drained continuously into a rolling 64 KiB tail rather
+than an unbounded memory or temporary-disk buffer.
+
 Plan precedence is conservative:
 
 1. A conventional `bootstrap` task in `.codex/tasks.toml`, or a task selected
@@ -180,5 +194,9 @@ workspace-harbor-bootstrap status "$(git rev-parse --show-toplevel)" --json
 serena-worktree-broker status
 serena-worktree-broker cleanup
 ```
+
+If a newly spawned Serena service cannot be authenticated during startup, the
+broker now terminates that exact child process group before returning an error;
+it never leaves an unrecorded service for later broad cleanup.
 
 Deployment backups live under `~/.codex/backups/workspace-harbor/`.

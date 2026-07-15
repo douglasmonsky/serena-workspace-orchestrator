@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 import unittest
 
 
@@ -622,6 +623,130 @@ class OpenCodexProjectInIntellijTests(unittest.TestCase):
                 self.assertIn(expected_message, result.stderr)
                 if bootstrap_exit == 1:
                     self.assertLessEqual(len(result.stderr.encode("utf-8")), 1024)
+
+    def test_hung_bootstrap_is_bounded_and_does_not_block_intellij(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            project = root / "project"
+            project.mkdir()
+            home = root / "home"
+            bin_dir = home / ".codex/bin"
+            bin_dir.mkdir(parents=True)
+            app = root / "IntelliJ IDEA.app"
+            app.mkdir()
+            ready = project / "ready"
+            open_log = root / "open-log"
+            leaked = root / "bootstrap-leaked"
+
+            bootstrap_command = root / "bootstrap"
+            bootstrap_command.write_text(
+                f"#!/bin/sh\nsleep 0.5\ntouch '{leaked}'\n", encoding="utf-8"
+            )
+            bootstrap_command.chmod(0o755)
+            (bin_dir / "serena-codex").write_text(
+                f"#!/bin/sh\n[ -f '{ready}' ]\n", encoding="utf-8"
+            )
+            (bin_dir / "serena-codex").chmod(0o755)
+            (bin_dir / "intellij-project-reaper").write_text(
+                "#!/bin/sh\nexit 0\n", encoding="utf-8"
+            )
+            (bin_dir / "intellij-project-reaper").chmod(0o755)
+            opener = root / "open"
+            opener.write_text(
+                f"#!/bin/sh\nprintf 'open\\n' > '{open_log}'\ntouch '{ready}'\n",
+                encoding="utf-8",
+            )
+            opener.chmod(0o755)
+
+            try:
+                result = subprocess.run(
+                    [str(HELPER), str(project)],
+                    capture_output=True,
+                    text=True,
+                    timeout=1.5,
+                    check=False,
+                    env=os.environ
+                    | {
+                        "HOME": str(home),
+                        "INTELLIJ_APP_PATH": str(app),
+                        "INTELLIJ_OPEN_COMMAND": str(opener),
+                        "WORKSPACE_HARBOR_BOOTSTRAP_COMMAND": str(bootstrap_command),
+                        "WORKSPACE_HARBOR_BOOTSTRAP_OPENER_TIMEOUT_SECONDS": "0.1",
+                        "INTELLIJ_SERENA_READY_INTERVAL": "0.01",
+                        "INTELLIJ_SERENA_READY_TIMEOUT": "1",
+                    },
+                )
+            except subprocess.TimeoutExpired:
+                self.fail("hung dependency bootstrap blocked IntelliJ project opening")
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual("open\n", open_log.read_text(encoding="utf-8"))
+            self.assertIn("timed out", result.stderr)
+            time.sleep(0.6)
+            self.assertFalse(leaked.exists(), "timed-out bootstrap child escaped cleanup")
+
+    def test_bootstrap_capture_does_not_use_unbounded_temporary_storage(self) -> None:
+        script = HELPER.read_text(encoding="utf-8")
+
+        self.assertNotIn("TemporaryFile", script)
+        self.assertIn("BOOTSTRAP_OUTPUT_LIMIT_BYTES", script)
+
+    def test_successful_bootstrap_cannot_leave_a_pipe_holding_descendant(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            project = root / "project"
+            project.mkdir()
+            home = root / "home"
+            bin_dir = home / ".codex/bin"
+            bin_dir.mkdir(parents=True)
+            app = root / "IntelliJ IDEA.app"
+            app.mkdir()
+            ready = project / "ready"
+            leaked = root / "bootstrap-leaked"
+
+            bootstrap_command = root / "bootstrap"
+            bootstrap_command.write_text(
+                f"#!/bin/sh\n(sleep 0.3; touch '{leaked}') &\nexit 0\n",
+                encoding="utf-8",
+            )
+            bootstrap_command.chmod(0o755)
+            (bin_dir / "serena-codex").write_text(
+                f"#!/bin/sh\n[ -f '{ready}' ]\n", encoding="utf-8"
+            )
+            (bin_dir / "serena-codex").chmod(0o755)
+            (bin_dir / "intellij-project-reaper").write_text(
+                "#!/bin/sh\nexit 0\n", encoding="utf-8"
+            )
+            (bin_dir / "intellij-project-reaper").chmod(0o755)
+            opener = root / "open"
+            opener.write_text(
+                f"#!/bin/sh\ntouch '{ready}'\n", encoding="utf-8"
+            )
+            opener.chmod(0o755)
+
+            try:
+                result = subprocess.run(
+                    [str(HELPER), str(project)],
+                    capture_output=True,
+                    text=True,
+                    timeout=1.5,
+                    check=False,
+                    env=os.environ
+                    | {
+                        "HOME": str(home),
+                        "INTELLIJ_APP_PATH": str(app),
+                        "INTELLIJ_OPEN_COMMAND": str(opener),
+                        "WORKSPACE_HARBOR_BOOTSTRAP_COMMAND": str(bootstrap_command),
+                        "INTELLIJ_SERENA_READY_INTERVAL": "0.01",
+                        "INTELLIJ_SERENA_READY_TIMEOUT": "1",
+                    },
+                )
+            except subprocess.TimeoutExpired:
+                self.fail("successful bootstrap descendant blocked opener completion")
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            time.sleep(0.4)
+            self.assertFalse(leaked.exists(), "bootstrap descendant escaped cleanup")
 
 
 if __name__ == "__main__":

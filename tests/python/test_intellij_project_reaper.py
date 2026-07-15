@@ -452,6 +452,33 @@ class ClientTests(unittest.TestCase):
             ):
                 self.assertFalse(reaper.runtime_responds(runtime))
 
+    def test_hung_restart_stops_when_identity_changes_after_probes(self):
+        runtime = {
+            "pid": 101,
+            "processStartInstant": "2026-01-01T00:00:00Z",
+            "pluginVersion": reaper.HUNG_RESTART_PLUGIN_VERSION,
+            "token": "t",
+        }
+        app = Path("/Applications/IntelliJ IDEA.app")
+        executable = str(app / "Contents/MacOS/idea")
+        with patch.object(
+            reaper,
+            "process_start",
+            side_effect=[runtime["processStartInstant"], "changed"],
+        ), patch.object(
+            reaper, "process_command", return_value=executable
+        ), patch.object(
+            reaper, "runtime_responds", return_value=False
+        ), patch.object(
+            reaper.os, "kill"
+        ) as kill, patch.object(reaper.time, "sleep"):
+            result = reaper.restart_hung_intellij(
+                runtime, app, probe_interval=0
+            )
+
+        self.assertEqual("identity-changed", result["status"])
+        kill.assert_not_called()
+
     def test_inspect_reports_exact_project_indexing_and_modal_state(self):
         root = reaper.canonical("/workspace")
         item = {

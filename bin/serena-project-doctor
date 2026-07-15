@@ -36,6 +36,28 @@ REAPER = CODEX_HOME / "bin" / "intellij-project-reaper"
 INTEGRATION_CONFIG = CODEX_HOME / "serena-integration.yml"
 REPAIR_LOCK_DIR = CODEX_HOME / "state" / "serena-project-doctor"
 HISTORY_PATH = REPAIR_LOCK_DIR / "history.jsonl"
+OPENER_BOOTSTRAP_TIMEOUT_SECONDS = float(
+    os.environ.get("WORKSPACE_HARBOR_BOOTSTRAP_OPENER_TIMEOUT_SECONDS", "1860")
+)
+OPENER_READY_TIMEOUT_SECONDS = float(
+    os.environ.get("INTELLIJ_SERENA_READY_TIMEOUT", "120")
+)
+OPENER_LOCK_TIMEOUT_SECONDS = float(
+    os.environ.get("INTELLIJ_OPENER_LOCK_TIMEOUT", "30")
+)
+MIN_OPENER_TIMEOUT_SECONDS = (
+    OPENER_BOOTSTRAP_TIMEOUT_SECONDS
+    + 10
+    + OPENER_LOCK_TIMEOUT_SECONDS
+    + OPENER_READY_TIMEOUT_SECONDS
+    + 30
+)
+OPENER_TIMEOUT_SECONDS = float(
+    os.environ.get(
+        "SERENA_DOCTOR_INTELLIJ_LAUNCH_TIMEOUT",
+        str(MIN_OPENER_TIMEOUT_SECONDS),
+    )
+)
 MAX_FILES = 50_000
 PRUNED_DIRECTORIES = {
     ".git",
@@ -611,7 +633,7 @@ def _open_exact_project(root: Path) -> subprocess.CompletedProcess[str]:
         capture_output=True,
         text=True,
         check=False,
-        timeout=180,
+        timeout=max(OPENER_TIMEOUT_SECONDS, MIN_OPENER_TIMEOUT_SECONDS),
     )
 
 

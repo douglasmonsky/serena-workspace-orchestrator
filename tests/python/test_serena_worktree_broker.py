@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -613,6 +614,60 @@ class SerenaWorktreeBrokerTests(unittest.TestCase):
 
         self.assertEqual(selected, occupied + 1)
 
+    def test_startup_identity_failure_terminates_untracked_service(self) -> None:
+        project_root = Path(self.temporary_directory.name) / "project"
+        project_root.mkdir()
+        broker.LOG_DIR.mkdir(parents=True)
+        process = mock.Mock(pid=43210)
+        process.poll.return_value = None
+        state = {"services": {}}
+
+        with mock.patch.object(
+            broker.subprocess, "Popen", return_value=process
+        ), mock.patch.object(
+            broker, "_process_details", return_value=None
+        ), mock.patch.object(
+            broker, "_free_port", return_value=42123
+        ), mock.patch.object(
+            broker, "START_TIMEOUT_SECONDS", 0
+        ), mock.patch.object(
+            broker.time, "sleep"
+        ), mock.patch.object(
+            broker.os, "killpg"
+        ) as killpg:
+            with self.assertRaisesRegex(RuntimeError, "exited during startup"):
+                broker._start_service(state, project_root, "LSP", "codex")
+
+        killpg.assert_called_once_with(process.pid, broker.signal.SIGTERM)
+        self.assertEqual({}, state["services"])
+
+    def test_startup_wrong_identity_terminates_untracked_service(self) -> None:
+        project_root = Path(self.temporary_directory.name) / "project"
+        project_root.mkdir()
+        broker.LOG_DIR.mkdir(parents=True)
+        process = mock.Mock(pid=43210)
+        process.poll.return_value = None
+        state = {"services": {}}
+
+        with mock.patch.object(
+            broker.subprocess, "Popen", return_value=process
+        ), mock.patch.object(
+            broker, "_process_details", return_value=("start", "/usr/bin/foreign")
+        ), mock.patch.object(
+            broker, "_free_port", return_value=42123
+        ), mock.patch.object(
+            broker, "START_TIMEOUT_SECONDS", 0
+        ), mock.patch.object(
+            broker.time, "sleep"
+        ), mock.patch.object(
+            broker.os, "killpg"
+        ) as killpg:
+            with self.assertRaisesRegex(RuntimeError, "identity.*startup"):
+                broker._start_service(state, project_root, "LSP", "codex")
+
+        killpg.assert_called_once_with(process.pid, broker.signal.SIGTERM)
+        self.assertEqual({}, state["services"])
+
     def test_language_auto_repair_invokes_project_doctor(self) -> None:
         completed = mock.Mock(returncode=0, stdout="{}", stderr="")
         doctor_path = Path(self.temporary_directory.name) / "doctor"
@@ -626,16 +681,37 @@ class SerenaWorktreeBrokerTests(unittest.TestCase):
         self.assertIn("--repair-languages", command)
         self.assertIn("--json", command)
 
-    def test_intellij_launcher_timeout_exceeds_helper_ready_timeout(self) -> None:
+    def test_intellij_launcher_timeout_exceeds_bootstrap_and_ready_timeouts(self) -> None:
         completed = mock.Mock(returncode=0, stdout="", stderr="")
         launcher = Path(self.temporary_directory.name) / "open-intellij"
         launcher.write_text("fixture", encoding="utf-8")
         with mock.patch.object(broker, "INTELLIJ_LAUNCHER", launcher), mock.patch.object(
+            broker, "INTELLIJ_LAUNCH_TIMEOUT_SECONDS", 1
+        ), mock.patch.object(
             broker.subprocess, "run", return_value=completed
         ) as run:
             broker._open_intellij(Path("/tmp/example"))
 
-        self.assertGreaterEqual(run.call_args.kwargs["timeout"], 150)
+        self.assertGreaterEqual(run.call_args.kwargs["timeout"], 2050)
+
+    def test_untracked_service_cleanup_escalates_and_reaps(self) -> None:
+        process = mock.Mock(pid=43210)
+        process.poll.side_effect = [None, None]
+        process.wait.side_effect = [
+            subprocess.TimeoutExpired(["serena"], 5),
+            0,
+        ]
+        with mock.patch.object(broker.os, "killpg") as killpg:
+            broker._stop_spawned_service(process)
+
+        self.assertEqual(
+            [
+                mock.call(process.pid, broker.signal.SIGTERM),
+                mock.call(process.pid, broker.signal.SIGKILL),
+            ],
+            killpg.call_args_list,
+        )
+        self.assertEqual(2, process.wait.call_count)
 
     def test_language_auto_repair_failure_blocks_service_startup(self) -> None:
         completed = mock.Mock(returncode=1, stdout="", stderr="invalid config")

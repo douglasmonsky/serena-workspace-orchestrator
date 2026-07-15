@@ -374,6 +374,32 @@ class BootstrapPlansTests(unittest.TestCase):
             self.assertEqual("bootstrap-state", result["operation"])
             self.assertEqual(1, bootstrap.result_exit_status(result))
 
+    def test_success_record_failure_is_typed_and_never_claims_cache(self):
+        self.make_go_fixture()
+        state = Path(self.tmp.name) / "state"
+        identity = {"path": "/tools/go", "version": "go1"}
+        error = PermissionError(errno.EPERM, "Operation not permitted")
+        with patch.dict(
+            os.environ,
+            {"WORKSPACE_HARBOR_BOOTSTRAP_STATE_DIR": str(state)},
+            clear=False,
+        ), patch.object(
+            bootstrap, "_tool_identity", return_value=identity
+        ), patch.object(
+            bootstrap, "_execute", return_value=(0, "", None)
+        ) as execute, patch.object(
+            bootstrap, "write_worktree_success", side_effect=error
+        ):
+            first = bootstrap.run_bootstrap(self.root)
+            second = bootstrap.run_bootstrap(self.root)
+
+        for result in (first, second):
+            self.assertEqual("failed", result["status"])
+            self.assertEqual("permission-denied", result["failure_kind"])
+            self.assertEqual("bootstrap-state", result["operation"])
+        self.assertEqual(2, execute.call_count)
+        self.assertFalse(bootstrap._worktree_path(self.root).exists())
+
     def test_force_reruns_and_failure_removes_success_record_with_redaction(self):
         self.make_go_fixture()
         state = Path(self.tmp.name) / "state"
@@ -492,12 +518,12 @@ class BootstrapPlansTests(unittest.TestCase):
             "WORKSPACE_HARBOR_BOOTSTRAP_STATE_DIR": str(state),
             "PATH": str(tools) + os.pathsep + os.environ.get("PATH", ""),
         }
-        commands = [[sys.executable, str(wrapper), "run", str(self.root), "--json"] for _ in range(2)]
+        commands = [[sys.executable, str(wrapper), "run", str(self.root), "--json"] for _ in range(8)]
         processes = [subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=environment) for command in commands]
         results = [process.communicate(timeout=10) + (process.returncode,) for process in processes]
-        self.assertEqual([0, 0], [result[2] for result in results], results)
+        self.assertEqual([0] * 8, [result[2] for result in results], results)
         self.assertEqual(1, len(log.read_text(encoding="utf-8").splitlines()))
-        self.assertEqual(["ready", "ready"], [json.loads(result[0])["status"] for result in results])
+        self.assertEqual(["ready"] * 8, [json.loads(result[0])["status"] for result in results])
 
     def test_custom_argv_rejects_likely_inline_secrets(self):
         secret_values = [

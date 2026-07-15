@@ -74,8 +74,27 @@ PORT_FIRST = int(os.environ.get("SERENA_BROKER_PORT_FIRST", "24320"))
 PORT_LAST = int(os.environ.get("SERENA_BROKER_PORT_LAST", "24419"))
 DEFAULT_IDLE_SECONDS = int(os.environ.get("SERENA_BROKER_IDLE_SECONDS", "900"))
 START_TIMEOUT_SECONDS = float(os.environ.get("SERENA_BROKER_START_TIMEOUT", "30"))
+OPENER_BOOTSTRAP_TIMEOUT_SECONDS = float(
+    os.environ.get("WORKSPACE_HARBOR_BOOTSTRAP_OPENER_TIMEOUT_SECONDS", "1860")
+)
+OPENER_READY_TIMEOUT_SECONDS = float(
+    os.environ.get("INTELLIJ_SERENA_READY_TIMEOUT", "120")
+)
+OPENER_LOCK_TIMEOUT_SECONDS = float(
+    os.environ.get("INTELLIJ_OPENER_LOCK_TIMEOUT", "30")
+)
+MIN_INTELLIJ_LAUNCH_TIMEOUT_SECONDS = (
+    OPENER_BOOTSTRAP_TIMEOUT_SECONDS
+    + 10
+    + OPENER_LOCK_TIMEOUT_SECONDS
+    + OPENER_READY_TIMEOUT_SECONDS
+    + 30
+)
 INTELLIJ_LAUNCH_TIMEOUT_SECONDS = float(
-    os.environ.get("SERENA_BROKER_INTELLIJ_LAUNCH_TIMEOUT", "150")
+    os.environ.get(
+        "SERENA_BROKER_INTELLIJ_LAUNCH_TIMEOUT",
+        str(MIN_INTELLIJ_LAUNCH_TIMEOUT_SECONDS),
+    )
 )
 THREAD_ID_PATTERN = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
@@ -552,6 +571,30 @@ def _stop_owned_service(record: dict[str, Any]) -> bool:
     return True
 
 
+def _stop_spawned_service(process: subprocess.Popen[Any]) -> None:
+    """Stop a child that this broker spawned before it had a trusted record."""
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=5)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    if process.poll() is None:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+
+
 def _open_intellij(project_root: Path) -> None:
     if not INTELLIJ_LAUNCHER.is_file():
         raise RuntimeError(f"IntelliJ launcher not found: {INTELLIJ_LAUNCHER}")
@@ -560,7 +603,10 @@ def _open_intellij(project_root: Path) -> None:
         check=False,
         capture_output=True,
         text=True,
-        timeout=INTELLIJ_LAUNCH_TIMEOUT_SECONDS,
+        timeout=max(
+            INTELLIJ_LAUNCH_TIMEOUT_SECONDS,
+            MIN_INTELLIJ_LAUNCH_TIMEOUT_SECONDS,
+        ),
     )
     if result.returncode != 0:
         message = result.stderr.strip() or result.stdout.strip()
@@ -679,7 +725,13 @@ def _start_service(
             break
         time.sleep(0.05)
     if details is None:
+        _stop_spawned_service(process)
         raise RuntimeError(f"Serena service exited during startup; see {log_path}")
+    if "start-mcp-server" not in details[1]:
+        _stop_spawned_service(process)
+        raise RuntimeError(
+            f"Serena service identity could not be verified during startup; see {log_path}"
+        )
     record: dict[str, Any] = {
         "backend": backend,
         "context": context,
