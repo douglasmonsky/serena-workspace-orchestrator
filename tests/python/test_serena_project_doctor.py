@@ -392,6 +392,31 @@ class SerenaProjectDoctorTests(unittest.TestCase):
         self.assertEqual(2, state.call_count)
         sleep.assert_called_once_with(0.01)
 
+    def test_indexing_timeout_recycles_the_owned_window(self) -> None:
+        stalled = {
+            "jetbrains_semantic_health": {"status": "stalled"},
+            "recommended_action": "fallback",
+        }
+        healthy = {
+            "jetbrains_semantic_health": {"status": "healthy"},
+            "recommended_action": "Use Serena normally.",
+        }
+        opened = subprocess.CompletedProcess(args=[], returncode=0, stdout="ready", stderr="")
+        with mock.patch.object(
+            doctor, "audit", side_effect=[stalled, healthy]
+        ), mock.patch.object(
+            doctor, "_intellij_project_state", return_value={"status": "indexing", "active": {"indexing": True}}
+        ), mock.patch.object(
+            doctor, "_recycle_intellij_project", return_value={"status": "closed"}
+        ) as recycle, mock.patch.object(
+            doctor, "_open_exact_project", return_value=opened
+        ), mock.patch.object(doctor.time, "sleep"):
+            report = doctor.recover_serena(self.root, wait_seconds=0)
+
+        self.assertEqual("recovered-after-window-recycle", report["recovery"]["status"])
+        self.assertIn("indexing-timeout", report["recovery"]["actions"])
+        recycle.assert_called_once_with(self.root)
+
     def test_recovery_surfaces_modal_without_blind_semantic_retry(self) -> None:
         stalled = {
             "jetbrains_semantic_health": {"status": "plugin-error"},

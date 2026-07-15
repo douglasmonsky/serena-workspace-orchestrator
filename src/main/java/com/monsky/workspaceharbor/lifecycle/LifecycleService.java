@@ -47,19 +47,22 @@ public final class LifecycleService implements Disposable, LifecycleHttpServer.A
                 .map(ProjectStatusReader::readWithDeadline).toList();
     }
 
-    @Override public SafetyDecision freshDecision(String root) {
+    @Override public SafetyDecision freshDecision(String root, boolean ownedRecovery) {
         Project project = findOpenProject(root);
-        return project == null ? SafetyDecision.evaluate(ProjectStatusReader.unknown(root))
-                : SafetyDecision.evaluate(ProjectStatusReader.readWithDeadline(project));
+        SafetySnapshot snapshot = project == null ? ProjectStatusReader.unknown(root) : ProjectStatusReader.readWithDeadline(project);
+        return ownedRecovery ? SafetyDecision.evaluateOwnedRecovery(snapshot) : SafetyDecision.evaluate(snapshot);
     }
 
-    @Override public boolean close(String root) {
+    @Override public boolean close(String root, boolean ownedRecovery) {
         Project project = findOpenProject(root);
         if (project == null) return false;
         final boolean[] accepted = {false};
         ApplicationManager.getApplication().invokeAndWait(() -> {
             if (project.isDisposed()) return;
-            SafetyDecision decision = SafetyDecision.evaluate(ProjectStatusReader.read(project));
+            SafetySnapshot snapshot = ProjectStatusReader.read(project);
+            SafetyDecision decision = ownedRecovery
+                    ? SafetyDecision.evaluateOwnedRecovery(snapshot)
+                    : SafetyDecision.evaluate(snapshot);
             if (!decision.safeToClose()) return;
             ProjectManager.getInstance().closeAndDispose(project);
             accepted[0] = true;

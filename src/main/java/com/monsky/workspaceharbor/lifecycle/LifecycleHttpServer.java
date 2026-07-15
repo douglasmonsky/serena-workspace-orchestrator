@@ -17,7 +17,7 @@ import java.util.concurrent.Executors;
 
 /** Authenticated loopback API. All project operations are delegated to the IDE adapter. */
 public final class LifecycleHttpServer implements AutoCloseable {
-    public interface Adapter { List<SafetySnapshot> openProjects(); SafetyDecision freshDecision(String root); boolean close(String root); boolean trust(String root); boolean modelReady(String root); boolean responsive(); }
+    public interface Adapter { List<SafetySnapshot> openProjects(); SafetyDecision freshDecision(String root, boolean ownedRecovery); boolean close(String root, boolean ownedRecovery); boolean trust(String root); boolean modelReady(String root); boolean responsive(); }
     private final Adapter adapter; private final String token; private final Map<String, CompletableFuture<Boolean>> closingRoots = new ConcurrentHashMap<>();
     private final HttpServer server; private final ExecutorService executor = Executors.newCachedThreadPool();
     public LifecycleHttpServer(Adapter adapter, String token) throws IOException { this.adapter = adapter; this.token = token; server = HttpServer.create(new InetSocketAddress(InetAddress.getByName("127.0.0.1"), 0), 0); server.createContext("/v1/projects", this::handle); server.createContext("/v1/health", this::handle); server.setExecutor(executor); }
@@ -31,6 +31,9 @@ public final class LifecycleHttpServer implements AutoCloseable {
     private void closeProject(HttpExchange x) throws IOException {
         String root = query(x.getRequestURI().getRawQuery(), "root");
         if (root == null) { reply(x, 404, "{\"error\":\"not-found\"}"); return; }
+        String mode = query(x.getRequestURI().getRawQuery(), "mode");
+        if (mode != null && !"owned-recovery".equals(mode)) { reply(x, 409, "{\"error\":\"protected\"}"); return; }
+        boolean ownedRecovery = "owned-recovery".equals(mode);
         CompletableFuture<Boolean> attempt = new CompletableFuture<>();
         CompletableFuture<Boolean> existing = closingRoots.putIfAbsent(root, attempt);
         if (existing != null) { replyCloseResult(x, existing.join()); return; }
@@ -38,13 +41,13 @@ public final class LifecycleHttpServer implements AutoCloseable {
             if (adapter.openProjects().stream().map(SafetySnapshot::canonicalRoot).noneMatch(root::equals)) {
                 attempt.complete(false); closingRoots.remove(root, attempt); reply(x, 404, "{\"error\":\"not-found\"}"); return;
             }
-            SafetyDecision decision = adapter.freshDecision(root);
+            SafetyDecision decision = adapter.freshDecision(root, ownedRecovery);
             if (!decision.safeToClose()) {
                 attempt.complete(false); closingRoots.remove(root, attempt);
                 String reasons = decision.reasons().stream().map(v -> "\"" + json(v) + "\"").reduce((a,b) -> a + "," + b).orElse("");
                 reply(x, 409, "{\"reasons\":[" + reasons + "]}"); return;
             }
-            boolean accepted = adapter.close(root);
+            boolean accepted = adapter.close(root, ownedRecovery);
             attempt.complete(accepted);
             if (!accepted) closingRoots.remove(root, attempt);
             replyCloseResult(x, accepted);

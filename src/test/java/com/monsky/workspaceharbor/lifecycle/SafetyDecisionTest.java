@@ -50,6 +50,24 @@ class SafetyDecisionTest {
     }
 
     @org.junit.jupiter.api.Test
+    void ownedRecoveryMayStopTaskLocalActivity() {
+        SafetyDecision decision = SafetyDecision.evaluateOwnedRecovery(new SafetySnapshot(
+                "/workspace", 0, true, true, false, 2, false, 3, false, 4, true, false, true, false, true));
+
+        assertTrue(decision.safeToClose());
+        assertTrue(decision.reasons().isEmpty());
+    }
+
+    @org.junit.jupiter.api.Test
+    void ownedRecoveryStillProtectsDataAndAmbiguousUiState() {
+        SafetyDecision decision = SafetyDecision.evaluateOwnedRecovery(new SafetySnapshot(
+                "/workspace", 1, true, true, false, 2, false, 3, false, 4, true, true, true, false, true));
+
+        assertFalse(decision.safeToClose());
+        assertEquals(List.of("unsaved-documents", "modal-active"), decision.reasons());
+    }
+
+    @org.junit.jupiter.api.Test
     void collectsAllReasons() {
         SafetyDecision decision = SafetyDecision.evaluate(new SafetySnapshot(
                 "/workspace", 2, true, true, true, 1, true, 3, true, 4, true, true, true, true, true));

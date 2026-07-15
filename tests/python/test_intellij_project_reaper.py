@@ -244,7 +244,7 @@ class PolicyTests(unittest.TestCase):
 
 
 class ClientTests(unittest.TestCase):
-    def test_recycle_closes_only_a_managed_safe_exact_project(self):
+    def test_recycle_closes_only_a_managed_exact_project_with_owned_recovery(self):
         root = reaper.canonical("/workspace")
         record = {
             "root": root,
@@ -274,7 +274,34 @@ class ClientTests(unittest.TestCase):
 
         self.assertEqual(0, status)
         self.assertEqual({"root": root, "status": "closed"}, json.loads(output.getvalue()))
-        close.assert_called_once_with(root, {"token": "t"})
+        close.assert_called_once_with(root, {"token": "t"}, owned_recovery=True)
+
+    def test_recycle_allows_task_local_activity_but_not_data_or_ui_risks(self):
+        root = reaper.canonical("/workspace")
+        record = {"root": root}
+        config = {
+            "state": Path("/state"), "runtime": Path("/runtime"),
+            "broker": Path("/broker"), "idle": 1800, "cap": 4,
+            "app": Path("/Applications/IntelliJ IDEA.app"),
+        }
+        active = {
+            "root": root, "safe": False,
+            "reasons": ["indexing", "run-active", "terminal-active", "debugger-active"],
+            "known": {}, "counts": {}, "active": {},
+        }
+        protected = active | {"reasons": ["indexing", "unsaved-documents"]}
+        with patch.object(reaper, "environment", return_value=config), patch.object(
+            reaper, "runtime_client", return_value={"token": "t"}
+        ), patch.object(reaper, "load_registry", return_value=({"projects": [record]}, False)), patch.object(
+            reaper, "close_verified", return_value=True
+        ) as close, patch("sys.stdout", new_callable=io.StringIO):
+            with patch.object(reaper, "inspect_project", return_value=(active, True)):
+                self.assertEqual(0, reaper.main_with_environment(["recycle", root, "--json"]))
+                close.assert_called_once_with(root, {"token": "t"}, owned_recovery=True)
+            close.reset_mock()
+            with patch.object(reaper, "inspect_project", return_value=(protected, True)):
+                self.assertEqual(1, reaper.main_with_environment(["recycle", root, "--json"]))
+                close.assert_not_called()
 
     def test_recycle_refuses_unmanaged_or_unsafe_projects(self):
         root = reaper.canonical("/workspace")

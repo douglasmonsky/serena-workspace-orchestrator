@@ -36,16 +36,18 @@ python3 -m unittest discover -s tests/python -p 'test_*.py' -v
   IntelliJ trusted-path registry.
 - `intellij-project-reaper status --json` reports lifecycle state; `inspect ROOT`
   returns the exact project's indexing, modal, activity, and safety snapshot.
-  `recycle ROOT` closes only that registered project after a fresh fully-safe
-  snapshot. `restart-hung` stops only the exact validated IntelliJ host after
-  three failed authenticated event-thread probes. `cleanup` retains its normal
-  fully-eligible policy, and `unregister ROOT` removes a record only after a
-  worktree has been safely closed and removed.
+  `recycle ROOT` closes only that registered project using the task-owned window
+  policy: it may stop indexing and task-local run, terminal, or debugger
+  activity, while still protecting unsaved documents, modal ambiguity, closing
+  races, and unknown data-safety state. `restart-hung` stops only the exact
+  validated IntelliJ host after three failed authenticated event-thread probes.
+  `cleanup` retains its normal fully-eligible policy, and `unregister ROOT`
+  removes a record only after a worktree has been safely closed and removed.
 - `serena-codex jetbrains-service-status ROOT` requires one IntelliJ-owned
   Serena service and rejects foreign or duplicate matches.
 - `serena-project-doctor ROOT` performs one read-only bounded health and
   language-coverage check. `--recover` opens a missing exact project, waits
-  through indexing, retries semantics, then may recycle its safe managed window
+  through indexing, retries semantics, then may recycle its managed owned window
   or restart a positively validated hung IDE. `--bootstrap` performs explicit
   dependency preparation after reporting any one-time decisions. `--history`
   aggregates semantic outcomes plus recovery results and actions without
@@ -152,9 +154,12 @@ the bootstrap helper.
 
 Normal cleanup is fail-closed. Unsaved documents, indexing, active
 run/debug/terminal sessions, modal dialogs, unknown plugin state, a broker
-lease, or ambiguous ownership all protect a project. Explicit doctor recovery
-may recycle only its registered exact-root window after a fresh snapshot has no
-such blockers. A whole-IDE restart is reserved for an alive exact IntelliJ
+lease, or ambiguous ownership all protect normal cleanup. Explicit doctor
+recovery may recycle only its registered exact-root window. Because that window
+belongs exclusively to the task, recovery may interrupt indexing and task-local
+runs, terminals, or debugger sessions; unsaved documents, modal ambiguity,
+closing transitions, and unknown data-safety state still fail closed. A
+whole-IDE restart is reserved for an alive exact IntelliJ
 process whose authenticated event-thread probe fails three times; PID, start
 time, and executable are revalidated immediately before signaling, TERM is
 tried before KILL, and a semantic timeout alone is never sufficient. Do not

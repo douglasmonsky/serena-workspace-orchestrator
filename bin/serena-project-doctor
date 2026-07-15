@@ -785,15 +785,8 @@ def recover_serena(
             state = _intellij_project_state(root)
         actions.append("waited-for-indexing")
         if state["status"] == "indexing":
-            return _with_recovery(
-                report,
-                status="indexing-timeout",
-                initial_status=initial_status,
-                actions=actions,
-                ide_state=state,
-                recommendation="IntelliJ is still indexing. Continue independent native work and rerun --recover when indexing settles; Serena remains expected for later semantic work.",
-            )
-        if state["status"] != "ready":
+            actions.append("indexing-timeout")
+        elif state["status"] != "ready":
             return _with_recovery(
                 report,
                 status=f"blocked-{state['status']}",
@@ -803,18 +796,19 @@ def recover_serena(
                 recommendation="IntelliJ changed to another non-ready state. Address that reported state and rerun --recover.",
             )
 
-    actions.append("semantic-retry")
-    report = audit(root)
-    final_status = str(report.get("jetbrains_semantic_health", {}).get("status", "unknown"))
-    if final_status in {"healthy", "no-source-file"}:
-        return _with_recovery(
-            report,
-            status="recovered",
-            initial_status=initial_status,
-            actions=actions,
-            ide_state=state,
-            recommendation="Serena recovered; use it normally.",
-        )
+    if state["status"] != "indexing":
+        actions.append("semantic-retry")
+        report = audit(root)
+        final_status = str(report.get("jetbrains_semantic_health", {}).get("status", "unknown"))
+        if final_status in {"healthy", "no-source-file"}:
+            return _with_recovery(
+                report,
+                status="recovered",
+                initial_status=initial_status,
+                actions=actions,
+                ide_state=state,
+                recommendation="Serena recovered; use it normally.",
+            )
     recycle = _recycle_intellij_project(root)
     if recycle.get("status") == "closed":
         actions.append("recycled-exact-project-window")

@@ -51,6 +51,15 @@ class LifecycleHttpServerTest {
         assertEquals(404, post("/v1/projects/close?root=%2Fother").statusCode());
     }
 
+    @Test void ownedRecoveryCloseUsesTheExplicitRecoveryPolicy() throws Exception {
+        start();
+        adapter.safe = false;
+        adapter.ownedRecoverySafe = true;
+
+        assertEquals(202, post("/v1/projects/close?root=%2Fworkspace&mode=owned-recovery").statusCode());
+        assertEquals(true, adapter.lastOwnedRecovery);
+    }
+
     @Test void accepts_authenticated_exact_trust_request() throws Exception {
         start();
 
@@ -125,6 +134,8 @@ class LifecycleHttpServerTest {
     private static final class FakeAdapter implements LifecycleHttpServer.Adapter {
         boolean open = true;
         boolean safe = true;
+        boolean ownedRecoverySafe;
+        boolean lastOwnedRecovery;
         boolean closeAccepted = true;
         boolean throwOnClose;
         int closeCalls;
@@ -133,14 +144,16 @@ class LifecycleHttpServerTest {
         boolean responsive = true;
         CountDownLatch concurrentDecisionBarrier;
         @Override public List<SafetySnapshot> openProjects() { return open ? List.of(snapshot()) : List.of(); }
-        @Override public SafetyDecision freshDecision(String root) {
+        @Override public SafetyDecision freshDecision(String root, boolean ownedRecovery) {
+            lastOwnedRecovery = ownedRecovery;
             if (concurrentDecisionBarrier != null) {
                 concurrentDecisionBarrier.countDown();
                 try { concurrentDecisionBarrier.await(1, TimeUnit.SECONDS); } catch (InterruptedException exception) { Thread.currentThread().interrupt(); throw new RuntimeException(exception); }
             }
-            return safe ? new SafetyDecision(true, List.of()) : new SafetyDecision(false, List.of("unsaved-documents"));
+            boolean accepted = ownedRecovery ? ownedRecoverySafe : safe;
+            return accepted ? new SafetyDecision(true, List.of()) : new SafetyDecision(false, List.of("unsaved-documents"));
         }
-        @Override public boolean close(String root) { closeCalls++; if (throwOnClose) throw new RuntimeException("close failed"); if (closeAccepted) open = false; return closeAccepted; }
+        @Override public boolean close(String root, boolean ownedRecovery) { lastOwnedRecovery = ownedRecovery; closeCalls++; if (throwOnClose) throw new RuntimeException("close failed"); if (closeAccepted) open = false; return closeAccepted; }
         @Override public boolean trust(String root) { trustedRoot = root; return true; }
         @Override public boolean modelReady(String root) { return modelReady; }
         @Override public boolean responsive() { return responsive; }

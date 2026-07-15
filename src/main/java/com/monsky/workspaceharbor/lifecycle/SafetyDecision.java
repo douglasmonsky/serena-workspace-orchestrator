@@ -17,6 +17,15 @@ public record SafetyDecision(boolean safeToClose, List<String> reasons) {
         return new SafetyDecision(reasons.isEmpty(), List.copyOf(reasons));
     }
 
+    /** Explicit recovery for a task-owned window may stop task-local activity. */
+    public static SafetyDecision evaluateOwnedRecovery(SafetySnapshot snapshot) {
+        List<String> reasons = new ArrayList<>();
+        addKnownZero(reasons, "unsaved-documents", snapshot.unsavedKnown(), snapshot.unsavedCount());
+        addFalse(reasons, "modal-active", snapshot.modalKnown(), snapshot.modalActive());
+        addFalse(reasons, "closing", snapshot.closingKnown(), snapshot.closing());
+        return new SafetyDecision(reasons.isEmpty(), List.copyOf(reasons));
+    }
+
     private static void addKnownZero(List<String> reasons, String field, boolean known, int count) {
         if (!known) {
             reasons.add(field + "-unknown");

@@ -11,7 +11,7 @@ STATE = Path.home() / ".codex/state/intellij-projects/managed.json"
 RUNTIME = STATE.with_name("plugin-runtime.json")
 CAP, IDLE = 4, 1800
 BROKER = Path.home() / ".codex/bin/serena-worktree-broker"
-HUNG_RESTART_PLUGIN_VERSION = "0.1.8"
+HUNG_RESTART_PLUGIN_VERSION = "0.1.9"
 
 @dataclass(frozen=True)
 class Decision:
@@ -156,7 +156,7 @@ def runtime_client(runtime_path=RUNTIME):
     except Exception: return None
 def http_request(method, path, runtime, root=None):
     url = "http://127.0.0.1:%s%s" % (runtime["port"], path)
-    if root is not None: url += "?root=" + quote(canonical(root), safe="")
+    if root is not None: url += ("&" if "?" in url else "?") + "root=" + quote(canonical(root), safe="")
     request = Request(url, method=method, headers={"Authorization": "Bearer " + runtime["token"]})
     with urlopen(request, timeout=2) as response: return response.status, json.loads(response.read() or b"{}")
 def model_ready(root, runtime):
@@ -306,9 +306,10 @@ def broker_live_roots(command=BROKER):
 def _valid_timestamp(value):
     try: epoch(value); return True
     except ValueError: return False
-def close_verified(root, runtime, request=http_request, dry_run=False, sleep=time.sleep):
+def close_verified(root, runtime, request=http_request, dry_run=False, sleep=time.sleep, owned_recovery=False):
     if dry_run: return True
-    try: status, _ = request("POST", "/v1/projects/close", runtime, root)
+    path = "/v1/projects/close?mode=owned-recovery" if owned_recovery else "/v1/projects/close"
+    try: status, _ = request("POST", path, runtime, root)
     except Exception: return False
     if status != 202: return False
     deadline = time.monotonic() + 10
@@ -359,11 +360,13 @@ def main_with_environment(argv=None):
             result = {"root": root, "status": "refused-unmanaged"}
             print(json.dumps(result) if args.json else result["status"])
             return 1
-        if item.get("safe") is not True:
-            result = {"root": root, "status": "refused-unsafe", "reasons": item.get("reasons", [])}
+        protected_prefixes = ("unsaved-documents", "modal-active", "closing")
+        blockers = [reason for reason in item.get("reasons", []) if reason.startswith(protected_prefixes)]
+        if blockers:
+            result = {"root": root, "status": "refused-unsafe", "reasons": blockers}
             print(json.dumps(result) if args.json else result["status"])
             return 1
-        if not close_verified(root, runtime):
+        if not close_verified(root, runtime, owned_recovery=True):
             result = {"root": root, "status": "close-race-refused"}
             print(json.dumps(result) if args.json else result["status"])
             return 1
