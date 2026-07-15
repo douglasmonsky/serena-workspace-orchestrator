@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Fail-closed registry and policy for managed IntelliJ projects."""
-import argparse, datetime as dt, fcntl, json, os, stat, subprocess, sys, tempfile, time
+import argparse, datetime as dt, fcntl, json, os, signal, stat, subprocess, sys, tempfile, time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -11,6 +11,7 @@ STATE = Path.home() / ".codex/state/intellij-projects/managed.json"
 RUNTIME = STATE.with_name("plugin-runtime.json")
 CAP, IDLE = 4, 1800
 BROKER = Path.home() / ".codex/bin/serena-worktree-broker"
+HUNG_RESTART_PLUGIN_VERSION = "0.1.8"
 
 @dataclass(frozen=True)
 class Decision:
@@ -34,6 +35,18 @@ def process_start(pid):
         value = subprocess.check_output(["ps", "-o", "lstart=", "-p", str(int(pid))], text=True).strip()
         local = dt.datetime.strptime(value, "%a %b %d %H:%M:%S %Y").astimezone()
         return local.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+    except Exception: return None
+
+def process_command(pid):
+    try:
+        completed = subprocess.run(
+            ["ps", "-p", str(int(pid)), "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        return completed.stdout.strip() if completed.returncode == 0 else None
     except Exception: return None
 
 def empty_registry(): return {"schemaVersion": 1, "projects": []}
@@ -172,8 +185,76 @@ def project_status(body):
         for key, reason in (("indexing", "indexing"), ("modal", "modal-active"), ("closing", "closing")):
             expected += [reason + "-unknown"] if not item["known"][key] else ([reason] if item["active"][key] else [])
         if item["reasons"] != expected or item["safeToClose"] != (not expected): raise ValueError("contradictory status")
-        result[root] = {"safe": item["safeToClose"]}
+        result[root] = {
+            "root": root,
+            "safe": item["safeToClose"],
+            "reasons": list(item["reasons"]),
+            "known": dict(item["known"]),
+            "counts": dict(item["counts"]),
+            "active": dict(item["active"]),
+        }
     return result
+
+def inspect_project(root, runtime):
+    root = canonical(root)
+    try:
+        status, body = http_request("GET", "/v1/projects/status", runtime)
+        if status != 200: return None, False
+        projects = project_status(body)
+        return projects.get(root), True
+    except Exception:
+        return None, False
+
+def runtime_responds(runtime):
+    try:
+        status, body = http_request("GET", "/v1/health", runtime)
+        return status == 200 and body == {"responsive": True}
+    except Exception: return False
+
+def validated_intellij_process(runtime, app):
+    try:
+        pid = runtime["pid"]
+        started = runtime["processStartInstant"]
+        expected = str((Path(app).expanduser() / "Contents/MacOS/idea").resolve())
+        return (
+            type(pid) is int
+            and pid > 1
+            and isinstance(started, str)
+            and runtime.get("pluginVersion") == HUNG_RESTART_PLUGIN_VERSION
+            and same_start(process_start(pid), started)
+            and process_command(pid) == expected
+        )
+    except Exception: return False
+
+def restart_hung_intellij(runtime, app, probes=3, probe_interval=1, term_timeout=10, kill_timeout=5):
+    """Stop only the validated IntelliJ host after repeated control-plane failure."""
+    if not validated_intellij_process(runtime, app):
+        return {"status": "identity-mismatch"}
+    probes = max(3, int(probes))
+    for attempt in range(probes):
+        if runtime_responds(runtime):
+            return {"status": "responsive"}
+        if attempt + 1 < probes: time.sleep(max(0, probe_interval))
+    if not validated_intellij_process(runtime, app):
+        return {"status": "identity-changed"}
+    pid = runtime["pid"]
+    try: os.kill(pid, signal.SIGTERM)
+    except OSError as error: return {"status": "signal-failed", "error": str(error)}
+    deadline = time.monotonic() + max(0, term_timeout)
+    while time.monotonic() <= deadline:
+        if not same_start(process_start(pid), runtime["processStartInstant"]):
+            return {"status": "stopped-term", "pid": pid}
+        time.sleep(.25)
+    if not validated_intellij_process(runtime, app):
+        return {"status": "identity-changed"}
+    try: os.kill(pid, signal.SIGKILL)
+    except OSError as error: return {"status": "signal-failed", "error": str(error)}
+    deadline = time.monotonic() + max(0, kill_timeout)
+    while time.monotonic() <= deadline:
+        if not same_start(process_start(pid), runtime["processStartInstant"]):
+            return {"status": "stopped-kill", "pid": pid}
+        time.sleep(.25)
+    return {"status": "still-running", "pid": pid}
 
 def plugin_inventory(runtime):
     if runtime is None: return None
@@ -190,8 +271,8 @@ def status_report(records, plugins, leases, corrupt=False, idle=IDLE):
     return {"reportOnly": report_only, "decisions": {root: decision.__dict__ for root, decision in decisions.items()}}
 
 def environment():
-    values = {"state": STATE, "runtime": RUNTIME, "broker": BROKER, "cap": CAP, "idle": IDLE}
-    mapping = {"state": "INTELLIJ_PROJECT_REAPER_STATE_FILE", "runtime": "INTELLIJ_PROJECT_REAPER_RUNTIME_FILE", "broker": "INTELLIJ_PROJECT_REAPER_BROKER_COMMAND"}
+    values = {"state": STATE, "runtime": RUNTIME, "broker": BROKER, "app": Path.home() / "Applications/IntelliJ IDEA.app", "cap": CAP, "idle": IDLE}
+    mapping = {"state": "INTELLIJ_PROJECT_REAPER_STATE_FILE", "runtime": "INTELLIJ_PROJECT_REAPER_RUNTIME_FILE", "broker": "INTELLIJ_PROJECT_REAPER_BROKER_COMMAND", "app": "INTELLIJ_APP_PATH"}
     try:
         for key, name in mapping.items():
             if name in os.environ:
@@ -248,6 +329,9 @@ def main_with_environment(argv=None):
         p = sub.add_parser(name); p.add_argument("root")
     status = sub.add_parser("status"); status.add_argument("--json", action="store_true")
     is_open = sub.add_parser("is-open"); is_open.add_argument("root")
+    inspect = sub.add_parser("inspect"); inspect.add_argument("root"); inspect.add_argument("--json", action="store_true")
+    recycle = sub.add_parser("recycle"); recycle.add_argument("root"); recycle.add_argument("--json", action="store_true")
+    restart_hung = sub.add_parser("restart-hung"); restart_hung.add_argument("--json", action="store_true")
     cleanup = sub.add_parser("cleanup"); cleanup.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
     if args.command == "register": return 0 if register_root(args.root, config["state"]) else 1
@@ -256,6 +340,41 @@ def main_with_environment(argv=None):
     if args.command == "model-ready":
         if runtime is None: return 2
         return 0 if model_ready(args.root, runtime) else 1
+    if args.command == "inspect":
+        if runtime is None: return 2
+        item, known = inspect_project(args.root, runtime)
+        if not known: return 2
+        if item is None: return 1
+        print(json.dumps(item) if args.json else "project state: " + ", ".join(item["reasons"] or ["ready"]))
+        return 0
+    if args.command == "recycle":
+        if runtime is None: return 2
+        root = canonical(args.root)
+        item, known = inspect_project(root, runtime)
+        if not known: return 2
+        if item is None: return 1
+        registry, corrupt = load_registry(config["state"])
+        managed = any(project.get("root") == root for project in registry["projects"])
+        if corrupt or not managed:
+            result = {"root": root, "status": "refused-unmanaged"}
+            print(json.dumps(result) if args.json else result["status"])
+            return 1
+        if item.get("safe") is not True:
+            result = {"root": root, "status": "refused-unsafe", "reasons": item.get("reasons", [])}
+            print(json.dumps(result) if args.json else result["status"])
+            return 1
+        if not close_verified(root, runtime):
+            result = {"root": root, "status": "close-race-refused"}
+            print(json.dumps(result) if args.json else result["status"])
+            return 1
+        result = {"root": root, "status": "closed"}
+        print(json.dumps(result) if args.json else result["status"])
+        return 0
+    if args.command == "restart-hung":
+        if runtime is None: return 2
+        result = restart_hung_intellij(runtime, config["app"])
+        print(json.dumps(result) if args.json else result["status"])
+        return 0 if result["status"] in {"stopped-term", "stopped-kill"} else 1
     plugins = plugin_inventory(runtime)
     if args.command == "unregister":
         root = canonical(args.root)

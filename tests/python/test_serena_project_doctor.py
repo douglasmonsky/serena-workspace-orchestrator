@@ -260,7 +260,265 @@ class SerenaProjectDoctorTests(unittest.TestCase):
         self.assertEqual(report["jetbrains_semantic_health"]["status"], "plugin-error")
         codes = {item["code"] for item in report["findings"]}
         self.assertIn("jetbrains_semantic_unhealthy", codes)
-        self.assertIn("rerun the doctor once", report["recommended_action"].lower())
+        self.assertIn("--recover", report["recommended_action"].lower())
+        self.assertIn("meaningful ide or repository state change", report["recommended_action"].lower())
+
+    def test_intellij_project_state_reports_indexing_modal_and_unknown(self) -> None:
+        base = {
+            "root": str(self.root.resolve()),
+            "safe": False,
+            "reasons": ["indexing"],
+            "known": {
+                "unsavedDocuments": True,
+                "indexing": True,
+                "run": True,
+                "terminal": True,
+                "debugger": True,
+                "modal": True,
+                "closing": True,
+            },
+            "counts": {
+                "unsavedDocuments": 0,
+                "run": 0,
+                "terminal": 0,
+                "debugger": 0,
+            },
+            "active": {"indexing": True, "modal": False, "closing": False},
+        }
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=json.dumps(base), stderr=""
+        )
+        with mock.patch.object(doctor, "_run", return_value=completed):
+            self.assertEqual(
+                "indexing", doctor._intellij_project_state(self.root)["status"]
+            )
+
+        modal = base | {
+            "reasons": ["modal-active"],
+            "active": {"indexing": False, "modal": True, "closing": False},
+        }
+        with mock.patch.object(
+            doctor,
+            "_run",
+            return_value=subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=json.dumps(modal), stderr=""
+            ),
+        ):
+            self.assertEqual(
+                "modal", doctor._intellij_project_state(self.root)["status"]
+            )
+
+        unknown_activity = base | {
+            "known": base["known"] | {"indexing": False},
+            "active": {"indexing": False, "modal": False, "closing": False},
+            "reasons": ["indexing-unknown"],
+        }
+        with mock.patch.object(
+            doctor,
+            "_run",
+            return_value=subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=json.dumps(unknown_activity), stderr=""
+            ),
+        ):
+            self.assertEqual(
+                "unknown", doctor._intellij_project_state(self.root)["status"]
+            )
+
+        for returncode in (1, 2):
+            with self.subTest(returncode=returncode), mock.patch.object(
+                doctor,
+                "_run",
+                return_value=subprocess.CompletedProcess(
+                    args=[], returncode=returncode, stdout="", stderr="unavailable"
+                ),
+            ):
+                expected = "missing" if returncode == 1 else "unknown"
+                self.assertEqual(
+                    expected, doctor._intellij_project_state(self.root)["status"]
+                )
+
+    def test_recovery_opens_missing_service_and_rechecks_semantics(self) -> None:
+        initial = {
+            "jetbrains_semantic_health": {"status": "missing"},
+            "recommended_action": "open it",
+        }
+        healthy = {
+            "jetbrains_semantic_health": {"status": "healthy"},
+            "recommended_action": "Use Serena normally.",
+        }
+        opener = Path(self.temporary_directory.name) / "opener"
+        opener.write_text("fixture", encoding="utf-8")
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="ready", stderr=""
+        )
+        with mock.patch.object(
+            doctor, "OPENER", opener
+        ), mock.patch.object(
+            doctor, "audit", side_effect=[initial, healthy]
+        ) as audit, mock.patch.object(
+            doctor.subprocess, "run", return_value=completed
+        ) as run:
+            report = doctor.recover_serena(self.root)
+
+        self.assertEqual("recovered", report["recovery"]["status"])
+        self.assertEqual("healthy", report["recovery"]["final_semantic_status"])
+        self.assertEqual(2, audit.call_count)
+        self.assertEqual([str(opener), str(self.root)], run.call_args.args[0])
+
+    def test_recovery_waits_for_indexing_then_retries_once(self) -> None:
+        stalled = {
+            "jetbrains_semantic_health": {"status": "stalled"},
+            "recommended_action": "fallback",
+        }
+        healthy = {
+            "jetbrains_semantic_health": {"status": "healthy"},
+            "recommended_action": "Use Serena normally.",
+        }
+        states = [
+            {"status": "indexing", "active": {"indexing": True}},
+            {"status": "ready", "active": {"indexing": False}},
+        ]
+        with mock.patch.object(
+            doctor, "audit", side_effect=[stalled, healthy]
+        ), mock.patch.object(
+            doctor, "_intellij_project_state", side_effect=states
+        ) as state, mock.patch.object(doctor.time, "sleep") as sleep:
+            report = doctor.recover_serena(
+                self.root, wait_seconds=10, poll_seconds=0.01
+            )
+
+        self.assertEqual("recovered", report["recovery"]["status"])
+        self.assertIn("waited-for-indexing", report["recovery"]["actions"])
+        self.assertEqual(2, state.call_count)
+        sleep.assert_called_once_with(0.01)
+
+    def test_recovery_surfaces_modal_without_blind_semantic_retry(self) -> None:
+        stalled = {
+            "jetbrains_semantic_health": {"status": "plugin-error"},
+            "recommended_action": "fallback",
+        }
+        with mock.patch.object(
+            doctor, "audit", return_value=stalled
+        ) as audit, mock.patch.object(
+            doctor,
+            "_intellij_project_state",
+            return_value={"status": "modal", "active": {"modal": True}},
+        ):
+            report = doctor.recover_serena(self.root)
+
+        self.assertEqual("blocked-modal", report["recovery"]["status"])
+        self.assertEqual(1, audit.call_count)
+        self.assertIn("modal", report["recommended_action"].lower())
+        self.assertNotIn("remainder of the task", report["recommended_action"].lower())
+
+    def test_persistent_semantic_failure_keeps_later_recovery_available(self) -> None:
+        stalled = {
+            "jetbrains_semantic_health": {"status": "stalled"},
+            "recommended_action": "fallback",
+        }
+        with mock.patch.object(
+            doctor, "audit", side_effect=[stalled, stalled.copy()]
+        ), mock.patch.object(
+            doctor,
+            "_intellij_project_state",
+            return_value={"status": "ready", "active": {}},
+        ), mock.patch.object(
+            doctor,
+            "_recycle_intellij_project",
+            return_value={"status": "refused-unsafe", "reasons": ["run-active"]},
+        ):
+            report = doctor.recover_serena(self.root)
+
+        self.assertEqual(
+            "semantic-still-unhealthy", report["recovery"]["status"]
+        )
+        self.assertIn("keep serena recovery active", report["recommended_action"].lower())
+        self.assertIn("state change", report["recommended_action"].lower())
+
+    def test_recovery_recycles_safe_owned_window_after_persistent_stall(self) -> None:
+        stalled = {
+            "jetbrains_semantic_health": {"status": "stalled"},
+            "recommended_action": "fallback",
+        }
+        healthy = {
+            "jetbrains_semantic_health": {"status": "healthy"},
+            "recommended_action": "Use Serena normally.",
+        }
+        opened = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="ready", stderr=""
+        )
+        with mock.patch.object(
+            doctor, "audit", side_effect=[stalled, stalled.copy(), healthy]
+        ), mock.patch.object(
+            doctor,
+            "_intellij_project_state",
+            return_value={"status": "ready", "safe": True, "active": {}},
+        ), mock.patch.object(
+            doctor,
+            "_recycle_intellij_project",
+            return_value={"status": "closed"},
+        ) as recycle, mock.patch.object(
+            doctor, "_open_exact_project", return_value=opened
+        ) as opener:
+            report = doctor.recover_serena(self.root)
+
+        self.assertEqual("recovered-after-window-recycle", report["recovery"]["status"])
+        self.assertIn("recycled-exact-project-window", report["recovery"]["actions"])
+        recycle.assert_called_once_with(self.root)
+        opener.assert_called_once_with(self.root)
+
+    def test_recovery_restarts_validated_hung_ide_then_reopens_exact_root(self) -> None:
+        stalled = {
+            "jetbrains_semantic_health": {"status": "stalled"},
+            "recommended_action": "fallback",
+        }
+        healthy = {
+            "jetbrains_semantic_health": {"status": "healthy"},
+            "recommended_action": "Use Serena normally.",
+        }
+        opened = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="ready", stderr=""
+        )
+        with mock.patch.object(
+            doctor, "audit", side_effect=[stalled, healthy]
+        ), mock.patch.object(
+            doctor,
+            "_intellij_project_state",
+            return_value={"status": "unknown", "error": "control plane timed out"},
+        ), mock.patch.object(
+            doctor,
+            "_restart_hung_intellij",
+            return_value={"status": "stopped-term", "pid": 101},
+        ) as restart, mock.patch.object(
+            doctor, "_open_exact_project", return_value=opened
+        ) as opener:
+            report = doctor.recover_serena(self.root)
+
+        self.assertEqual("recovered-after-ide-restart", report["recovery"]["status"])
+        self.assertIn("restarted-validated-hung-intellij", report["recovery"]["actions"])
+        restart.assert_called_once_with(self.root)
+        opener.assert_called_once_with(self.root)
+
+    def test_recovery_never_restarts_when_hang_guard_reports_responsive(self) -> None:
+        stalled = {
+            "jetbrains_semantic_health": {"status": "stalled"},
+            "recommended_action": "fallback",
+        }
+        with mock.patch.object(
+            doctor, "audit", return_value=stalled
+        ), mock.patch.object(
+            doctor,
+            "_intellij_project_state",
+            return_value={"status": "unknown", "error": "transient"},
+        ), mock.patch.object(
+            doctor,
+            "_restart_hung_intellij",
+            return_value={"status": "responsive"},
+        ), mock.patch.object(doctor, "_open_exact_project") as opener:
+            report = doctor.recover_serena(self.root)
+
+        self.assertEqual("project-state-unknown", report["recovery"]["status"])
+        opener.assert_not_called()
 
     def test_history_summarizes_semantic_stability(self) -> None:
         doctor._record_history(
@@ -277,6 +535,10 @@ class SerenaProjectDoctorTests(unittest.TestCase):
                 "status": "needs-attention",
                 "jetbrains_semantic_health": {"status": "stalled", "elapsed_ms": 10_001},
                 "findings": [{"code": "jetbrains_semantic_unhealthy"}],
+                "recovery": {
+                    "status": "semantic-still-unhealthy",
+                    "actions": ["semantic-retry", "recycled-exact-project-window"],
+                },
             }
         )
 
@@ -284,6 +546,14 @@ class SerenaProjectDoctorTests(unittest.TestCase):
 
         self.assertEqual(summary["runs"], 2)
         self.assertEqual(summary["semantic_status_counts"], {"healthy": 1, "stalled": 1})
+        self.assertEqual(
+            summary["recovery_status_counts"],
+            {"not-run": 1, "semantic-still-unhealthy": 1},
+        )
+        self.assertEqual(
+            summary["recovery_action_counts"],
+            {"recycled-exact-project-window": 1, "semantic-retry": 1},
+        )
         self.assertEqual(summary["healthy_rate"], 0.5)
 
     def test_confirmed_typescript_repairs_but_source_only_rust_needs_decision(self) -> None:
@@ -391,6 +661,33 @@ class SerenaProjectDoctorTests(unittest.TestCase):
         ):
             status = doctor.main(["--bootstrap", "--json", str(self.root)])
         self.assertEqual(3, status)
+
+    def test_recover_exit_status_distinguishes_recovered_from_still_unhealthy(self) -> None:
+        for recovery_status, expected in (
+            ("healthy", 0),
+            ("recovered", 0),
+            ("recovered-after-window-recycle", 0),
+            ("recovered-after-ide-restart", 0),
+            ("semantic-still-unhealthy", 1),
+        ):
+            report = {
+                "root": str(self.root.resolve()),
+                "status": "ready" if expected == 0 else "needs-attention",
+                "jetbrains_semantic_health": {
+                    "status": "healthy" if expected == 0 else "stalled"
+                },
+                "findings": [],
+                "recovery": {"status": recovery_status},
+            }
+            with self.subTest(recovery_status=recovery_status), mock.patch.object(
+                doctor, "recover_serena", return_value=report
+            ), mock.patch.object(doctor, "_record_history"), mock.patch(
+                "sys.stdout", new_callable=mock.MagicMock
+            ):
+                self.assertEqual(
+                    expected,
+                    doctor.main(["--recover", "--json", str(self.root)]),
+                )
 
 
 if __name__ == "__main__":

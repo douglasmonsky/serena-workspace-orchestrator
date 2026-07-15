@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit a repository's Serena configuration without modifying the repository."""
+"""Audit Serena state read-only, with an explicit bounded recovery mode."""
 
 from __future__ import annotations
 
@@ -31,6 +31,8 @@ CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
 SERENA = Path.home() / ".local" / "share" / "uv" / "tools" / "serena-agent" / "bin" / "serena"
 SERENA_CODEX = CODEX_HOME / "bin" / "serena-codex"
 BROKER = CODEX_HOME / "bin" / "serena-worktree-broker"
+OPENER = CODEX_HOME / "bin" / "open-codex-project-in-intellij"
+REAPER = CODEX_HOME / "bin" / "intellij-project-reaper"
 INTEGRATION_CONFIG = CODEX_HOME / "serena-integration.yml"
 REPAIR_LOCK_DIR = CODEX_HOME / "state" / "serena-project-doctor"
 HISTORY_PATH = REPAIR_LOCK_DIR / "history.jsonl"
@@ -537,6 +539,336 @@ def _broker_services(root: Path) -> list[dict[str, Any]]:
     return [item for item in payload if isinstance(item, dict) and item.get("project_root") == resolved]
 
 
+def _intellij_project_state(root: Path) -> dict[str, Any]:
+    """Read exact-project IDE activity without scraping windows or process titles."""
+    if not REAPER.is_file():
+        return {"status": "unknown", "error": f"project-state helper missing: {REAPER}"}
+    completed = _run((str(REAPER), "inspect", str(root), "--json"), root)
+    if completed.returncode == 1:
+        return {"status": "missing"}
+    if completed.returncode != 0:
+        detail = (completed.stderr or "project state unavailable").strip()[-500:]
+        return {"status": "unknown", "error": detail}
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        return {"status": "unknown", "error": "invalid project-state response"}
+    if not isinstance(payload, dict) or payload.get("root") != str(root.resolve()):
+        return {"status": "unknown", "error": "mismatched project-state response"}
+    known = payload.get("known")
+    active = payload.get("active")
+    counts = payload.get("counts")
+    if not isinstance(known, dict) or not isinstance(active, dict) or not isinstance(counts, dict):
+        return {"status": "unknown", "error": "incomplete project-state response"}
+    if any(type(known.get(key)) is not bool for key in ("indexing", "modal", "closing")):
+        return {"status": "unknown", "error": "unknown project activity state"}
+    if any(type(active.get(key)) is not bool for key in ("indexing", "modal", "closing")):
+        return {"status": "unknown", "error": "invalid project activity state"}
+    if any(not known[key] for key in ("indexing", "modal", "closing")):
+        return {**payload, "status": "unknown", "error": "project activity is not fully known"}
+    if active["closing"]:
+        status = "closing"
+    elif active["modal"]:
+        status = "modal"
+    elif active["indexing"]:
+        status = "indexing"
+    else:
+        status = "ready"
+    return {"status": status, **payload}
+
+
+def _reaper_action(root: Path, command: str, *arguments: str) -> dict[str, Any]:
+    if not REAPER.is_file():
+        return {"status": "helper-missing", "error": str(REAPER)}
+    completed = _run(
+        (str(REAPER), command, *arguments, "--json"),
+        root,
+    )
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        detail = (completed.stderr or completed.stdout or "invalid reaper response").strip()[-500:]
+        return {"status": "unavailable", "returncode": completed.returncode, "error": detail}
+    if not isinstance(payload, dict) or not isinstance(payload.get("status"), str):
+        return {"status": "unavailable", "returncode": completed.returncode, "error": "malformed reaper response"}
+    return {**payload, "returncode": completed.returncode}
+
+
+def _recycle_intellij_project(root: Path) -> dict[str, Any]:
+    return _reaper_action(root, "recycle", str(root))
+
+
+def _restart_hung_intellij(root: Path) -> dict[str, Any]:
+    return _reaper_action(root, "restart-hung")
+
+
+def _open_exact_project(root: Path) -> subprocess.CompletedProcess[str]:
+    if not OPENER.is_file():
+        raise OSError(f"exact-root IntelliJ opener is missing: {OPENER}")
+    return subprocess.run(
+        [str(OPENER), str(root)],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=180,
+    )
+
+
+def _with_recovery(
+    report: dict[str, Any],
+    *,
+    status: str,
+    initial_status: str,
+    actions: list[str],
+    ide_state: dict[str, Any] | None = None,
+    action_result: dict[str, Any] | None = None,
+    recommendation: str | None = None,
+) -> dict[str, Any]:
+    result = dict(report)
+    final_status = str(result.get("jetbrains_semantic_health", {}).get("status", "unknown"))
+    result["recovery"] = {
+        "attempted": bool(actions),
+        "status": status,
+        "initial_semantic_status": initial_status,
+        "final_semantic_status": final_status,
+        "actions": actions,
+        "ide_state": ide_state,
+        "action_result": action_result,
+    }
+    if recommendation is not None:
+        result["recommended_action"] = recommendation
+    return result
+
+
+def recover_serena(
+    root: Path,
+    *,
+    wait_seconds: float = 90,
+    poll_seconds: float = 2,
+) -> dict[str, Any]:
+    """Run bounded recovery with exact-project and validated-process guards."""
+    report = audit(root)
+    initial_status = str(report.get("jetbrains_semantic_health", {}).get("status", "unknown"))
+    actions: list[str] = []
+    if initial_status in {"healthy", "no-source-file"}:
+        return _with_recovery(
+            report,
+            status="healthy",
+            initial_status=initial_status,
+            actions=actions,
+        )
+
+    if initial_status == "missing":
+        try:
+            opened = _open_exact_project(root)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            return _with_recovery(
+                report,
+                status="opener-failed",
+                initial_status=initial_status,
+                actions=actions,
+                recommendation=f"The exact-root IntelliJ opener failed: {error}. Correct that blocker and rerun --recover.",
+            )
+        actions.append("opened-exact-project")
+        if opened.returncode != 0:
+            detail = (opened.stderr or opened.stdout or "unknown opener failure").strip()[-500:]
+            return _with_recovery(
+                report,
+                status="opener-failed",
+                initial_status=initial_status,
+                actions=actions,
+                recommendation=f"The exact-root IntelliJ opener did not recover the project: {detail}",
+            )
+        report = audit(root)
+        current_status = str(report.get("jetbrains_semantic_health", {}).get("status", "unknown"))
+        if current_status in {"healthy", "no-source-file"}:
+            return _with_recovery(
+                report,
+                status="recovered",
+                initial_status=initial_status,
+                actions=actions,
+                recommendation="Serena recovered; use it normally.",
+            )
+        if current_status == "missing":
+            return _with_recovery(
+                report,
+                status="service-still-missing",
+                initial_status=initial_status,
+                actions=actions,
+                recommendation="The exact project opened but its Serena service is still missing. Keep native work moving and rerun --recover after IntelliJ finishes project startup.",
+            )
+
+    state = _intellij_project_state(root)
+    state_status = state["status"]
+    if state_status == "modal":
+        return _with_recovery(
+            report,
+            status="blocked-modal",
+            initial_status=initial_status,
+            actions=actions,
+            ide_state=state,
+            recommendation="An IntelliJ modal is blocking project services. Resolve that visible prompt, then rerun --recover; do not disable Serena for the rest of the task.",
+        )
+    if state_status == "closing":
+        return _with_recovery(
+            report,
+            status="project-closing",
+            initial_status=initial_status,
+            actions=actions,
+            ide_state=state,
+            recommendation="The exact IntelliJ project is closing. Let that transition finish, then rerun --recover.",
+        )
+    if state_status in {"missing", "unknown"}:
+        if state_status == "unknown":
+            restart = _restart_hung_intellij(root)
+            if restart.get("status") in {"stopped-term", "stopped-kill"}:
+                actions.append("restarted-validated-hung-intellij")
+                try:
+                    opened = _open_exact_project(root)
+                except (OSError, subprocess.TimeoutExpired) as error:
+                    return _with_recovery(
+                        report,
+                        status="ide-restart-opener-failed",
+                        initial_status=initial_status,
+                        actions=actions,
+                        ide_state=state,
+                        action_result=restart,
+                        recommendation=f"The validated hung IntelliJ host stopped, but exact-root reopen failed: {error}",
+                    )
+                if opened.returncode != 0:
+                    detail = (opened.stderr or opened.stdout or "unknown opener failure").strip()[-500:]
+                    return _with_recovery(
+                        report,
+                        status="ide-restart-opener-failed",
+                        initial_status=initial_status,
+                        actions=actions,
+                        ide_state=state,
+                        action_result=restart,
+                        recommendation=f"The validated hung IntelliJ host stopped, but exact-root reopen failed: {detail}",
+                    )
+                actions.append("reopened-exact-project")
+                report = audit(root)
+                final_status = str(report.get("jetbrains_semantic_health", {}).get("status", "unknown"))
+                if final_status in {"healthy", "no-source-file"}:
+                    return _with_recovery(
+                        report,
+                        status="recovered-after-ide-restart",
+                        initial_status=initial_status,
+                        actions=actions,
+                        ide_state=state,
+                        action_result=restart,
+                        recommendation="Serena recovered after a validated hung-IDE restart; use it normally.",
+                    )
+                return _with_recovery(
+                    report,
+                    status="semantic-unhealthy-after-ide-restart",
+                    initial_status=initial_status,
+                    actions=actions,
+                    ide_state=state,
+                    action_result=restart,
+                    recommendation="IntelliJ restarted safely, but Serena semantics remain unhealthy. Continue native work and inspect doctor history before another recovery attempt.",
+                )
+        return _with_recovery(
+            report,
+            status="project-state-unknown",
+            initial_status=initial_status,
+            actions=actions,
+            ide_state=state,
+            action_result=restart if state_status == "unknown" else None,
+            recommendation="Workspace Harbor could not verify exact-project IDE state. Keep native work moving and rerun --recover after the IDE state changes; do not restart or kill IntelliJ blindly.",
+        )
+    if state_status == "indexing":
+        deadline = time.monotonic() + max(0, wait_seconds)
+        while state["status"] == "indexing" and time.monotonic() < deadline:
+            time.sleep(max(0.01, poll_seconds))
+            state = _intellij_project_state(root)
+        actions.append("waited-for-indexing")
+        if state["status"] == "indexing":
+            return _with_recovery(
+                report,
+                status="indexing-timeout",
+                initial_status=initial_status,
+                actions=actions,
+                ide_state=state,
+                recommendation="IntelliJ is still indexing. Continue independent native work and rerun --recover when indexing settles; Serena remains expected for later semantic work.",
+            )
+        if state["status"] != "ready":
+            return _with_recovery(
+                report,
+                status=f"blocked-{state['status']}",
+                initial_status=initial_status,
+                actions=actions,
+                ide_state=state,
+                recommendation="IntelliJ changed to another non-ready state. Address that reported state and rerun --recover.",
+            )
+
+    actions.append("semantic-retry")
+    report = audit(root)
+    final_status = str(report.get("jetbrains_semantic_health", {}).get("status", "unknown"))
+    if final_status in {"healthy", "no-source-file"}:
+        return _with_recovery(
+            report,
+            status="recovered",
+            initial_status=initial_status,
+            actions=actions,
+            ide_state=state,
+            recommendation="Serena recovered; use it normally.",
+        )
+    recycle = _recycle_intellij_project(root)
+    if recycle.get("status") == "closed":
+        actions.append("recycled-exact-project-window")
+        try:
+            opened = _open_exact_project(root)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            return _with_recovery(
+                report,
+                status="window-recycle-opener-failed",
+                initial_status=initial_status,
+                actions=actions,
+                ide_state=state,
+                action_result=recycle,
+                recommendation=f"The owned exact-root window closed safely, but reopen failed: {error}",
+            )
+        if opened.returncode != 0:
+            detail = (opened.stderr or opened.stdout or "unknown opener failure").strip()[-500:]
+            return _with_recovery(
+                report,
+                status="window-recycle-opener-failed",
+                initial_status=initial_status,
+                actions=actions,
+                ide_state=state,
+                action_result=recycle,
+                recommendation=f"The owned exact-root window closed safely, but reopen failed: {detail}",
+            )
+        actions.append("reopened-exact-project")
+        report = audit(root)
+        recycled_status = str(report.get("jetbrains_semantic_health", {}).get("status", "unknown"))
+        if recycled_status in {"healthy", "no-source-file"}:
+            return _with_recovery(
+                report,
+                status="recovered-after-window-recycle",
+                initial_status=initial_status,
+                actions=actions,
+                ide_state=state,
+                action_result=recycle,
+                recommendation="Serena recovered after recycling the owned exact-root IntelliJ window; use it normally.",
+            )
+    return _with_recovery(
+        report,
+        status="semantic-still-unhealthy",
+        initial_status=initial_status,
+        actions=actions,
+        ide_state=state,
+        action_result=recycle,
+        recommendation=(
+            "Continue useful native work for the current bounded slice, but keep Serena recovery active. "
+            "Rerun --recover after a meaningful state change such as indexing completion, a branch transition, "
+            "or an IDE prompt resolution; do not declare Serena unavailable for the remainder of the task."
+        ),
+    )
+
+
 def _memory_check(root: Path, config_exists: bool) -> str | None:
     if not config_exists or not SERENA.is_file():
         return None
@@ -548,12 +880,23 @@ def _memory_check(root: Path, config_exists: bool) -> str | None:
 def _record_history(report: dict[str, Any]) -> None:
     """Append a compact, non-source snapshot for stability monitoring."""
     semantic = report.get("jetbrains_semantic_health", {})
+    recovery = report.get("recovery")
+    if not isinstance(recovery, dict):
+        recovery = {}
+    recovery_status = recovery.get("status")
+    recovery_actions = recovery.get("actions")
     record = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "root": report.get("root"),
         "status": report.get("status"),
         "semantic_status": semantic.get("status"),
         "semantic_elapsed_ms": semantic.get("elapsed_ms"),
+        "recovery_status": recovery_status if isinstance(recovery_status, str) else "not-run",
+        "recovery_actions": (
+            [action for action in recovery_actions[:10] if isinstance(action, str)]
+            if isinstance(recovery_actions, list)
+            else []
+        ),
         "finding_codes": [
             item.get("code")
             for item in report.get("findings", [])
@@ -578,10 +921,19 @@ def _history_summary() -> dict[str, Any]:
             if isinstance(item, dict):
                 records.append(item)
     counts = Counter(str(item.get("semantic_status") or "unknown") for item in records)
+    recovery_counts = Counter(str(item.get("recovery_status") or "not-run") for item in records)
+    recovery_actions = Counter(
+        action
+        for item in records
+        for action in item.get("recovery_actions", [])
+        if isinstance(action, str)
+    )
     healthy = counts.get("healthy", 0)
     return {
         "runs": len(records),
         "semantic_status_counts": dict(sorted(counts.items())),
+        "recovery_status_counts": dict(sorted(recovery_counts.items())),
+        "recovery_action_counts": dict(sorted(recovery_actions.items())),
         "healthy_rate": round(healthy / len(records), 3) if records else None,
         "latest": records[-1] if records else None,
         "history_path": str(HISTORY_PATH),
@@ -753,9 +1105,9 @@ def audit(root: Path) -> dict[str, Any]:
     auto_repair_enabled, auto_repair_source = _auto_repair_setting(root)
     if semantic_status in {"stalled", "plugin-error"}:
         recommended_action = (
-            "Do not retry Serena tools repeatedly. Save any IDE edits, recover the exact "
-            "IntelliJ project service, then rerun the doctor once; use native diagnostics "
-            "if that bounded retry is not healthy."
+            f'Run serena-project-doctor --recover "{root}". Continue independent native work '
+            "while bounded recovery runs, and retry Serena after a meaningful IDE or repository "
+            "state change instead of abandoning it for the rest of the task."
         )
     elif bootstrap_report.get("status") == "needs-decision":
         recommended_action = "Resolve the reported bootstrap decision once, then rerun preparation."
@@ -833,6 +1185,13 @@ def _print_text(report: dict[str, Any]) -> None:
             print(f"- [{finding['severity']}] {finding['code']}: {finding['message']}")
     else:
         print("Findings: none")
+    recovery = report.get("recovery")
+    if isinstance(recovery, dict):
+        actions = recovery.get("actions") or []
+        print(
+            f"Recovery: {recovery.get('status', 'unknown')}; actions: "
+            + (", ".join(str(action) for action in actions) or "none")
+        )
     print(f"Recommended action: {report['recommended_action']}")
 
 
@@ -856,6 +1215,11 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="repair confirmed languages and run the selected deterministic dependency plan",
     )
+    parser.add_argument(
+        "--recover",
+        action="store_true",
+        help="run guarded open, indexing wait, semantic retry, window recycle, and hung-IDE recovery",
+    )
     return parser
 
 
@@ -868,6 +1232,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             print(f"Serena doctor history: {summary['runs']} run(s)")
             print(f"Semantic outcomes: {summary['semantic_status_counts']}")
+            print(f"Recovery outcomes: {summary['recovery_status_counts']}")
+            print(f"Recovery actions: {summary['recovery_action_counts']}")
             print(f"Healthy rate: {summary['healthy_rate']}")
             print(f"History: {summary['history_path']}")
         return 0
@@ -875,7 +1241,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         root = _resolve_root(args.project)
         repair = repair_languages(root) if args.repair_languages or args.bootstrap else None
         bootstrap_run = bootstrap.run_bootstrap(root) if args.bootstrap else None
-        report = audit(root)
+        report = recover_serena(root) if args.recover else audit(root)
         if repair is not None:
             report["language_repair"] = repair
         if bootstrap_run is not None:
@@ -897,6 +1263,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             return bootstrap_status
         if repair is not None and repair.get("pending_languages"):
             return 3
+    if args.recover and report.get("recovery", {}).get("status") not in {
+        "healthy",
+        "recovered",
+        "recovered-after-window-recycle",
+        "recovered-after-ide-restart",
+    }:
+        return 1
     if args.strict and report["status"] != "ready":
         return 1
     return 0

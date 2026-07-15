@@ -3,12 +3,13 @@ import importlib.util
 import io
 import json
 import os
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import call, patch
 from pathlib import Path
 
 TEST_FILE = Path(__file__).resolve()
@@ -243,6 +244,260 @@ class PolicyTests(unittest.TestCase):
 
 
 class ClientTests(unittest.TestCase):
+    def test_recycle_closes_only_a_managed_safe_exact_project(self):
+        root = reaper.canonical("/workspace")
+        record = {
+            "root": root,
+            "registeredAt": "2026-01-01T00:00:00Z",
+            "lastReadyAt": "2026-01-01T00:00:00Z",
+        }
+        item = {"root": root, "safe": True, "reasons": [], "known": {}, "counts": {}, "active": {}}
+        config = {
+            "state": Path("/state"),
+            "runtime": Path("/runtime"),
+            "broker": Path("/broker"),
+            "idle": 1800,
+            "cap": 4,
+            "app": Path("/Applications/IntelliJ IDEA.app"),
+        }
+        output = io.StringIO()
+        with patch.object(reaper, "environment", return_value=config), patch.object(
+            reaper, "runtime_client", return_value={"token": "t"}
+        ), patch.object(
+            reaper, "inspect_project", return_value=(item, True)
+        ), patch.object(
+            reaper, "load_registry", return_value=({"projects": [record]}, False)
+        ), patch.object(
+            reaper, "close_verified", return_value=True
+        ) as close, patch("sys.stdout", output):
+            status = reaper.main_with_environment(["recycle", root, "--json"])
+
+        self.assertEqual(0, status)
+        self.assertEqual({"root": root, "status": "closed"}, json.loads(output.getvalue()))
+        close.assert_called_once_with(root, {"token": "t"})
+
+    def test_recycle_refuses_unmanaged_or_unsafe_projects(self):
+        root = reaper.canonical("/workspace")
+        config = {
+            "state": Path("/state"),
+            "runtime": Path("/runtime"),
+            "broker": Path("/broker"),
+            "idle": 1800,
+            "cap": 4,
+            "app": Path("/Applications/IntelliJ IDEA.app"),
+        }
+        unsafe = {
+            "root": root,
+            "safe": False,
+            "reasons": ["unsaved-documents"],
+            "known": {},
+            "counts": {},
+            "active": {},
+        }
+        for records, item in (([], unsafe), ([{"root": root}], unsafe)):
+            with self.subTest(records=records), patch.object(
+                reaper, "environment", return_value=config
+            ), patch.object(
+                reaper, "runtime_client", return_value={"token": "t"}
+            ), patch.object(
+                reaper, "inspect_project", return_value=(item, True)
+            ), patch.object(
+                reaper, "load_registry", return_value=({"projects": records}, False)
+            ), patch.object(reaper, "close_verified") as close, patch(
+                "sys.stdout", new_callable=io.StringIO
+            ):
+                self.assertEqual(
+                    1, reaper.main_with_environment(["recycle", root, "--json"])
+                )
+                close.assert_not_called()
+
+    def test_hung_restart_requires_exact_process_and_repeated_unresponsiveness(self):
+        runtime = {
+            "pid": 101,
+            "processStartInstant": "2026-01-01T00:00:00Z",
+            "pluginVersion": reaper.HUNG_RESTART_PLUGIN_VERSION,
+            "token": "t",
+        }
+        app = Path("/Applications/IntelliJ IDEA.app")
+        executable = str(app / "Contents/MacOS/idea")
+        with patch.object(
+            reaper, "process_start", side_effect=[runtime["processStartInstant"], runtime["processStartInstant"], None]
+        ), patch.object(
+            reaper, "process_command", return_value=executable
+        ), patch.object(
+            reaper, "runtime_responds", side_effect=[False, False, False]
+        ) as responds, patch.object(reaper.os, "kill") as kill, patch.object(
+            reaper.time, "sleep"
+        ):
+            result = reaper.restart_hung_intellij(runtime, app, probe_interval=0)
+
+        self.assertEqual("stopped-term", result["status"])
+        self.assertEqual(3, responds.call_count)
+        kill.assert_called_once_with(101, signal.SIGTERM)
+
+        with patch.object(
+            reaper, "process_start", return_value=runtime["processStartInstant"]
+        ), patch.object(
+            reaper, "process_command", return_value=executable
+        ), patch.object(
+            reaper, "runtime_responds", return_value=True
+        ), patch.object(reaper.os, "kill") as kill:
+            result = reaper.restart_hung_intellij(runtime, app, probe_interval=0)
+        self.assertEqual("responsive", result["status"])
+        kill.assert_not_called()
+
+        with patch.object(
+            reaper, "process_start", return_value=runtime["processStartInstant"]
+        ), patch.object(
+            reaper, "process_command", return_value="/Applications/Other.app/other"
+        ), patch.object(reaper, "runtime_responds") as responds, patch.object(
+            reaper.os, "kill"
+        ) as kill:
+            result = reaper.restart_hung_intellij(runtime, app, probe_interval=0)
+        self.assertEqual("identity-mismatch", result["status"])
+        responds.assert_not_called()
+        kill.assert_not_called()
+
+        legacy_runtime = runtime | {"pluginVersion": "0.1.7"}
+        with patch.object(reaper, "process_start") as started, patch.object(
+            reaper, "process_command"
+        ) as command, patch.object(reaper, "runtime_responds") as responds, patch.object(
+            reaper.os, "kill"
+        ) as kill:
+            result = reaper.restart_hung_intellij(
+                legacy_runtime, app, probe_interval=0
+            )
+        self.assertEqual("identity-mismatch", result["status"])
+        started.assert_not_called()
+        command.assert_not_called()
+        responds.assert_not_called()
+        kill.assert_not_called()
+
+        with patch.object(
+            reaper,
+            "process_start",
+            side_effect=[
+                runtime["processStartInstant"],
+                runtime["processStartInstant"],
+                runtime["processStartInstant"],
+                None,
+            ],
+        ), patch.object(
+            reaper, "process_command", return_value=executable
+        ), patch.object(
+            reaper, "runtime_responds", side_effect=[False, False, False]
+        ), patch.object(reaper.os, "kill") as kill, patch.object(
+            reaper.time, "sleep"
+        ):
+            result = reaper.restart_hung_intellij(
+                runtime,
+                app,
+                probe_interval=0,
+                term_timeout=-1,
+                kill_timeout=1,
+            )
+        self.assertEqual("stopped-kill", result["status"])
+        self.assertEqual(
+            [call(101, signal.SIGTERM), call(101, signal.SIGKILL)],
+            kill.call_args_list,
+        )
+
+    def test_runtime_responsiveness_uses_the_authenticated_ide_health_probe(self):
+        runtime = {"token": "t"}
+        with patch.object(
+            reaper, "http_request", return_value=(200, {"responsive": True})
+        ) as request:
+            self.assertTrue(reaper.runtime_responds(runtime))
+        request.assert_called_once_with("GET", "/v1/health", runtime)
+        for response in (
+            (202, {"responsive": False}),
+            (200, {"responsive": "yes"}),
+            (500, {}),
+        ):
+            with self.subTest(response=response), patch.object(
+                reaper, "http_request", return_value=response
+            ):
+                self.assertFalse(reaper.runtime_responds(runtime))
+
+    def test_inspect_reports_exact_project_indexing_and_modal_state(self):
+        root = reaper.canonical("/workspace")
+        item = {
+            "root": root,
+            "safeToClose": False,
+            "reasons": ["indexing", "modal-active"],
+            "known": {
+                "unsavedDocuments": True,
+                "indexing": True,
+                "run": True,
+                "terminal": True,
+                "debugger": True,
+                "modal": True,
+                "closing": True,
+            },
+            "counts": {
+                "unsavedDocuments": 0,
+                "run": 0,
+                "terminal": 0,
+                "debugger": 0,
+            },
+            "active": {"indexing": True, "modal": True, "closing": False},
+        }
+        output = io.StringIO()
+        with patch.object(
+            reaper, "environment", return_value={
+                "state": Path("/state"),
+                "runtime": Path("/runtime"),
+                "broker": Path("/broker"),
+                "idle": 1800,
+                "cap": 4,
+            }
+        ), patch.object(
+            reaper, "runtime_client", return_value={"token": "t"}
+        ), patch.object(
+            reaper, "http_request", return_value=(200, {"projects": [item]})
+        ) as request, patch("sys.stdout", output):
+            status = reaper.main_with_environment(["inspect", root, "--json"])
+
+        self.assertEqual(0, status)
+        self.assertEqual(
+            {
+                "root": root,
+                "safe": False,
+                "reasons": ["indexing", "modal-active"],
+                "known": item["known"],
+                "counts": item["counts"],
+                "active": item["active"],
+            },
+            json.loads(output.getvalue()),
+        )
+        request.assert_called_once_with(
+            "GET", "/v1/projects/status", {"token": "t"}
+        )
+
+    def test_inspect_distinguishes_missing_project_from_unknown_runtime(self):
+        root = reaper.canonical("/workspace")
+        config = {
+            "state": Path("/state"),
+            "runtime": Path("/runtime"),
+            "broker": Path("/broker"),
+            "idle": 1800,
+            "cap": 4,
+        }
+        with patch.object(reaper, "environment", return_value=config), patch.object(
+            reaper, "runtime_client", return_value={"token": "t"}
+        ), patch.object(
+            reaper, "http_request", return_value=(200, {"projects": []})
+        ):
+            self.assertEqual(
+                1, reaper.main_with_environment(["inspect", root, "--json"])
+            )
+        with patch.object(reaper, "environment", return_value=config), patch.object(
+            reaper, "runtime_client", return_value=None
+        ):
+            self.assertEqual(
+                2, reaper.main_with_environment(["inspect", root, "--json"])
+            )
+
     def test_model_ready_is_authenticated_and_fail_closed(self):
         runtime = {"token": "t"}
         with patch.object(reaper, "http_request", return_value=(200, {"ready": True})) as request:

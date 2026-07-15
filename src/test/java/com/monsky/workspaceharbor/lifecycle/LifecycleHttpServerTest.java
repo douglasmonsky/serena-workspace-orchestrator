@@ -69,6 +69,13 @@ class LifecycleHttpServerTest {
         assertEquals(404, get("/v1/projects/model?root=%2Fmissing", "token").statusCode());
     }
 
+    @Test void health_requires_a_responsive_ide_event_thread() throws Exception {
+        start();
+        assertEquals(200, get("/v1/health", "token").statusCode());
+        adapter.responsive = false;
+        assertEquals(202, get("/v1/health", "token").statusCode());
+    }
+
     @Test void refuses_when_final_close_safety_check_changes() throws Exception {
         start();
         adapter.closeAccepted = false;
@@ -123,6 +130,7 @@ class LifecycleHttpServerTest {
         int closeCalls;
         String trustedRoot;
         boolean modelReady = true;
+        boolean responsive = true;
         CountDownLatch concurrentDecisionBarrier;
         @Override public List<SafetySnapshot> openProjects() { return open ? List.of(snapshot()) : List.of(); }
         @Override public SafetyDecision freshDecision(String root) {
@@ -135,6 +143,7 @@ class LifecycleHttpServerTest {
         @Override public boolean close(String root) { closeCalls++; if (throwOnClose) throw new RuntimeException("close failed"); if (closeAccepted) open = false; return closeAccepted; }
         @Override public boolean trust(String root) { trustedRoot = root; return true; }
         @Override public boolean modelReady(String root) { return modelReady; }
+        @Override public boolean responsive() { return responsive; }
         private SafetySnapshot snapshot() { return new SafetySnapshot("/workspace", 0, true, false, true, 0, true, 0, true, 0, true, false, true, false, true); }
     }
 }

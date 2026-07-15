@@ -34,14 +34,22 @@ python3 -m unittest discover -s tests/python -p 'test_*.py' -v
   one exact Git root.
 - `intellij-project-trust allow|status ROOT` and `audit` manage only the active
   IntelliJ trusted-path registry.
-- `intellij-project-reaper status --json` reports lifecycle state;
-  `cleanup` closes only fully eligible managed projects, and `unregister ROOT`
-  removes the registry record after a worktree has been safely closed and removed.
+- `intellij-project-reaper status --json` reports lifecycle state; `inspect ROOT`
+  returns the exact project's indexing, modal, activity, and safety snapshot.
+  `recycle ROOT` closes only that registered project after a fresh fully-safe
+  snapshot. `restart-hung` stops only the exact validated IntelliJ host after
+  three failed authenticated event-thread probes. `cleanup` retains its normal
+  fully-eligible policy, and `unregister ROOT` removes a record only after a
+  worktree has been safely closed and removed.
 - `serena-codex jetbrains-service-status ROOT` requires one IntelliJ-owned
   Serena service and rejects foreign or duplicate matches.
-- `serena-project-doctor ROOT` performs one bounded health and language-coverage
-  check; `--bootstrap` performs explicit dependency preparation after reporting
-  any one-time decisions.
+- `serena-project-doctor ROOT` performs one read-only bounded health and
+  language-coverage check. `--recover` opens a missing exact project, waits
+  through indexing, retries semantics, then may recycle its safe managed window
+  or restart a positively validated hung IDE. `--bootstrap` performs explicit
+  dependency preparation after reporting any one-time decisions. `--history`
+  aggregates semantic outcomes plus recovery results and actions without
+  storing prompts, source, or raw tool output.
 - `workspace-harbor-bootstrap status|run ROOT` plans and caches deterministic
   repository setup; `decide` records local language, tracking, or custom-command
   consent.
@@ -142,13 +150,18 @@ the bootstrap helper.
 
 ## Safety and recovery
 
-Closing is fail-closed. Unsaved documents, indexing, active run/debug/terminal
-sessions, modal dialogs, unknown plugin state, a broker lease, or ambiguous
-ownership all protect a project. Do not kill IntelliJ or Serena processes
-broadly. Use:
+Normal cleanup is fail-closed. Unsaved documents, indexing, active
+run/debug/terminal sessions, modal dialogs, unknown plugin state, a broker
+lease, or ambiguous ownership all protect a project. Explicit doctor recovery
+may recycle only its registered exact-root window after a fresh snapshot has no
+such blockers. A whole-IDE restart is reserved for an alive exact IntelliJ
+process whose authenticated event-thread probe fails three times; PID, start
+time, and executable are revalidated immediately before signaling, TERM is
+tried before KILL, and a semantic timeout alone is never sufficient. Do not
+kill IntelliJ or Serena processes broadly. Use:
 
 ```sh
-serena-project-doctor "$(git rev-parse --show-toplevel)"
+serena-project-doctor --recover "$(git rev-parse --show-toplevel)"
 workspace-harbor-bootstrap status "$(git rev-parse --show-toplevel)" --json
 serena-worktree-broker status
 serena-worktree-broker cleanup

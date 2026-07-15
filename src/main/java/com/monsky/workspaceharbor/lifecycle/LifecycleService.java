@@ -19,6 +19,8 @@ import java.util.Base64;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 
 /** Owns the authenticated loopback endpoint and its same-instance discovery record. */
 public final class LifecycleService implements Disposable, LifecycleHttpServer.Adapter {
@@ -90,6 +92,16 @@ public final class LifecycleService implements Disposable, LifecycleHttpServer.A
     @Override public boolean modelReady(String root) {
         Project project = findOpenProject(root);
         return project != null && GradleModelProvisioner.isReady(project);
+    }
+
+    @Override public boolean responsive() {
+        CompletableFuture<Boolean> response = new CompletableFuture<>();
+        try {
+            ApplicationManager.getApplication().invokeLater(() -> response.complete(true));
+            return Boolean.TRUE.equals(response.get(2, TimeUnit.SECONDS));
+        } catch (Exception exception) {
+            return false;
+        }
     }
 
     private Project findOpenProject(String root) {
