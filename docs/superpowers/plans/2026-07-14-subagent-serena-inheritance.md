@@ -31,7 +31,7 @@
 - Produces `_owner_resolution() -> OwnerResolution` and retains `_owner_id() -> str` as a compatibility wrapper returning `.owner_id`.
 - Consumes `SESSION_DIR`, defaulting to `$CODEX_HOME/sessions` and injectable with `WORKSPACE_HARBOR_SESSION_DIR`.
 
-- [ ] **Step 1: Write failing root, nested-child, override, and failure tests**
+- [x] **Step 1: Write failing root, nested-child, override, and failure tests**
 
 Add helpers that create session files named like Codex rollouts and write one `session_meta` line:
 
@@ -81,7 +81,7 @@ def test_invalid_lineage_falls_back_to_child(self):
 
 Also assert a top-level thread returns `root-thread`; an explicit owner returns `explicit`; missing, malformed, oversized (more than 64 KiB before newline), duplicate filenames, self-link, cycle, invalid UUID, and nine-generation ancestry return the current child as owner with a stable concise reason.
 
-- [ ] **Step 2: Run the focused tests to verify RED**
+- [x] **Step 2: Run the focused tests to verify RED**
 
 Run:
 
@@ -93,7 +93,7 @@ python3 -m unittest -v \
 
 Expected: FAIL because `_owner_resolution` and `SESSION_DIR` do not exist.
 
-- [ ] **Step 3: Implement the immutable result and bounded metadata reader**
+- [x] **Step 3: Implement the immutable result and bounded metadata reader**
 
 Add:
 
@@ -118,7 +118,7 @@ Implement `_session_meta(thread_id) -> tuple[dict[str, Any] | None, str | None]`
 
 Implement `_lineage_owner(thread_id) -> OwnerResolution` with a visited set and at most eight parent transitions. A root record has no parent, must not claim `thread_source == "subagent"`, and returns the last thread with source `root-thread` for a top-level caller or `subagent-lineage` after one or more transitions. A child record must claim `thread_source == "subagent"` and its top-level and nested parent values must be identical valid thread IDs. Any failure returns the original caller ID and the stable failure reason.
 
-- [ ] **Step 4: Integrate resolution without changing ownership enforcement**
+- [x] **Step 4: Integrate resolution without changing ownership enforcement**
 
 Replace `_owner_id` with:
 
@@ -143,7 +143,7 @@ def _owner_id() -> str:
 
 Keep `_connect`, `_assert_root_owner`, service keys, and lease records unchanged except that the lease receives the resolved root owner through `_owner_id()`.
 
-- [ ] **Step 5: Run the broker suite and syntax check to verify GREEN**
+- [x] **Step 5: Run the broker suite and syntax check to verify GREEN**
 
 Run:
 
@@ -155,7 +155,7 @@ git diff --check
 
 Expected: all broker tests PASS with no syntax or whitespace errors.
 
-- [ ] **Step 6: Commit Task 1**
+- [x] **Step 6: Commit Task 1**
 
 ```bash
 git add -- bin/serena-worktree-broker tests/python/test_serena_worktree_broker.py
@@ -177,7 +177,7 @@ git commit -m "feat: inherit Serena ownership across subagents"
 - Consumes `_owner_resolution() -> OwnerResolution` from Task 1.
 - Produces `serena-worktree-broker owner [--json]` with JSON keys `thread_id`, `owner_id`, `source`, and optional `reason`.
 
-- [ ] **Step 1: Write failing owner-command contract tests**
+- [x] **Step 1: Write failing owner-command contract tests**
 
 Add:
 
@@ -199,7 +199,7 @@ def test_owner_json_reports_resolution_without_session_content(self):
 
 Also cover text output and inclusion of only a concise `reason` when lineage fails closed.
 
-- [ ] **Step 2: Run the command tests to verify RED**
+- [x] **Step 2: Run the command tests to verify RED**
 
 Run:
 
@@ -210,7 +210,7 @@ python3 -m unittest -v \
 
 Expected: FAIL because the `owner` subcommand does not exist.
 
-- [ ] **Step 3: Implement the read-only owner command**
+- [x] **Step 3: Implement the read-only owner command**
 
 Add `_owner(args)` that converts `OwnerResolution` into a mapping, omits `reason` when it is `None`, prints sorted JSON for `--json`, and otherwise prints `thread=<value-or-> owner=<owner_id> source=<source>` plus `reason=<reason>` when present. Register:
 
@@ -222,7 +222,7 @@ owner.set_defaults(handler=_owner)
 
 The command must not acquire broker state, open IntelliJ, connect Serena, or modify a session file.
 
-- [ ] **Step 4: Document automatic inheritance and recovery**
+- [x] **Step 4: Document automatic inheritance and recovery**
 
 Update README ownership documentation and global Serena guidance with these operational rules:
 
@@ -232,7 +232,7 @@ Update README ownership documentation and global Serena guidance with these oper
 - Different canonical worktrees always use different services.
 - `serena-worktree-broker owner --json` diagnoses resolution; a fail-closed reason means the child remains isolated rather than sharing incorrectly.
 
-- [ ] **Step 5: Run complete verification**
+- [x] **Step 5: Run complete verification**
 
 Run:
 
@@ -246,7 +246,7 @@ git diff --check
 
 Expected: no Python failures, Gradle `BUILD SUCCESSFUL`, and no whitespace errors.
 
-- [ ] **Step 6: Commit Task 2 and deploy the reviewed set**
+- [x] **Step 6: Commit Task 2 and deploy the reviewed set**
 
 ```bash
 git add -- bin/serena-worktree-broker tests/python/test_serena_worktree_broker.py README.md
@@ -257,7 +257,7 @@ bin/deploy-workspace-harbor
 
 Do not stage `/Users/Monsky/.codex/AGENTS.md`. Verify the deployed broker hash matches the deployment dry-run packet.
 
-- [ ] **Step 7: Dogfood one real parent and child**
+- [x] **Step 7: Dogfood one real parent and child**
 
 Run deployed `serena-worktree-broker owner --json` in the parent and record its owner ID. Spawn one bounded read-only child with no inherited turns and assign it the same source checkout. The child runs the same owner command, `serena-codex jetbrains-service-status ROOT`, and one doctor semantic probe. Assert:
 
@@ -270,6 +270,6 @@ Run deployed `serena-worktree-broker owner --json` in the parent and record its 
 
 Then use isolated session fixtures to assert a different top-level thread remains a different owner and `_assert_root_owner` rejects it for the parent's worktree.
 
-- [ ] **Step 8: Final review**
+- [x] **Step 8: Final review**
 
 Inspect `git status --short --branch`, `git diff --stat`, committed diffs, deployed/source hashes, and staged files for secrets or private session content. Confirm no session JSONL path or contents entered a commit. Report commits, checks, dogfood results, skipped tests, and remaining compatibility risk from Codex session-format changes.
