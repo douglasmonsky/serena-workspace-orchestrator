@@ -53,32 +53,62 @@ ensure_project_trusted() {
   "$project_trust_command" allow "$dir"
 }
 
+format_bootstrap_diagnostic() {
+  local result_code="$1"
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    print -r -- "exit=$result_code; diagnostic-parser=unavailable"
+    return 0
+  fi
+  python3 -c '
+import json
+import sys
+
+exit_code = sys.argv[1]
+try:
+    result = json.load(sys.stdin)
+except (json.JSONDecodeError, OSError, TypeError, ValueError):
+    print(f"exit={exit_code}; result=unreadable")
+    raise SystemExit(0)
+if not isinstance(result, dict):
+    print(f"exit={exit_code}; result=unreadable")
+    raise SystemExit(0)
+parts = [f"exit={exit_code}"]
+for key in ("status", "failure_kind", "operation"):
+    value = result.get(key)
+    if isinstance(value, str):
+        parts.append(f"{key}={value}")
+detail = result.get("error") or result.get("failure_context")
+if isinstance(detail, str) and detail:
+    parts.append("detail=" + " ".join(detail.split()))
+encoded = "; ".join(parts).encode("utf-8")
+if len(encoded) > 512:
+    encoded = encoded[:509].decode("utf-8", errors="ignore").encode("utf-8") + b"..."
+print(encoded.decode("utf-8", errors="ignore"))
+' "$result_code"
+}
+
 prepare_project_dependencies() {
-  local dir="$1" result_code
+  local dir="$1" result_code result_payload diagnostic category
 
   if [[ ! -x "$bootstrap_command" ]]; then
-    print -u2 "open-codex-project-in-intellij: dependency bootstrap command unavailable"
-    return 2
+    print -u2 "open-codex-project-in-intellij: dependency bootstrap command unavailable; continuing with IntelliJ and Serena"
+    return 0
   fi
-  if "$bootstrap_command" run "$dir" --json >/dev/null 2>&1; then
+  if result_payload="$("$bootstrap_command" run "$dir" --json 2>&1)"; then
     return 0
   else
     result_code=$?
   fi
+  diagnostic="$(print -rn -- "$result_payload" | format_bootstrap_diagnostic "$result_code")"
   case "$result_code" in
-    1)
-      print -u2 "open-codex-project-in-intellij: dependency bootstrap is degraded; continuing with IntelliJ and Serena available for diagnosis"
-      return 0
-      ;;
-    3)
-      print -u2 "open-codex-project-in-intellij: dependency bootstrap needs one repository decision; continuing without retry"
-      return 0
-      ;;
-    *)
-      print -u2 "open-codex-project-in-intellij: dependency bootstrap configuration or state is invalid"
-      return 2
-      ;;
+    1) category="is degraded" ;;
+    2) category="validation failed" ;;
+    3) category="needs a repository decision" ;;
+    *) category="returned an unexpected result" ;;
   esac
+  print -u2 "open-codex-project-in-intellij: dependency bootstrap $category ($diagnostic); continuing with IntelliJ and Serena available for diagnosis"
+  return 0
 }
 
 release_opener_lock() {
