@@ -64,16 +64,27 @@ removes them automatically.
 
 ## Ownership model
 
-Ownership is one logical Codex task per canonical worktree. Parent agents and
-their subagents share a workspace owner by exporting the same
-`WORKSPACE_HARBOR_OWNER_ID`. Different tasks may use different worktrees or
-repositories concurrently in separate IntelliJ project windows. A second
-logical owner is rejected for an already-owned worktree, preventing two tasks
-from racing the same project model or Serena service.
+Ownership is one logical Codex task per canonical worktree. Workspace Harbor
+reads the bounded `session_meta` record for a Codex subagent and resolves its
+validated ancestry to the root parent task automatically. No capsule, prompt
+token, or manual environment export is required for ordinary Codex subagents.
+`WORKSPACE_HARBOR_OWNER_ID` remains available as an explicit override for
+non-Codex callers and custom integrations.
+
+Different tasks may use different worktrees or repositories concurrently in
+separate IntelliJ project windows. A second logical owner is rejected for an
+already-owned worktree, preventing two tasks from racing the same project
+model or Serena service. Missing, malformed, ambiguous, cyclic, or inconsistent
+lineage fails closed to the child's own thread ID instead of granting reuse.
 
 The broker exposes owners in `serena-worktree-broker status`. IntelliJ itself
 remains one application process; project-window and worktree ownership is the
 unit Workspace Harbor manages.
+
+Use `serena-worktree-broker owner --json` to inspect the current thread, its
+resolved owner, the resolution source, and any concise fail-closed reason. The
+command never reads beyond the first bounded session metadata record and never
+prints prompts or session content.
 
 ## Persistent dependency bootstrap
 

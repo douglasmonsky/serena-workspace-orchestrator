@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -225,6 +226,41 @@ class SerenaWorktreeBrokerTests(unittest.TestCase):
             over_depth = broker._owner_resolution()
         self.assertEqual(chain[0], over_depth.owner_id)
         self.assertEqual("lineage-too-deep", over_depth.reason)
+
+    def test_owner_json_reports_resolution_without_session_content(self) -> None:
+        resolution = broker.OwnerResolution(CHILD_ID, ROOT_ID, "subagent-lineage")
+        with mock.patch.object(
+            broker, "_owner_resolution", return_value=resolution
+        ), mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            status = broker.main(["owner", "--json"])
+
+        self.assertEqual(0, status)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(
+            {
+                "owner_id": ROOT_ID,
+                "source": "subagent-lineage",
+                "thread_id": CHILD_ID,
+            },
+            payload,
+        )
+        self.assertNotIn("payload", stdout.getvalue())
+
+    def test_owner_text_includes_only_concise_failure_reason(self) -> None:
+        resolution = broker.OwnerResolution(
+            CHILD_ID, CHILD_ID, "root-thread", "inconsistent-parent"
+        )
+        with mock.patch.object(
+            broker, "_owner_resolution", return_value=resolution
+        ), mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            status = broker.main(["owner"])
+
+        self.assertEqual(0, status)
+        self.assertEqual(
+            f"thread={CHILD_ID} owner={CHILD_ID} source=root-thread "
+            "reason=inconsistent-parent\n",
+            stdout.getvalue(),
+        )
 
     def test_root_ownership_rejects_another_thread_but_allows_other_roots(self) -> None:
         first = Path(self.temporary_directory.name) / "first"; first.mkdir()

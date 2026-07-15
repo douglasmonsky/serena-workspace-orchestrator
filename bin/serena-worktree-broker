@@ -727,6 +727,30 @@ def _leases(args: argparse.Namespace) -> int:
     return 0
 
 
+def _owner(args: argparse.Namespace) -> int:
+    """Report only the resolved logical owner identity."""
+    resolution = _owner_resolution()
+    payload: dict[str, Any] = {
+        "thread_id": resolution.thread_id,
+        "owner_id": resolution.owner_id,
+        "source": resolution.source,
+    }
+    if resolution.reason is not None:
+        payload["reason"] = resolution.reason
+    if args.json:
+        print(json.dumps(payload, sort_keys=True))
+    else:
+        fields = [
+            f"thread={resolution.thread_id or '-'}",
+            f"owner={resolution.owner_id}",
+            f"source={resolution.source}",
+        ]
+        if resolution.reason is not None:
+            fields.append(f"reason={resolution.reason}")
+        print(" ".join(fields))
+    return 0
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -749,6 +773,10 @@ def _parser() -> argparse.ArgumentParser:
     leases = subparsers.add_parser("leases", help="show pruned broker lease snapshot")
     leases.add_argument("--json", action="store_true", required=True)
     leases.set_defaults(handler=_leases)
+
+    owner = subparsers.add_parser("owner", help="show resolved logical task owner")
+    owner.add_argument("--json", action="store_true")
+    owner.set_defaults(handler=_owner)
     return parser
 
 
