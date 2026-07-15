@@ -373,6 +373,12 @@ class ClientTests(unittest.TestCase):
         self.assertEqual("responsive", result["status"])
         kill.assert_not_called()
 
+        rolling_runtime = runtime | {"pluginVersion": "0.1.9"}
+        with patch.object(
+            reaper, "process_start", return_value=runtime["processStartInstant"]
+        ), patch.object(reaper, "process_command", return_value=executable):
+            self.assertTrue(reaper.validated_intellij_process(rolling_runtime, app))
+
         with patch.object(
             reaper, "process_start", return_value=runtime["processStartInstant"]
         ), patch.object(

@@ -35,8 +35,18 @@ public final class LifecycleHttpServer implements AutoCloseable {
         if (mode != null && !"owned-recovery".equals(mode)) { reply(x, 409, "{\"error\":\"protected\"}"); return; }
         boolean ownedRecovery = "owned-recovery".equals(mode);
         CompletableFuture<Boolean> attempt = new CompletableFuture<>();
-        CompletableFuture<Boolean> existing = closingRoots.putIfAbsent(root, attempt);
-        if (existing != null) { replyCloseResult(x, existing.join()); return; }
+        while (true) {
+            CompletableFuture<Boolean> existing = closingRoots.putIfAbsent(root, attempt);
+            if (existing == null) break;
+            boolean rootOpen = adapter.openProjects().stream()
+                    .map(SafetySnapshot::canonicalRoot).anyMatch(root::equals);
+            if (!existing.isDone() || !rootOpen
+                    || adapter.freshDecision(root, ownedRecovery).reasons().contains("closing")) {
+                replyCloseResult(x, existing.join());
+                return;
+            }
+            closingRoots.remove(root, existing);
+        }
         try {
             if (adapter.openProjects().stream().map(SafetySnapshot::canonicalRoot).noneMatch(root::equals)) {
                 attempt.complete(false); closingRoots.remove(root, attempt); reply(x, 404, "{\"error\":\"not-found\"}"); return;

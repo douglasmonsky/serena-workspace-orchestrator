@@ -5,7 +5,7 @@ plugins {
     id("org.jetbrains.intellij.platform") version "2.18.1"
 }
 
-version = "0.1.9"
+version = "0.1.10"
 
 val intellijAppPath = providers.environmentVariable("INTELLIJ_APP_PATH")
     .orElse("${System.getProperty("user.home")}/Applications/IntelliJ IDEA.app")

@@ -18,7 +18,7 @@ class IntelliJPluginTargetTests(unittest.TestCase):
         self.assertIn('environmentVariable("INTELLIJ_APP_PATH")', build)
         self.assertIn("Applications/IntelliJ IDEA.app", build)
         self.assertNotIn("/Applications/PyCharm.app", build)
-        self.assertIn('version = "0.1.9"', build)
+        self.assertIn('version = "0.1.10"', build)
 
     def test_java_sources_live_in_product_neutral_package(self):
         expected_main = ROOT / "src/main/java/com/monsky/workspaceharbor/lifecycle"

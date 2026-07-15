@@ -11,7 +11,8 @@ STATE = Path.home() / ".codex/state/intellij-projects/managed.json"
 RUNTIME = STATE.with_name("plugin-runtime.json")
 CAP, IDLE = 4, 1800
 BROKER = Path.home() / ".codex/bin/serena-worktree-broker"
-HUNG_RESTART_PLUGIN_VERSION = "0.1.9"
+HUNG_RESTART_PLUGIN_VERSION = "0.1.10"
+HUNG_RESTART_COMPATIBLE_PLUGIN_VERSIONS = {"0.1.9", HUNG_RESTART_PLUGIN_VERSION}
 
 @dataclass(frozen=True)
 class Decision:
@@ -220,7 +221,7 @@ def validated_intellij_process(runtime, app):
             type(pid) is int
             and pid > 1
             and isinstance(started, str)
-            and runtime.get("pluginVersion") == HUNG_RESTART_PLUGIN_VERSION
+            and runtime.get("pluginVersion") in HUNG_RESTART_COMPATIBLE_PLUGIN_VERSIONS
             and same_start(process_start(pid), started)
             and process_command(pid) == expected
         )

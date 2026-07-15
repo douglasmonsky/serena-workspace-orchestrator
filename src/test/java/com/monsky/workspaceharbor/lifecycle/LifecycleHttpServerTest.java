@@ -51,6 +51,17 @@ class LifecycleHttpServerTest {
         assertEquals(404, post("/v1/projects/close?root=%2Fother").statusCode());
     }
 
+    @Test void aReopenedRootGetsANewCloseAttempt() throws Exception {
+        start();
+        assertEquals(202, post("/v1/projects/close?root=%2Fworkspace").statusCode());
+        assertEquals(1, adapter.closeCalls);
+
+        adapter.open = true;
+
+        assertEquals(202, post("/v1/projects/close?root=%2Fworkspace").statusCode());
+        assertEquals(2, adapter.closeCalls);
+    }
+
     @Test void ownedRecoveryCloseUsesTheExplicitRecoveryPolicy() throws Exception {
         start();
         adapter.safe = false;
