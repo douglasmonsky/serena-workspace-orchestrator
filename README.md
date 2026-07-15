@@ -114,6 +114,15 @@ only when a selected command, manifest, lockfile, runtime/tool identity,
 required environment marker, or Harbor recipe version changes, or when
 `--force` is requested.
 
+A cache hit is fully read-only: it does not acquire the mutable execution lock
+or require write access to Harbor's private state directory. Pending or forced
+setup still requires that lock and fails closed if state cannot be mutated.
+Operational permission or I/O failures are reported as degraded `failed`
+results, distinct from invalid repository configuration. Dependency
+degradation never authorizes a fallback installer and does not prevent the
+separately guarded IntelliJ opener from making Serena semantics available for
+diagnosis.
+
 Plan precedence is conservative:
 
 1. A conventional `bootstrap` task in `.codex/tasks.toml`, or a task selected
