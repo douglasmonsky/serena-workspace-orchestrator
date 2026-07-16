@@ -30,7 +30,7 @@ def current_owner(request_id: str) -> queue.OwnerIdentity:
         request_id=request_id,
         pid=os.getpid(),
         process_started=queue.read_process_start(os.getpid()),
-        command_token="test_workspace_harbor_opener_queue",
+        command_token="python",
     )
 
 

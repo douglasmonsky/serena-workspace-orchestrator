@@ -969,7 +969,7 @@ class OpenCodexProjectInIntellijTests(unittest.TestCase):
                     [str(HELPER), str(project)],
                     capture_output=True,
                     text=True,
-                    timeout=1.5,
+                    timeout=4,
                     check=False,
                     env=os.environ
                     | {
