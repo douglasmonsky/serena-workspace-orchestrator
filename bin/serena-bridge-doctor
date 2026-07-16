@@ -148,7 +148,18 @@ def _broker_evidence(root: Path) -> dict[str, Any]:
 
 def _handshake(root: Path) -> bridge.HandshakeResult:
     journal = bridge.BridgeJournal(BRIDGE_STATE)
-    return bridge.run_handshake(root, BROKER, journal=journal)
+    desktop_owner = bridge.find_desktop_host_owner(root, BROKER)
+    environment = (
+        {"WORKSPACE_HARBOR_OWNER_ID": desktop_owner}
+        if desktop_owner is not None
+        else None
+    )
+    return bridge.run_handshake(
+        root,
+        BROKER,
+        journal=journal,
+        extra_environment=environment,
+    )
 
 
 def _semantic_status(project: dict[str, Any]) -> str:

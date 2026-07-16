@@ -29,6 +29,7 @@ HEX_24 = re.compile(r"^[0-9a-f]{24}$")
 HEX_32 = re.compile(r"^[0-9a-f]{32}$")
 REASON_CODE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+CODEX_HOST_OWNER = re.compile(r"^codex-host-[0-9a-f]{24}$")
 ALLOWED_OWNER_SOURCES = frozenset(
     {"explicit", "root-thread", "subagent-lineage", "codex-host", "process-fallback"}
 )
@@ -491,6 +492,54 @@ def check_codex_serena_config(
     if completed.returncode != 0:
         return ConfigCheck("invalid", "serena-config-missing", None)
     return parse_codex_mcp_get(completed.stdout, expected_broker)
+
+
+def find_desktop_host_owner(
+    root: Path,
+    broker: Path,
+    *,
+    timeout_seconds: float = 8,
+    max_output_bytes: int = 1_048_576,
+) -> str | None:
+    if not broker.is_file() or not os.access(broker, os.X_OK):
+        return None
+    try:
+        completed = subprocess.run(
+            [str(broker), "status", "--json"],
+            capture_output=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if (
+        completed.returncode != 0
+        or len(completed.stdout) > max_output_bytes
+        or len(completed.stderr) > max_output_bytes
+    ):
+        return None
+    try:
+        payload = json.loads(completed.stdout)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, list):
+        return None
+    canonical = str(root.expanduser().resolve(strict=False))
+    matching = [
+        item
+        for item in payload
+        if isinstance(item, dict)
+        and item.get("project_root") == canonical
+        and item.get("backend") == "JetBrains"
+        and item.get("healthy") is True
+    ]
+    if len(matching) != 1:
+        return None
+    owners = matching[0].get("owners")
+    if not isinstance(owners, list) or len(owners) != 1:
+        return None
+    owner = owners[0]
+    return owner if isinstance(owner, str) and CODEX_HOST_OWNER.fullmatch(owner) else None
 
 
 def _message_bytes(message: dict[str, Any]) -> bytes:

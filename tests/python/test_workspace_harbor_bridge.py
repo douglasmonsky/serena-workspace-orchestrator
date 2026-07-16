@@ -182,6 +182,64 @@ class ConfigCheckTests(unittest.TestCase):
         )
 
 
+class DesktopOwnerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.base = Path(self.temporary_directory.name)
+        self.root = self.base / "project"
+        self.root.mkdir()
+        self.broker = self.base / "broker"
+
+    def tearDown(self) -> None:
+        self.temporary_directory.cleanup()
+
+    def write_status(self, payload) -> None:
+        self.broker.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json\n"
+            f"print(json.dumps({payload!r}))\n",
+            encoding="utf-8",
+        )
+        self.broker.chmod(0o755)
+
+    def test_exact_healthy_desktop_host_owner_is_reused(self) -> None:
+        owner = "codex-host-" + "a" * 24
+        self.write_status(
+            [
+                {
+                    "project_root": str(self.root.resolve()),
+                    "backend": "JetBrains",
+                    "healthy": True,
+                    "owners": [owner],
+                }
+            ]
+        )
+
+        result = bridge.find_desktop_host_owner(self.root, self.broker)
+
+        self.assertEqual(owner, result)
+
+    def test_ambiguous_unhealthy_or_nonhost_owner_fails_closed(self) -> None:
+        base = {
+            "project_root": str(self.root.resolve()),
+            "backend": "JetBrains",
+            "healthy": True,
+            "owners": ["codex-host-" + "a" * 24],
+        }
+        cases = (
+            [base, dict(base)],
+            [{**base, "healthy": False}],
+            [{**base, "owners": ["root-thread"]}],
+            [{**base, "project_root": str(self.base / "other")}],
+        )
+        for payload in cases:
+            with self.subTest(payload=payload):
+                self.write_status(payload)
+                self.assertIsNone(
+                    bridge.find_desktop_host_owner(self.root, self.broker)
+                )
+
+
 class HandshakeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()

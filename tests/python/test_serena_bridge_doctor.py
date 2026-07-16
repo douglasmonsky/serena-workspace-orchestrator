@@ -116,6 +116,28 @@ class StatusClassificationTests(unittest.TestCase):
         self.assertEqual("backend-unhealthy", backend["status"])
         self.assertEqual("handshake-unhealthy", handshake["status"])
 
+    def test_probe_reuses_only_validated_desktop_host_owner(self) -> None:
+        result = doctor.bridge.HandshakeResult(
+            "healthy", "handshake-complete", 1, 1, 3, True, 0
+        )
+        owner = "codex-host-" + "a" * 24
+        with (
+            mock.patch.object(
+                doctor.bridge,
+                "find_desktop_host_owner",
+                return_value=owner,
+            ),
+            mock.patch.object(
+                doctor.bridge, "run_handshake", return_value=result
+            ) as handshake,
+        ):
+            self.assertIs(result, doctor._handshake(self.root))
+
+        self.assertEqual(
+            {"WORKSPACE_HARBOR_OWNER_ID": owner},
+            handshake.call_args.kwargs["extra_environment"],
+        )
+
 
 class IncidentStoreTests(unittest.TestCase):
     def setUp(self) -> None:
