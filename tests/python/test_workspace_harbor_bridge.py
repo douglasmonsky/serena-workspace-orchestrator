@@ -11,6 +11,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from unittest import mock
 
 
 BIN_DIR = Path(__file__).resolve().parents[2] / "bin"
@@ -195,7 +196,7 @@ class HandshakeTests(unittest.TestCase):
         path = self.base / "broker"
         path.write_text(
             "#!/usr/bin/env python3\n"
-            "import json, sys, time\n"
+            "import json, os, sys, time\n"
             + textwrap.dedent(response_body),
             encoding="utf-8",
         )
@@ -226,6 +227,32 @@ class HandshakeTests(unittest.TestCase):
         self.assertEqual(1, result.tool_count)
         self.assertTrue(result.expected_tool_found)
         self.assertEqual(0, result.proxy_exit)
+
+    def test_handshake_mirrors_desktop_launcher_without_task_owner_env(self) -> None:
+        broker_path = self.write_broker(
+            """
+            if os.environ.get("CODEX_THREAD_ID") or os.environ.get("WORKSPACE_HARBOR_OWNER_ID"):
+                sys.exit(9)
+            for line in sys.stdin:
+                message = json.loads(line)
+                if message.get("id") == 1:
+                    print(json.dumps({"jsonrpc": "2.0", "id": 1, "result": {}}), flush=True)
+                if message.get("id") == 2:
+                    print(json.dumps({"jsonrpc": "2.0", "id": 2, "result": {"tools": [{"name": "initial_instructions"}]}}), flush=True)
+                    break
+            """
+        )
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "CODEX_THREAD_ID": "11111111-1111-4111-8111-111111111111",
+                "WORKSPACE_HARBOR_OWNER_ID": "custom-owner",
+            },
+        ):
+            result = bridge.run_handshake(self.root, broker_path, timeout_seconds=1)
+
+        self.assertEqual(("healthy", "handshake-complete"), (result.status, result.reason))
 
     def test_handshake_rejects_initialize_error(self) -> None:
         broker_path = self.write_broker(

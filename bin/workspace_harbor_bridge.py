@@ -636,6 +636,11 @@ def run_handshake(
     attempt_id = uuid.uuid4().hex
     started = time.monotonic()
     environment = os.environ.copy()
+    # The desktop MCP launcher owns services by its validated Codex host because
+    # it does not receive per-task lineage. Mirror that launch surface so a
+    # doctor invoked from a task does not manufacture an ownership conflict.
+    environment.pop("CODEX_THREAD_ID", None)
+    environment.pop("WORKSPACE_HARBOR_OWNER_ID", None)
     if extra_environment:
         environment.update(extra_environment)
     command: Sequence[str] = (
