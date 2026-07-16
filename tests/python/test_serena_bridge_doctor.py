@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sys
 import tempfile
@@ -306,6 +307,199 @@ class RecoveryTests(unittest.TestCase):
 
         self.assertEqual("restart-eligible", first["status"])
         self.assertEqual(first["incident"], second["incident"])
+
+
+class GuardedRestartTests(unittest.TestCase):
+    CURRENT = "11111111-1111-4111-8111-111111111111"
+    NOW = datetime(2026, 7, 15, 20, 0, tzinfo=timezone.utc)
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.state = Path(self.temporary_directory.name) / "bridge"
+        self.root = Path(self.temporary_directory.name) / "repo"
+        self.root.mkdir()
+        self.store = doctor.bridge.IncidentStore(self.state / "incidents")
+        self.incident = self.store.create_or_reuse_restart(
+            self.root, self.CURRENT, "task-tools-missing"
+        )
+        self.old_identity = doctor.codex.CodexProcessIdentity(
+            123,
+            "old-start",
+            "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+            "com.openai.codex",
+        )
+
+    def tearDown(self) -> None:
+        self.temporary_directory.cleanup()
+
+    def attest(self) -> dict:
+        return doctor.attest_restart(
+            self.root,
+            incident_id=self.incident.id,
+            current_thread=self.CURRENT,
+            host_id="local",
+            active_threads=[self.CURRENT],
+            active_children=[],
+            unknown_threads=[],
+            unavailable_hosts=[],
+            observed_at=self.NOW,
+            heartbeat={
+                "id": "workspace-harbor-bridge-incident",
+                "target_thread_id": self.CURRENT,
+                "enabled": True,
+                "next_run": self.NOW + timedelta(seconds=90),
+                "incident": self.incident.id,
+            },
+            store=self.store,
+            state_dir=self.state,
+        )
+
+    def test_prepare_dogfood_requires_attestation_and_transitions_once(self) -> None:
+        attested = self.attest()
+        self.assertEqual("restart-attested", attested["status"])
+
+        with (
+            mock.patch.object(
+                doctor.codex,
+                "find_codex_app_identity",
+                return_value=self.old_identity,
+            ),
+            mock.patch.object(doctor, "_launch_relauncher", return_value=True) as launch,
+        ):
+            report = doctor.prepare_restart(
+                self.root,
+                incident_id=self.incident.id,
+                current_thread=self.CURRENT,
+                dogfood=True,
+                store=self.store,
+                state_dir=self.state,
+                now=self.NOW + timedelta(seconds=5),
+            )
+
+        self.assertEqual("restart-prepared", report["status"])
+        transitioned = self.store.load(self.incident.id)
+        self.assertTrue(transitioned.restart_attempted)
+        self.assertTrue(transitioned.dogfood_restart)
+        launch.assert_called_once()
+        repeated = doctor.prepare_restart(
+            self.root,
+            incident_id=self.incident.id,
+            current_thread=self.CURRENT,
+            dogfood=True,
+            store=self.store,
+            state_dir=self.state,
+            now=self.NOW + timedelta(seconds=6),
+        )
+        self.assertEqual("invalid-state", repeated["status"])
+
+    def test_prepare_refuses_when_restart_policy_is_disabled(self) -> None:
+        self.attest()
+        with mock.patch.object(
+            doctor.codex,
+            "find_codex_app_identity",
+            return_value=self.old_identity,
+        ):
+            report = doctor.prepare_restart(
+                self.root,
+                incident_id=self.incident.id,
+                current_thread=self.CURRENT,
+                dogfood=False,
+                store=self.store,
+                state_dir=self.state,
+                now=self.NOW + timedelta(seconds=5),
+            )
+
+        self.assertEqual("restart-blocked", report["status"])
+        self.assertEqual("restart-policy-disabled", report["reason"])
+
+    def test_resume_closes_healthy_and_returns_heartbeat(self) -> None:
+        self.attest()
+        incident = self.store.transition(
+            self.incident.id,
+            "restart-eligible",
+            "restart-prepared",
+            restart_attempted=True,
+            heartbeat_id="workspace-harbor-bridge-incident",
+            dogfood_restart=True,
+        )
+        self.store.transition(
+            incident.id,
+            "restart-prepared",
+            "resume-pending",
+            reason="codex-relaunched",
+        )
+        checkpoint = doctor.codex.RelaunchCheckpoint(
+            incident_id=incident.id,
+            incident_store=str(self.store.state_dir),
+            root=str(self.root.resolve()),
+            thread_id=self.CURRENT,
+            heartbeat_id="workspace-harbor-bridge-incident",
+            attestation_nonce="b" * 32,
+            doctor_pid=999,
+            app_identity=self.old_identity,
+            created_at=self.NOW.isoformat(),
+        )
+        doctor.codex.write_private_dataclass(
+            doctor.checkpoint_path(self.state, incident.id), checkpoint
+        )
+        new_identity = doctor.codex.CodexProcessIdentity(
+            456,
+            "new-start",
+            self.old_identity.executable,
+            self.old_identity.bundle_id,
+        )
+        handshake = doctor.bridge.HandshakeResult(
+            "healthy", "handshake-complete", 1, 1, 3, True, 0
+        )
+        with (
+            mock.patch.object(
+                doctor.codex, "find_codex_app_identity", return_value=new_identity
+            ),
+            mock.patch.object(doctor, "_handshake", return_value=handshake),
+        ):
+            report = doctor.resume_bridge(
+                self.root,
+                incident_id=incident.id,
+                current_thread=self.CURRENT,
+                reported_tools="present",
+                store=self.store,
+                state_dir=self.state,
+            )
+
+        self.assertEqual("healthy", report["status"])
+        self.assertEqual(
+            "workspace-harbor-bridge-incident", report["heartbeat_id"]
+        )
+        self.assertEqual("closed-healthy", self.store.load(incident.id).state)
+
+    def test_policy_enable_requires_successful_dogfood_incident(self) -> None:
+        policy = doctor.codex.RestartPolicyStore(self.state / "config.json")
+        blocked = doctor.update_restart_policy(
+            "enable", incident_id=self.incident.id, store=self.store, policy=policy
+        )
+        self.assertEqual("restart-policy-blocked", blocked["status"])
+        self.assertFalse(policy.load()["automatic_codex_restart"])
+
+    def test_policy_enable_accepts_closed_healthy_dogfood_incident(self) -> None:
+        prepared = self.store.transition(
+            self.incident.id,
+            "restart-eligible",
+            "restart-prepared",
+            dogfood_restart=True,
+            restart_attempted=True,
+        )
+        pending = self.store.transition(
+            prepared.id, "restart-prepared", "resume-pending"
+        )
+        self.store.transition(pending.id, "resume-pending", "closed-healthy")
+        policy = doctor.codex.RestartPolicyStore(self.state / "config.json")
+
+        report = doctor.update_restart_policy(
+            "enable", incident_id=self.incident.id, store=self.store, policy=policy
+        )
+
+        self.assertEqual("restart-policy", report["status"])
+        self.assertTrue(policy.load()["automatic_codex_restart"])
 
 
 if __name__ == "__main__":

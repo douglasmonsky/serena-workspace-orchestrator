@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict
+from datetime import datetime
 import json
 import os
 from pathlib import Path
@@ -18,6 +19,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 import workspace_harbor_bridge as bridge  # noqa: E402
+import workspace_harbor_codex as codex  # noqa: E402
 
 
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
@@ -40,6 +42,14 @@ BRIDGE_STATE = Path(
     )
 )
 INCIDENTS = BRIDGE_STATE / "incidents"
+ATTESTATIONS = BRIDGE_STATE / "attestations"
+CHECKPOINTS = BRIDGE_STATE / "checkpoints"
+RELAUNCHER = Path(
+    os.environ.get(
+        "WORKSPACE_HARBOR_CODEX_RELAUNCHER",
+        CODEX_HOME / "bin" / "workspace-harbor-codex-relauncher",
+    )
+)
 SUBPROCESS_TIMEOUT_SECONDS = 45
 
 
@@ -359,6 +369,284 @@ def recover_bridge(
     return report
 
 
+def attestation_path(state_dir: Path, incident_id: str) -> Path:
+    return state_dir / "attestations" / f"{incident_id}.json"
+
+
+def checkpoint_path(state_dir: Path, incident_id: str) -> Path:
+    return state_dir / "checkpoints" / f"{incident_id}.json"
+
+
+def _incident_matches(
+    incident: bridge.BridgeIncident,
+    root: Path,
+    current_thread: str,
+) -> bool:
+    return (
+        incident.root == str(root.expanduser().resolve(strict=False))
+        and incident.thread_id == current_thread
+    )
+
+
+def attest_restart(
+    root: Path,
+    *,
+    incident_id: str,
+    current_thread: str,
+    host_id: str,
+    active_threads: Sequence[str],
+    active_children: Sequence[str],
+    unknown_threads: Sequence[str],
+    unavailable_hosts: Sequence[str],
+    observed_at,
+    heartbeat: dict[str, Any],
+    store: bridge.IncidentStore | None = None,
+    state_dir: Path = BRIDGE_STATE,
+) -> dict[str, Any]:
+    incident_store = store or bridge.IncidentStore(state_dir / "incidents")
+    incident = incident_store.load(incident_id)
+    if incident.state != "restart-eligible" or not _incident_matches(
+        incident, root, current_thread
+    ):
+        return {
+            "status": "invalid-state",
+            "reason": "incident-not-restart-eligible",
+            "next_action": "run-bridge-recover",
+        }
+    try:
+        attestation = codex.build_restart_attestation(
+            current_thread=current_thread,
+            host_id=host_id,
+            active_threads=active_threads,
+            active_children=active_children,
+            unknown_threads=unknown_threads,
+            unavailable_hosts=unavailable_hosts,
+            observed_at=observed_at,
+            heartbeat=heartbeat,
+            incident=incident_id,
+        )
+    except codex.AttestationError as error:
+        return {
+            "status": "restart-refused",
+            "reason": error.reason,
+            "next_action": "keep-current-task-running",
+        }
+    path = attestation_path(state_dir, incident_id)
+    codex.write_private_dataclass(path, attestation)
+    return {
+        "status": "restart-attested",
+        "reason": "exclusive-task-heartbeat-verified",
+        "incident": incident_id,
+        "next_action": "prepare-restart",
+    }
+
+
+def _launch_relauncher(path: Path, state_dir: Path) -> bool:
+    log_path = state_dir / "relauncher.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        with os.fdopen(descriptor, "a", encoding="utf-8") as stream:
+            subprocess.Popen(
+                [str(RELAUNCHER), str(path)],
+                stdin=subprocess.DEVNULL,
+                stdout=stream,
+                stderr=stream,
+                start_new_session=True,
+                close_fds=True,
+            )
+    except OSError:
+        return False
+    return True
+
+
+def prepare_restart(
+    root: Path,
+    *,
+    incident_id: str,
+    current_thread: str,
+    dogfood: bool,
+    store: bridge.IncidentStore | None = None,
+    state_dir: Path = BRIDGE_STATE,
+    now=None,
+) -> dict[str, Any]:
+    from datetime import datetime, timezone
+
+    incident_store = store or bridge.IncidentStore(state_dir / "incidents")
+    try:
+        incident = incident_store.load(incident_id)
+    except (OSError, ValueError):
+        return {"status": "invalid-state", "reason": "incident-missing"}
+    if incident.state != "restart-eligible":
+        return {
+            "status": "invalid-state",
+            "reason": "restart-budget-exhausted",
+            "next_action": "keep-current-task-running",
+        }
+    if not _incident_matches(incident, root, current_thread):
+        return {"status": "invalid-state", "reason": "incident-scope-mismatch"}
+    proof_path = attestation_path(state_dir, incident_id)
+    try:
+        attestation = codex.load_restart_attestation(proof_path)
+        codex.validate_restart_attestation(
+            attestation,
+            current_thread=current_thread,
+            incident=incident_id,
+            now=now or datetime.now(timezone.utc),
+        )
+    except (OSError, ValueError, json.JSONDecodeError, codex.AttestationError) as error:
+        reason = (
+            error.reason
+            if isinstance(error, codex.AttestationError)
+            else "attestation-missing"
+        )
+        return {
+            "status": "restart-blocked",
+            "reason": reason,
+            "next_action": "refresh-restart-attestation",
+        }
+    policy = codex.RestartPolicyStore(state_dir / "config.json").load()
+    if not dogfood and not policy["automatic_codex_restart"]:
+        return {
+            "status": "restart-blocked",
+            "reason": "restart-policy-disabled",
+            "next_action": "use-dogfood-or-enable-after-success",
+        }
+    identity = codex.find_codex_app_identity()
+    if identity is None:
+        return {
+            "status": "restart-blocked",
+            "reason": "codex-identity-unavailable",
+            "next_action": "keep-current-task-running",
+        }
+    checkpoint = codex.RelaunchCheckpoint(
+        incident_id=incident.id,
+        incident_store=str(incident_store.state_dir),
+        root=incident.root,
+        thread_id=current_thread,
+        heartbeat_id=attestation.heartbeat_id,
+        attestation_nonce=attestation.nonce,
+        doctor_pid=os.getpid(),
+        app_identity=identity,
+        created_at=(now or datetime.now(timezone.utc)).isoformat(),
+    )
+    incident_store.transition(
+        incident.id,
+        "restart-eligible",
+        "restart-prepared",
+        reason="restart-prepared",
+        restart_attempted=True,
+        heartbeat_id=attestation.heartbeat_id,
+        dogfood_restart=dogfood,
+    )
+    path = checkpoint_path(state_dir, incident.id)
+    try:
+        codex.write_private_dataclass(path, checkpoint)
+        launched = _launch_relauncher(path, state_dir)
+    except OSError:
+        launched = False
+    if not launched:
+        incident_store.transition(
+            incident.id,
+            "restart-prepared",
+            "closed-blocked",
+            reason="relauncher-launch-failed",
+        )
+        return {"status": "restart-blocked", "reason": "relauncher-launch-failed"}
+    return {
+        "status": "restart-prepared",
+        "reason": "graceful-relaunch-scheduled",
+        "incident": incident.id,
+        "heartbeat_id": attestation.heartbeat_id,
+        "next_action": "exit-for-relauncher",
+    }
+
+
+def resume_bridge(
+    root: Path,
+    *,
+    incident_id: str,
+    current_thread: str,
+    reported_tools: str,
+    store: bridge.IncidentStore | None = None,
+    state_dir: Path = BRIDGE_STATE,
+) -> dict[str, Any]:
+    incident_store = store or bridge.IncidentStore(state_dir / "incidents")
+    incident = incident_store.load(incident_id)
+    if incident.state != "resume-pending":
+        return {
+            "status": "invalid-state",
+            "reason": "restart-budget-exhausted",
+            "heartbeat_id": incident.heartbeat_id,
+        }
+    if not _incident_matches(incident, root, current_thread):
+        return {"status": "invalid-state", "reason": "incident-scope-mismatch"}
+    try:
+        checkpoint = codex.load_checkpoint(checkpoint_path(state_dir, incident.id))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {"status": "invalid-state", "reason": "checkpoint-missing"}
+    current_identity = codex.find_codex_app_identity()
+    if current_identity is None or current_identity == checkpoint.app_identity:
+        return {"status": "invalid-state", "reason": "codex-not-relaunched"}
+    handshake = _handshake(root.expanduser().resolve())
+    if handshake.status != "healthy" or reported_tools == "missing":
+        closed = incident_store.transition(
+            incident.id,
+            "resume-pending",
+            "closed-fresh-task-required",
+            reason=(
+                "post-restart-handshake-failed"
+                if handshake.status != "healthy"
+                else "task-tools-still-missing"
+            ),
+        )
+        return {
+            "status": "fresh-task-required",
+            "reason": closed.reason,
+            "incident": incident.id,
+            "heartbeat_id": incident.heartbeat_id,
+        }
+    closed = incident_store.transition(
+        incident.id,
+        "resume-pending",
+        "closed-healthy",
+        reason="task-tools-restored",
+    )
+    return {
+        "status": "healthy",
+        "reason": closed.reason,
+        "incident": incident.id,
+        "heartbeat_id": incident.heartbeat_id,
+    }
+
+
+def update_restart_policy(
+    action: str,
+    *,
+    incident_id: str | None,
+    store: bridge.IncidentStore | None = None,
+    policy: codex.RestartPolicyStore | None = None,
+) -> dict[str, Any]:
+    policy_store = policy or codex.RestartPolicyStore(BRIDGE_STATE / "config.json")
+    if action == "status":
+        return {"status": "restart-policy", **policy_store.load()}
+    if action == "disable":
+        return {"status": "restart-policy", **policy_store.write(False)}
+    if not incident_id:
+        return {"status": "restart-policy-blocked", "reason": "incident-required"}
+    incident_store = store or bridge.IncidentStore(INCIDENTS)
+    try:
+        incident = incident_store.load(incident_id)
+    except (OSError, ValueError):
+        return {"status": "restart-policy-blocked", "reason": "incident-missing"}
+    if incident.state != "closed-healthy" or not incident.dogfood_restart:
+        return {
+            "status": "restart-policy-blocked",
+            "reason": "successful-dogfood-required",
+        }
+    return {"status": "restart-policy", **policy_store.write(True)}
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -374,7 +662,42 @@ def _parser() -> argparse.ArgumentParser:
         if name == "status":
             command.add_argument("--probe", action="store_true")
         else:
-            command.add_argument("--thread-id", default=os.environ.get("CODEX_THREAD_ID", ""))
+            command.add_argument(
+                "--thread-id", default=os.environ.get("CODEX_THREAD_ID", "")
+            )
+    attest = subparsers.add_parser("attest-restart")
+    attest.add_argument("root")
+    attest.add_argument("--incident", required=True)
+    attest.add_argument("--thread-id", required=True)
+    attest.add_argument("--host-id", required=True)
+    attest.add_argument("--active-thread", action="append", default=[])
+    attest.add_argument("--active-child", action="append", default=[])
+    attest.add_argument("--unknown-thread", action="append", default=[])
+    attest.add_argument("--unavailable-host", action="append", default=[])
+    attest.add_argument("--observed-at", required=True)
+    attest.add_argument("--heartbeat-id", required=True)
+    attest.add_argument("--heartbeat-target", required=True)
+    attest.add_argument("--heartbeat-next-run", required=True)
+    attest.add_argument("--heartbeat-enabled", action="store_true")
+    attest.add_argument("--json", action="store_true")
+    prepare = subparsers.add_parser("prepare-restart")
+    prepare.add_argument("root")
+    prepare.add_argument("--incident", required=True)
+    prepare.add_argument("--thread-id", required=True)
+    prepare.add_argument("--dogfood", action="store_true")
+    prepare.add_argument("--json", action="store_true")
+    resume = subparsers.add_parser("resume")
+    resume.add_argument("root")
+    resume.add_argument("--incident", required=True)
+    resume.add_argument("--thread-id", required=True)
+    resume.add_argument(
+        "--reported-tools", choices=("present", "missing"), required=True
+    )
+    resume.add_argument("--json", action="store_true")
+    policy = subparsers.add_parser("restart-policy")
+    policy.add_argument("action", choices=("status", "enable", "disable"))
+    policy.add_argument("--incident")
+    policy.add_argument("--json", action="store_true")
     return parser
 
 
@@ -392,11 +715,49 @@ def main(argv: Sequence[str] | None = None) -> int:
                 reported_tools=args.reported_tools,
                 probe=args.probe,
             )
-        else:
+        elif args.command == "recover":
             report = recover_bridge(
                 Path(args.root),
                 reported_tools=args.reported_tools,
                 thread_id=args.thread_id,
+            )
+        elif args.command == "attest-restart":
+            report = attest_restart(
+                Path(args.root),
+                incident_id=args.incident,
+                current_thread=args.thread_id,
+                host_id=args.host_id,
+                active_threads=args.active_thread,
+                active_children=args.active_child,
+                unknown_threads=args.unknown_thread,
+                unavailable_hosts=args.unavailable_host,
+                observed_at=datetime.fromisoformat(args.observed_at),
+                heartbeat={
+                    "id": args.heartbeat_id,
+                    "target_thread_id": args.heartbeat_target,
+                    "enabled": args.heartbeat_enabled,
+                    "next_run": datetime.fromisoformat(args.heartbeat_next_run),
+                    "incident": args.incident,
+                },
+            )
+        elif args.command == "prepare-restart":
+            report = prepare_restart(
+                Path(args.root),
+                incident_id=args.incident,
+                current_thread=args.thread_id,
+                dogfood=args.dogfood,
+            )
+        elif args.command == "resume":
+            report = resume_bridge(
+                Path(args.root),
+                incident_id=args.incident,
+                current_thread=args.thread_id,
+                reported_tools=args.reported_tools,
+            )
+        else:
+            report = update_restart_policy(
+                args.action,
+                incident_id=args.incident,
             )
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
         report = {
@@ -410,7 +771,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(report, indent=2, sort_keys=True))
     else:
         _print_human(report)
-    return 0 if report["status"] in {"healthy", "harbor-repaired"} else 1
+    success = {
+        "healthy",
+        "harbor-repaired",
+        "restart-attested",
+        "restart-prepared",
+        "restart-policy",
+    }
+    return 0 if report["status"] in success else 1
 
 
 if __name__ == "__main__":

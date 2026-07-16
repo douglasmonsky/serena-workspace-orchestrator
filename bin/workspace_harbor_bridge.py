@@ -117,6 +117,7 @@ class BridgeIncident:
     restart_attempted: bool
     heartbeat_id: str | None
     reason: str
+    dogfood_restart: bool = False
     schema_version: int = INCIDENT_SCHEMA_VERSION
 
 
@@ -393,6 +394,7 @@ class IncidentStore:
         reason: str | None = None,
         restart_attempted: bool | None = None,
         heartbeat_id: str | None = None,
+        dogfood_restart: bool | None = None,
     ) -> BridgeIncident:
         if next_state not in ALLOWED_INCIDENT_TRANSITIONS.get(expected, frozenset()):
             raise ValueError("invalid incident transition")
@@ -412,6 +414,11 @@ class IncidentStore:
                 ),
                 heartbeat_id=(
                     current.heartbeat_id if heartbeat_id is None else heartbeat_id
+                ),
+                dogfood_restart=(
+                    current.dogfood_restart
+                    if dogfood_restart is None
+                    else dogfood_restart
                 ),
             )
             self._write_locked(updated)
