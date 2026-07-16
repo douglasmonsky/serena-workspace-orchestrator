@@ -859,11 +859,56 @@ class SerenaWorktreeBrokerTests(unittest.TestCase):
         with mock.patch.object(broker, "INTELLIJ_LAUNCHER", launcher), mock.patch.object(
             broker, "INTELLIJ_LAUNCH_TIMEOUT_SECONDS", 1
         ), mock.patch.object(
+            broker, "OPENER_BOOTSTRAP_TIMEOUT_SECONDS", 10
+        ), mock.patch.object(
+            broker, "OPENER_OPERATION_TIMEOUT_SECONDS", 20
+        ), mock.patch.object(
+            broker, "OPENER_QUEUE_TIMEOUT_SECONDS", 30
+        ), mock.patch.object(
+            broker, "OPENER_READY_TIMEOUT_SECONDS", 40
+        ), mock.patch.object(
             broker.subprocess, "run", return_value=completed
         ) as run:
+            self.assertEqual(120, broker.minimum_intellij_opener_timeout())
             broker._open_intellij(Path("/tmp/example"))
 
-        self.assertGreaterEqual(run.call_args.kwargs["timeout"], 2050)
+        self.assertEqual(120, run.call_args.kwargs["timeout"])
+
+    def test_intellij_launcher_preserves_sanitized_queue_failure(self) -> None:
+        launcher = Path(self.temporary_directory.name) / "open-intellij"
+        launcher.write_text("fixture", encoding="utf-8")
+        for phase in (
+            "operation-deadline",
+            "queue-deadline",
+            "readiness-deadline",
+        ):
+            packet = {
+                "status": "failed",
+                "phase": phase,
+                "maximum_queue_position": 4,
+                "queue_wait_seconds": 2.5,
+                "launch_seconds": 0.25,
+            }
+            completed = mock.Mock(
+                returncode=1,
+                stdout="WORKSPACE_HARBOR_RESULT " + json.dumps(packet) + "\n",
+                stderr="private-root=/secret pid=999 request=other",
+            )
+            with self.subTest(phase=phase), mock.patch.object(
+                broker, "INTELLIJ_LAUNCHER", launcher
+            ), mock.patch.object(
+                broker.subprocess, "run", return_value=completed
+            ):
+                with self.assertRaises(RuntimeError) as raised:
+                    broker._open_intellij(Path("/tmp/example"))
+
+            message = str(raised.exception)
+            self.assertIn(phase, message)
+            self.assertIn("maximum_queue_position=4", message)
+            self.assertIn("queue_wait_seconds=2.5", message)
+            self.assertNotIn("/secret", message)
+            self.assertNotIn("pid=999", message)
+            self.assertNotIn("request=other", message)
 
     def test_untracked_service_cleanup_escalates_and_reaps(self) -> None:
         process = mock.Mock(pid=43210)

@@ -90,28 +90,80 @@ OPENER_BOOTSTRAP_TIMEOUT_SECONDS = float(
 OPENER_READY_TIMEOUT_SECONDS = float(
     os.environ.get("INTELLIJ_SERENA_READY_TIMEOUT", "120")
 )
-OPENER_LOCK_TIMEOUT_SECONDS = float(
-    os.environ.get("INTELLIJ_OPENER_LOCK_TIMEOUT", "30")
+OPENER_OPERATION_TIMEOUT_SECONDS = float(
+    os.environ.get("INTELLIJ_OPENER_OPERATION_TIMEOUT", "300")
 )
-MIN_INTELLIJ_LAUNCH_TIMEOUT_SECONDS = (
-    OPENER_BOOTSTRAP_TIMEOUT_SECONDS
-    + 10
-    + OPENER_LOCK_TIMEOUT_SECONDS
-    + OPENER_READY_TIMEOUT_SECONDS
-    + 30
+OPENER_QUEUE_TIMEOUT_SECONDS = float(
+    os.environ.get("INTELLIJ_OPENER_QUEUE_TIMEOUT", "300")
 )
+
+
+def minimum_intellij_opener_timeout() -> float:
+    return (
+        OPENER_BOOTSTRAP_TIMEOUT_SECONDS
+        + 10
+        + OPENER_OPERATION_TIMEOUT_SECONDS
+        + OPENER_QUEUE_TIMEOUT_SECONDS
+        + OPENER_READY_TIMEOUT_SECONDS
+        + 10
+    )
+
+
 INTELLIJ_LAUNCH_TIMEOUT_SECONDS = float(
     os.environ.get(
         "SERENA_BROKER_INTELLIJ_LAUNCH_TIMEOUT",
-        str(MIN_INTELLIJ_LAUNCH_TIMEOUT_SECONDS),
+        str(minimum_intellij_opener_timeout()),
     )
 )
+OPENER_RESULT_PREFIX = "WORKSPACE_HARBOR_RESULT "
+ALLOWED_OPENER_PHASES = {
+    "operation-deadline",
+    "queue-deadline",
+    "readiness-deadline",
+    "trust-failed",
+    "launch-failed",
+    "state-invalid",
+}
 THREAD_ID_PATTERN = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
 LEGACY_PROCESS_OWNER_PATTERN = re.compile(r"^manual-pid-([1-9][0-9]*)$")
 MAX_SESSION_META_BYTES = 65_536
 MAX_LINEAGE_DEPTH = 8
+
+
+def _opener_result(completed: subprocess.CompletedProcess[str]) -> dict[str, Any]:
+    for line in reversed(completed.stdout.splitlines()):
+        if not line.startswith(OPENER_RESULT_PREFIX):
+            continue
+        try:
+            payload = json.loads(line.removeprefix(OPENER_RESULT_PREFIX))
+        except json.JSONDecodeError:
+            return {}
+        if not isinstance(payload, dict) or payload.get("phase") not in ALLOWED_OPENER_PHASES:
+            return {}
+        maximum_position = payload.get("maximum_queue_position", 0)
+        queue_wait = payload.get("queue_wait_seconds", 0)
+        launch_seconds = payload.get("launch_seconds", 0)
+        if (
+            not isinstance(maximum_position, int)
+            or isinstance(maximum_position, bool)
+            or not 0 <= maximum_position <= 100_000
+            or not isinstance(queue_wait, (int, float))
+            or isinstance(queue_wait, bool)
+            or not 0 <= float(queue_wait) <= 100_000
+            or not isinstance(launch_seconds, (int, float))
+            or isinstance(launch_seconds, bool)
+            or not 0 <= float(launch_seconds) <= 100_000
+        ):
+            return {}
+        return {
+            "phase": payload["phase"],
+            "maximum_queue_position": maximum_position,
+            "queue_wait_seconds": queue_wait,
+            "launch_seconds": launch_seconds,
+        }
+    return {}
 
 
 @dataclass(frozen=True)
@@ -615,10 +667,23 @@ def _open_intellij(project_root: Path) -> None:
         text=True,
         timeout=max(
             INTELLIJ_LAUNCH_TIMEOUT_SECONDS,
-            MIN_INTELLIJ_LAUNCH_TIMEOUT_SECONDS,
+            minimum_intellij_opener_timeout(),
         ),
     )
     if result.returncode != 0:
+        opener_result = _opener_result(result)
+        if opener_result:
+            metrics = ", ".join(
+                f"{key}={opener_result[key]}"
+                for key in (
+                    "maximum_queue_position",
+                    "queue_wait_seconds",
+                    "launch_seconds",
+                )
+            )
+            raise RuntimeError(
+                f"failed to open IntelliJ project: {opener_result['phase']} ({metrics})"
+            )
         message = result.stderr.strip() or result.stdout.strip()
         raise RuntimeError(f"failed to open IntelliJ project: {message}")
 

@@ -365,6 +365,49 @@ class SerenaProjectDoctorTests(unittest.TestCase):
         self.assertEqual(2, audit.call_count)
         self.assertEqual([str(opener), str(self.root)], run.call_args.args[0])
 
+    def test_recovery_preserves_queued_opener_failure_classification(self) -> None:
+        initial = {
+            "jetbrains_semantic_health": {"status": "missing"},
+            "recommended_action": "open it",
+        }
+        opener = Path(self.temporary_directory.name) / "opener"
+        opener.write_text("fixture", encoding="utf-8")
+        metrics = {
+            "maximum_queue_position": 3,
+            "queue_wait_seconds": 1.25,
+            "launch_seconds": 0.5,
+        }
+        for phase in (
+            "operation-deadline",
+            "queue-deadline",
+            "readiness-deadline",
+        ):
+            packet = {"status": "failed", "phase": phase, **metrics}
+            completed = subprocess.CompletedProcess(
+                args=[],
+                returncode=1,
+                stdout="WORKSPACE_HARBOR_RESULT " + json.dumps(packet) + "\n",
+                stderr="private-root=/secret pid=999 request=other",
+            )
+            with self.subTest(phase=phase), mock.patch.object(
+                doctor, "OPENER", opener
+            ), mock.patch.object(
+                doctor, "audit", return_value=initial
+            ), mock.patch.object(
+                doctor.subprocess, "run", return_value=completed
+            ):
+                report = doctor.recover_serena(self.root)
+
+            self.assertEqual(phase, report["recovery"]["status"])
+            self.assertEqual(
+                {"phase": phase, **metrics},
+                report["recovery"]["action_result"],
+            )
+            rendered = json.dumps(report)
+            self.assertNotIn("/secret", rendered)
+            self.assertNotIn("pid=999", rendered)
+            self.assertNotIn("request=other", rendered)
+
     def test_opener_timeout_exceeds_bootstrap_and_ready_timeouts(self) -> None:
         opener = Path(self.temporary_directory.name) / "opener"
         opener.write_text("fixture", encoding="utf-8")
@@ -376,11 +419,20 @@ class SerenaProjectDoctorTests(unittest.TestCase):
         ), mock.patch.object(
             doctor, "OPENER_TIMEOUT_SECONDS", 1
         ), mock.patch.object(
+            doctor, "OPENER_BOOTSTRAP_TIMEOUT_SECONDS", 10
+        ), mock.patch.object(
+            doctor, "OPENER_OPERATION_TIMEOUT_SECONDS", 20
+        ), mock.patch.object(
+            doctor, "OPENER_QUEUE_TIMEOUT_SECONDS", 30
+        ), mock.patch.object(
+            doctor, "OPENER_READY_TIMEOUT_SECONDS", 40
+        ), mock.patch.object(
             doctor.subprocess, "run", return_value=completed
         ) as run:
+            self.assertEqual(120, doctor.minimum_intellij_opener_timeout())
             doctor._open_exact_project(self.root)
 
-        self.assertGreaterEqual(run.call_args.kwargs["timeout"], 2050)
+        self.assertEqual(120, run.call_args.kwargs["timeout"])
 
     def test_recovery_waits_for_indexing_then_retries_once(self) -> None:
         stalled = {
