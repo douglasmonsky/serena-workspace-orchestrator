@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
+from datetime import datetime, timezone
 import fcntl
 import hashlib
 import json
@@ -19,6 +20,7 @@ import uuid
 
 
 BRIDGE_SCHEMA_VERSION = 1
+INCIDENT_SCHEMA_VERSION = 1
 DEFAULT_JOURNAL_MAX_BYTES = 524_288
 DEFAULT_JOURNAL_BACKUPS = 4
 MAX_REASON_LENGTH = 96
@@ -26,6 +28,7 @@ HEX_20 = re.compile(r"^[0-9a-f]{20}$")
 HEX_24 = re.compile(r"^[0-9a-f]{24}$")
 HEX_32 = re.compile(r"^[0-9a-f]{32}$")
 REASON_CODE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 ALLOWED_OWNER_SOURCES = frozenset(
     {"explicit", "root-thread", "subagent-lineage", "codex-host", "process-fallback"}
 )
@@ -48,6 +51,25 @@ ALLOWED_OUTCOMES = frozenset({"ok", "failed", "protected", "unavailable"})
 EXPECTED_SERENA_TOOLS = frozenset(
     {"initial_instructions", "activate_project", "get_symbols_overview"}
 )
+INCIDENT_STATES = frozenset(
+    {
+        "diagnosing",
+        "restart-eligible",
+        "restart-prepared",
+        "resume-pending",
+        "closed-healthy",
+        "closed-blocked",
+        "closed-fresh-task-required",
+    }
+)
+ALLOWED_INCIDENT_TRANSITIONS = {
+    "diagnosing": frozenset(
+        {"restart-eligible", "closed-healthy", "closed-blocked"}
+    ),
+    "restart-eligible": frozenset({"restart-prepared", "closed-blocked"}),
+    "restart-prepared": frozenset({"resume-pending", "closed-blocked"}),
+    "resume-pending": frozenset({"closed-healthy", "closed-fresh-task-required"}),
+}
 
 
 @dataclass(frozen=True)
@@ -81,6 +103,21 @@ class HandshakeResult:
     expected_tool_found: bool
     proxy_exit: int | None
     process_pid: int | None = None
+
+
+@dataclass(frozen=True)
+class BridgeIncident:
+    id: str
+    root: str
+    root_digest: str
+    thread_id: str
+    created_at: str
+    updated_at: str
+    state: str
+    restart_attempted: bool
+    heartbeat_id: str | None
+    reason: str
+    schema_version: int = INCIDENT_SCHEMA_VERSION
 
 
 def root_digest(root: Path) -> str:
@@ -193,6 +230,203 @@ class BridgeJournal:
                 if event.root_digest == expected:
                     records.append(asdict(event))
         return records[-limit:]
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _validate_incident(incident: BridgeIncident) -> None:
+    if incident.schema_version != INCIDENT_SCHEMA_VERSION:
+        raise ValueError("invalid incident schema version")
+    if HEX_32.fullmatch(incident.id) is None:
+        raise ValueError("invalid incident id")
+    if HEX_24.fullmatch(incident.root_digest) is None:
+        raise ValueError("invalid incident root digest")
+    if not incident.root or "\n" in incident.root:
+        raise ValueError("invalid incident root")
+    if SAFE_ID.fullmatch(incident.thread_id) is None:
+        raise ValueError("invalid incident thread")
+    if incident.state not in INCIDENT_STATES:
+        raise ValueError("invalid incident state")
+    for timestamp in (incident.created_at, incident.updated_at):
+        try:
+            parsed = datetime.fromisoformat(timestamp)
+        except ValueError as error:
+            raise ValueError("invalid incident timestamp") from error
+        if parsed.tzinfo is None:
+            raise ValueError("invalid incident timestamp")
+    if not REASON_CODE.fullmatch(incident.reason):
+        raise ValueError("invalid incident reason")
+    if (
+        incident.heartbeat_id is not None
+        and SAFE_ID.fullmatch(incident.heartbeat_id) is None
+    ):
+        raise ValueError("invalid incident heartbeat")
+
+
+class IncidentStore:
+    """Private, atomic state for one guarded Codex bridge-recovery attempt."""
+
+    def __init__(self, state_dir: Path) -> None:
+        self.state_dir = state_dir
+        self.lock_path = state_dir / ".lock"
+
+    def path_for(self, incident_id: str) -> Path:
+        if HEX_32.fullmatch(incident_id) is None:
+            raise ValueError("invalid incident id")
+        return self.state_dir / f"{incident_id}.json"
+
+    def _ensure_directory(self) -> None:
+        self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.state_dir, 0o700)
+
+    def _lock(self):
+        self._ensure_directory()
+        lock = self.lock_path.open("a+", encoding="utf-8")
+        os.chmod(self.lock_path, 0o600)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        return lock
+
+    @staticmethod
+    def _decode(path: Path) -> BridgeIncident:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            incident = BridgeIncident(**payload)
+        except (OSError, json.JSONDecodeError, TypeError) as error:
+            raise ValueError("invalid incident record") from error
+        _validate_incident(incident)
+        return incident
+
+    def _write_locked(self, incident: BridgeIncident) -> None:
+        _validate_incident(incident)
+        path = self.path_for(incident.id)
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                json.dump(asdict(incident), stream, separators=(",", ":"), sort_keys=True)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+            os.chmod(path, 0o600)
+            directory = os.open(self.state_dir, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+    def load(self, incident_id: str) -> BridgeIncident:
+        with self._lock():
+            return self._decode(self.path_for(incident_id))
+
+    def create(
+        self,
+        root: Path,
+        thread_id: str,
+        state: str,
+        reason: str,
+    ) -> BridgeIncident:
+        canonical = root.expanduser().resolve(strict=False)
+        now = _utc_now()
+        incident = BridgeIncident(
+            id=uuid.uuid4().hex,
+            root=str(canonical),
+            root_digest=root_digest(canonical),
+            thread_id=thread_id,
+            created_at=now,
+            updated_at=now,
+            state=state,
+            restart_attempted=False,
+            heartbeat_id=None,
+            reason=reason,
+        )
+        with self._lock():
+            self._write_locked(incident)
+        return incident
+
+    def create_or_reuse_restart(
+        self, root: Path, thread_id: str, reason: str
+    ) -> BridgeIncident:
+        canonical = str(root.expanduser().resolve(strict=False))
+        with self._lock():
+            for path in sorted(self.state_dir.glob("*.json")):
+                incident = self._decode(path)
+                if (
+                    incident.root == canonical
+                    and incident.thread_id == thread_id
+                    and incident.state == "restart-eligible"
+                ):
+                    return incident
+            now = _utc_now()
+            incident = BridgeIncident(
+                id=uuid.uuid4().hex,
+                root=canonical,
+                root_digest=root_digest(Path(canonical)),
+                thread_id=thread_id,
+                created_at=now,
+                updated_at=now,
+                state="restart-eligible",
+                restart_attempted=False,
+                heartbeat_id=None,
+                reason=reason,
+            )
+            self._write_locked(incident)
+            return incident
+
+    def transition(
+        self,
+        incident_id: str,
+        expected: str,
+        next_state: str,
+        *,
+        reason: str | None = None,
+        restart_attempted: bool | None = None,
+        heartbeat_id: str | None = None,
+    ) -> BridgeIncident:
+        if next_state not in ALLOWED_INCIDENT_TRANSITIONS.get(expected, frozenset()):
+            raise ValueError("invalid incident transition")
+        with self._lock():
+            current = self._decode(self.path_for(incident_id))
+            if current.state != expected:
+                raise ValueError("incident state changed")
+            updated = replace(
+                current,
+                state=next_state,
+                updated_at=_utc_now(),
+                reason=reason or current.reason,
+                restart_attempted=(
+                    current.restart_attempted
+                    if restart_attempted is None
+                    else restart_attempted
+                ),
+                heartbeat_id=(
+                    current.heartbeat_id if heartbeat_id is None else heartbeat_id
+                ),
+            )
+            self._write_locked(updated)
+            return updated
+
+    def close(
+        self, incident_id: str, terminal_state: str, *, reason: str
+    ) -> BridgeIncident:
+        current = self.load(incident_id)
+        return self.transition(
+            incident_id,
+            current.state,
+            terminal_state,
+            reason=reason,
+        )
 
 
 def parse_codex_mcp_get(output: str, expected_broker: Path) -> ConfigCheck:

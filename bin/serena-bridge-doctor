@@ -1,0 +1,417 @@
+#!/usr/bin/env python3
+"""Diagnose and repair the Codex-to-Serena task bridge without conflating layers."""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import asdict
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+from typing import Any, Sequence
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+import workspace_harbor_bridge as bridge  # noqa: E402
+
+
+CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+BROKER = Path(
+    os.environ.get(
+        "WORKSPACE_HARBOR_BROKER",
+        CODEX_HOME / "bin" / "serena-worktree-broker",
+    )
+)
+PROJECT_DOCTOR = Path(
+    os.environ.get(
+        "WORKSPACE_HARBOR_PROJECT_DOCTOR",
+        CODEX_HOME / "bin" / "serena-project-doctor",
+    )
+)
+BRIDGE_STATE = Path(
+    os.environ.get(
+        "WORKSPACE_HARBOR_BRIDGE_STATE",
+        CODEX_HOME / "state" / "serena-bridge",
+    )
+)
+INCIDENTS = BRIDGE_STATE / "incidents"
+SUBPROCESS_TIMEOUT_SECONDS = 45
+
+
+def _resolve_codex_cli() -> Path:
+    configured = os.environ.get("WORKSPACE_HARBOR_CODEX_CLI")
+    if configured:
+        return Path(configured).expanduser()
+    bundled = Path("/Applications/ChatGPT.app/Contents/Resources/codex")
+    if bundled.is_file():
+        return bundled
+    discovered = shutil.which("codex")
+    return Path(discovered) if discovered else Path("/missing/codex")
+
+
+def _run_json(command: Sequence[str], *, timeout: float) -> Any:
+    try:
+        completed = subprocess.run(
+            list(command),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return {"status": "unavailable", "reason": "command-timeout"}
+    except OSError:
+        return {"status": "unavailable", "reason": "command-failed"}
+    if completed.returncode != 0:
+        return {
+            "status": "unavailable",
+            "reason": f"command-exit-{completed.returncode}",
+        }
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        return {"status": "unavailable", "reason": "invalid-json"}
+    return payload
+
+
+def _configuration() -> bridge.ConfigCheck:
+    return bridge.check_codex_serena_config(_resolve_codex_cli(), BROKER)
+
+
+def _project_report(root: Path, *, recover: bool) -> dict[str, Any]:
+    command = [str(PROJECT_DOCTOR)]
+    if recover:
+        command.append("--recover")
+    command.extend(("--json", str(root)))
+    payload = _run_json(command, timeout=SUBPROCESS_TIMEOUT_SECONDS)
+    return (
+        payload
+        if isinstance(payload, dict)
+        else {"status": "unavailable", "reason": "invalid-json"}
+    )
+
+
+def _repair_broker(root: Path) -> dict[str, Any]:
+    payload = _run_json(
+        [str(BROKER), "repair-root", str(root), "--json"],
+        timeout=15,
+    )
+    return (
+        payload
+        if isinstance(payload, dict)
+        else {"status": "unavailable", "reason": "invalid-json"}
+    )
+
+
+def _broker_evidence(root: Path) -> dict[str, Any]:
+    canonical = str(root.expanduser().resolve(strict=False))
+    owner = _run_json([str(BROKER), "owner", "--json"], timeout=5)
+    services = _run_json([str(BROKER), "status", "--json"], timeout=5)
+    matching = []
+    if isinstance(services, list):
+        matching = [
+            item
+            for item in services
+            if isinstance(item, dict) and item.get("project_root") == canonical
+        ]
+    return {
+        "owner_source": (
+            owner.get("source", "unknown") if isinstance(owner, dict) else "unknown"
+        ),
+        "owner_reason": (
+            owner.get("reason") if isinstance(owner, dict) else "invalid-json"
+        ),
+        "matching_services": len(matching),
+        "healthy_services": sum(item.get("healthy") is True for item in matching),
+        "live_leases": sum(
+            item.get("leases", 0)
+            for item in matching
+            if isinstance(item.get("leases", 0), int)
+        ),
+    }
+
+
+def _handshake(root: Path) -> bridge.HandshakeResult:
+    journal = bridge.BridgeJournal(BRIDGE_STATE)
+    return bridge.run_handshake(root, BROKER, journal=journal)
+
+
+def _semantic_status(project: dict[str, Any]) -> str:
+    semantic = project.get("jetbrains_semantic_health")
+    if isinstance(semantic, dict):
+        return str(semantic.get("status", "unknown"))
+    return str(project.get("semantic_health", "unknown"))
+
+
+def build_status(
+    *,
+    root: Path,
+    reported_tools: str,
+    config: bridge.ConfigCheck,
+    project: dict[str, Any],
+    handshake: bridge.HandshakeResult | None,
+) -> dict[str, Any]:
+    backend = (
+        "backend-healthy"
+        if _semantic_status(project) == "healthy"
+        else "backend-unhealthy"
+    )
+    if handshake is None:
+        handshake_state = "handshake-unverified"
+    elif handshake.status == "healthy":
+        handshake_state = "handshake-healthy"
+    else:
+        handshake_state = "handshake-unhealthy"
+    exposure = f"task-tools-{reported_tools}"
+    report: dict[str, Any] = {
+        "status": "unknown",
+        "reason": "unclassified",
+        "root": str(root.expanduser().resolve(strict=False)),
+        "backend": backend,
+        "handshake": handshake_state,
+        "task_exposure": exposure,
+        "incident": None,
+        "next_action": "inspect-bridge-status",
+    }
+    if config.status != "healthy":
+        report.update(
+            status="configuration-invalid",
+            reason=f"config-{config.reason}",
+            next_action="repair-codex-config",
+        )
+    elif backend != "backend-healthy":
+        report.update(
+            status="backend-unhealthy",
+            reason=f"semantic-{_semantic_status(project)}",
+            next_action="recover-serena-project",
+        )
+    elif handshake_state == "handshake-unhealthy":
+        assert handshake is not None
+        report.update(
+            status="handshake-unhealthy",
+            reason=handshake.reason,
+            next_action="repair-harbor-state",
+        )
+    elif handshake_state == "handshake-unverified":
+        report.update(
+            status="handshake-unverified",
+            reason="probe-not-run",
+            next_action="run-bridge-probe",
+        )
+    elif reported_tools == "missing":
+        report.update(
+            status="restart-eligible",
+            reason="handshake-healthy-task-tools-missing",
+            next_action="prepare-guarded-restart",
+        )
+    elif reported_tools == "unknown":
+        report.update(
+            status="exposure-unverified",
+            reason="task-tools-not-reported",
+            next_action="report-task-tool-exposure",
+        )
+    else:
+        report.update(
+            status="healthy",
+            reason="all-layers-healthy",
+            next_action="none",
+        )
+    return report
+
+
+def status_bridge(
+    root: Path,
+    *,
+    reported_tools: str,
+    probe: bool,
+) -> dict[str, Any]:
+    canonical = root.expanduser().resolve()
+    config = _configuration()
+    project = _project_report(canonical, recover=False)
+    handshake = _handshake(canonical) if probe else None
+    report = build_status(
+        root=canonical,
+        reported_tools=reported_tools,
+        config=config,
+        project=project,
+        handshake=handshake,
+    )
+    report["config"] = {"status": config.status, "reason": config.reason}
+    report["project_semantics"] = _semantic_status(project)
+    report["broker"] = _broker_evidence(canonical)
+    report["recent_events"] = bridge.BridgeJournal(BRIDGE_STATE).recent(
+        canonical, limit=12
+    )
+    if handshake is not None:
+        report["probe"] = {
+            key: value
+            for key, value in asdict(handshake).items()
+            if key != "process_pid"
+        }
+    return report
+
+
+def _repaired_report(report: dict[str, Any]) -> dict[str, Any]:
+    updated = dict(report)
+    updated.update(
+        status="harbor-repaired",
+        reason="lower-layer-repaired",
+        incident=None,
+        next_action="recheck-task-tools",
+    )
+    return updated
+
+
+def recover_bridge(
+    root: Path,
+    *,
+    reported_tools: str,
+    thread_id: str,
+    store: bridge.IncidentStore | None = None,
+) -> dict[str, Any]:
+    canonical = root.expanduser().resolve()
+    if reported_tools != "missing":
+        return {
+            "status": "invalid-state",
+            "reason": "recover-requires-missing-tools",
+            "root": str(canonical),
+            "next_action": "run-status",
+        }
+    incident_store = store or bridge.IncidentStore(INCIDENTS)
+    config = _configuration()
+    if config.status != "healthy":
+        return build_status(
+            root=canonical,
+            reported_tools=reported_tools,
+            config=config,
+            project={"semantic_health": "unknown"},
+            handshake=None,
+        )
+    project = _project_report(canonical, recover=False)
+    project_changed = False
+    if _semantic_status(project) != "healthy":
+        project = _project_report(canonical, recover=True)
+        project_changed = True
+        if _semantic_status(project) != "healthy":
+            return build_status(
+                root=canonical,
+                reported_tools=reported_tools,
+                config=config,
+                project=project,
+                handshake=None,
+            )
+    handshake = _handshake(canonical)
+    if project_changed and handshake.status == "healthy":
+        return _repaired_report(
+            build_status(
+                root=canonical,
+                reported_tools=reported_tools,
+                config=config,
+                project=project,
+                handshake=handshake,
+            )
+        )
+    if handshake.status != "healthy":
+        repair = _repair_broker(canonical)
+        if repair.get("status") != "repaired":
+            return build_status(
+                root=canonical,
+                reported_tools=reported_tools,
+                config=config,
+                project=project,
+                handshake=handshake,
+            )
+        handshake = _handshake(canonical)
+        if handshake.status == "healthy":
+            return _repaired_report(
+                build_status(
+                    root=canonical,
+                    reported_tools=reported_tools,
+                    config=config,
+                    project=project,
+                    handshake=handshake,
+                )
+            )
+    report = build_status(
+        root=canonical,
+        reported_tools=reported_tools,
+        config=config,
+        project=project,
+        handshake=handshake,
+    )
+    if report["status"] == "restart-eligible":
+        if not thread_id:
+            report.update(
+                status="restart-blocked",
+                reason="thread-id-missing",
+                next_action="provide-thread-id",
+            )
+            return report
+        incident = incident_store.create_or_reuse_restart(
+            canonical, thread_id, "task-tools-missing"
+        )
+        report["incident"] = incident.id
+    return report
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    for name in ("status", "recover"):
+        command = subparsers.add_parser(name)
+        command.add_argument("root")
+        command.add_argument(
+            "--reported-tools",
+            choices=("present", "missing", "unknown"),
+            required=True,
+        )
+        command.add_argument("--json", action="store_true")
+        if name == "status":
+            command.add_argument("--probe", action="store_true")
+        else:
+            command.add_argument("--thread-id", default=os.environ.get("CODEX_THREAD_ID", ""))
+    return parser
+
+
+def _print_human(report: dict[str, Any]) -> None:
+    print(report["status"])
+    print(f"Next action: {report.get('next_action', 'inspect-bridge-status')}")
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    try:
+        if args.command == "status":
+            report = status_bridge(
+                Path(args.root),
+                reported_tools=args.reported_tools,
+                probe=args.probe,
+            )
+        else:
+            report = recover_bridge(
+                Path(args.root),
+                reported_tools=args.reported_tools,
+                thread_id=args.thread_id,
+            )
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+        report = {
+            "status": "unavailable",
+            "reason": "doctor-failed",
+            "next_action": "inspect-local-state",
+        }
+        if os.environ.get("WORKSPACE_HARBOR_DEBUG") == "1":
+            report["debug_type"] = type(error).__name__
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        _print_human(report)
+    return 0 if report["status"] in {"healthy", "harbor-repaired"} else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
