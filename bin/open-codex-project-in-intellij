@@ -10,12 +10,20 @@ ready_interval="${INTELLIJ_SERENA_READY_INTERVAL:-1}"
 ready_timeout="${INTELLIJ_SERENA_READY_TIMEOUT:-120}"
 opener_state_dir="${INTELLIJ_OPENER_STATE_DIR:-$HOME/.codex/state/intellij-projects}"
 opener_lock_dir="$opener_state_dir/opener.lock"
-opener_lock_timeout="${INTELLIJ_OPENER_LOCK_TIMEOUT:-30}"
+coordinator_command="${WORKSPACE_HARBOR_OPENER_QUEUE_COMMAND:-$HOME/.codex/bin/workspace_harbor_opener_queue.py}"
+operation_allowance="${INTELLIJ_OPENER_OPERATION_TIMEOUT:-300}"
+queue_allowance="${INTELLIJ_OPENER_QUEUE_TIMEOUT:-300}"
+launch_command_timeout="${INTELLIJ_OPENER_LAUNCH_COMMAND_TIMEOUT:-30}"
 reaper_command="${INTELLIJ_PROJECT_REAPER_COMMAND:-$HOME/.codex/bin/intellij-project-reaper}"
 model_ready_command="${INTELLIJ_MODEL_READY_COMMAND:-$reaper_command}"
 project_trust_command="${INTELLIJ_PROJECT_TRUST_COMMAND:-$HOME/.codex/bin/intellij-project-trust}"
 bootstrap_command="${WORKSPACE_HARBOR_BOOTSTRAP_COMMAND:-$HOME/.codex/bin/workspace-harbor-bootstrap}"
 bootstrap_opener_timeout="${WORKSPACE_HARBOR_BOOTSTRAP_OPENER_TIMEOUT_SECONDS:-1860}"
+coordinator_active=false
+launch_claimed=false
+request_id=""
+owner_started=""
+overall_deadline=""
 
 usage() {
   print -u2 "Usage: open-codex-project-in-intellij [--require-github] [PROJECT_DIR]"
@@ -47,11 +55,68 @@ is_ready_in_intellij() {
   is_open_in_intellij "$dir" && is_model_ready "$dir"
 }
 
+launch_command_budget() {
+  local remaining
+  zmodload zsh/datetime
+  remaining=$(( overall_deadline - EPOCHREALTIME ))
+  (( remaining > 0 )) || return 1
+  if (( remaining < launch_command_timeout )); then
+    print -r -- "$remaining"
+  else
+    print -r -- "$launch_command_timeout"
+  fi
+}
+
+run_command_bounded() {
+  local timeout="$1"
+  shift
+  python3 - "$timeout" "$@" <<'PY'
+import math
+import os
+import signal
+import subprocess
+import sys
+
+try:
+    timeout = float(sys.argv[1])
+except ValueError:
+    raise SystemExit(2)
+if not math.isfinite(timeout) or timeout <= 0:
+    raise SystemExit(2)
+try:
+    process = subprocess.Popen(
+        sys.argv[2:],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+except OSError:
+    raise SystemExit(1)
+try:
+    raise SystemExit(process.wait(timeout=timeout))
+except subprocess.TimeoutExpired:
+    pass
+for group_signal, grace in ((signal.SIGTERM, 0.5), (signal.SIGKILL, 0.5)):
+    try:
+        os.killpg(process.pid, group_signal)
+    except ProcessLookupError:
+        break
+    try:
+        process.wait(timeout=grace)
+        break
+    except subprocess.TimeoutExpired:
+        continue
+raise SystemExit(124)
+PY
+}
+
 ensure_project_trusted() {
-  local dir="$1"
+  local dir="$1" timeout
 
   [[ -x "$project_trust_command" ]] || return 1
-  "$project_trust_command" allow "$dir"
+  timeout="$(launch_command_budget)" || return 1
+  run_command_bounded "$timeout" "$project_trust_command" allow "$dir"
 }
 
 format_bootstrap_diagnostic() {
@@ -244,61 +309,83 @@ prepare_project_dependencies() {
   return 0
 }
 
-release_opener_lock() {
-  if [[ -d "$opener_lock_dir" && -f "$opener_lock_dir/owner" ]] \
-      && grep -qx "pid=$$" "$opener_lock_dir/owner"; then
-    rm -f "$opener_lock_dir/owner"
-    rmdir "$opener_lock_dir" 2>/dev/null || true
+json_field() {
+  local packet="$1" field="$2"
+  python3 -c '
+import json
+import sys
+value = json.loads(sys.argv[1]).get(sys.argv[2])
+if value is True:
+    print("true")
+elif value is False:
+    print("false")
+elif value is not None:
+    print(value)
+' "$packet" "$field"
+}
+
+run_coordinator() {
+  python3 "$coordinator_command" "$@"
+}
+
+emit_result() {
+  local result_status="$1" phase="$2" maximum_position="${3:-0}"
+  local queue_wait="${4:-0}" launch_seconds="${5:-0}"
+  python3 -c '
+import json
+import sys
+packet = {
+    "status": sys.argv[1],
+    "phase": sys.argv[2],
+    "maximum_queue_position": int(float(sys.argv[3])),
+    "queue_wait_seconds": round(float(sys.argv[4]), 6),
+    "launch_seconds": round(float(sys.argv[5]), 6),
+}
+print("WORKSPACE_HARBOR_RESULT " + json.dumps(packet, sort_keys=True, separators=(",", ":")))
+' "$result_status" "$phase" "$maximum_position" "$queue_wait" "$launch_seconds"
+}
+
+release_launch_claim() {
+  local release_packet release_exit
+  [[ "$launch_claimed" == true ]] || return 0
+  if release_packet="$(run_coordinator launch-release \
+      --request-id "$request_id" --owner-pid "$$" --owner-start "$owner_started")"; then
+    launch_claimed=false
+    return 0
+  fi
+  release_exit=$?
+  fail_from_packet "$release_packet" "$release_exit"
+}
+
+cleanup_coordination() {
+  release_launch_claim >/dev/null 2>&1 || true
+  if [[ "$coordinator_active" == true ]]; then
+    run_coordinator release-all \
+      --request-id "$request_id" --owner-pid "$$" --owner-start "$owner_started" \
+      >/dev/null 2>&1 || true
+    coordinator_active=false
   fi
 }
 
-lock_owner_is_live() {
-  local owner_pid owner_started current_started current_command
-
-  owner_pid="$(sed -n 's/^pid=//p' "$opener_lock_dir/owner" 2>/dev/null || true)"
-  owner_started="$(sed -n 's/^process_started=//p' "$opener_lock_dir/owner" 2>/dev/null || true)"
-  [[ "$owner_pid" == <-> && -n "$owner_started" ]] || return 0
-  kill -0 "$owner_pid" 2>/dev/null || return 1
-  current_started="$(ps -p "$owner_pid" -o lstart= 2>/dev/null | sed 's/^ *//;s/ *$//' || true)"
-  current_command="$(ps -p "$owner_pid" -o command= 2>/dev/null || true)"
-  [[ "$current_started" == "$owner_started" \
-    && "$current_command" == *"open-codex-project-in-intellij"* ]]
-}
-
-acquire_opener_lock() {
-  local deadline process_started
-
-  zmodload zsh/datetime
-  mkdir -p -m 700 "$opener_state_dir"
-  deadline=$(( EPOCHREALTIME + opener_lock_timeout ))
-  while (( EPOCHREALTIME < deadline )); do
-    if mkdir -m 700 "$opener_lock_dir" 2>/dev/null; then
-      process_started="$(ps -p $$ -o lstart= | sed 's/^ *//;s/ *$//')"
-      {
-        print -r -- "pid=$$"
-        print -r -- "process_started=$process_started"
-        print -r -- "project_root=$project_dir"
-      } > "$opener_lock_dir/owner"
-      return 0
-    fi
-    if [[ -f "$opener_lock_dir/owner" ]] && ! lock_owner_is_live; then
-      rm -f "$opener_lock_dir/owner"
-      rmdir "$opener_lock_dir" 2>/dev/null || true
-      continue
-    fi
-    sleep 0.1
-  done
-
-  print -u2 "open-codex-project-in-intellij: timed out waiting for opener lock: $opener_lock_dir"
-  return 1
+fail_from_packet() {
+  local packet="$1" exit_code="$2" phase error
+  phase="$(json_field "$packet" phase 2>/dev/null || print state-invalid)"
+  error="$(json_field "$packet" error 2>/dev/null || print 'coordination failed')"
+  print -u2 "open-codex-project-in-intellij: ${phase}: ${error}"
+  emit_result failed "$phase"
+  return "$exit_code"
 }
 
 wait_for_serena_service() {
   local dir="$1"
-  local deadline
+  local deadline ready_deadline
 
   zmodload zsh/datetime
-  deadline=$(( EPOCHREALTIME + ready_timeout ))
+  ready_deadline=$(( EPOCHREALTIME + ready_timeout ))
+  deadline="$ready_deadline"
+  if [[ -n "$overall_deadline" ]] && (( overall_deadline < ready_deadline )); then
+    deadline="$overall_deadline"
+  fi
   while (( EPOCHREALTIME < deadline )); do
     if is_ready_in_intellij "$dir"; then
       print "open-codex-project-in-intellij: Serena service and native project model ready: $dir"
@@ -307,7 +394,7 @@ wait_for_serena_service() {
     sleep "$ready_interval"
   done
 
-  print -u2 "open-codex-project-in-intellij: timed out waiting for Serena service after ${ready_timeout}s: $dir"
+  print -u2 "open-codex-project-in-intellij: readiness-deadline after ${ready_timeout}s: $dir"
   return 1
 }
 
@@ -345,10 +432,12 @@ update_reaper_registry() {
 }
 
 open_new_intellij_window() {
-  local dir="$1"
+  local dir="$1" timeout
 
   if [[ -d "$intellij_app_path" && -x "$intellij_open_command" ]]; then
-    "$intellij_open_command" -a "$intellij_app_path" "$dir" >/dev/null 2>&1
+    timeout="$(launch_command_budget)" || return 1
+    run_command_bounded "$timeout" \
+      "$intellij_open_command" -a "$intellij_app_path" "$dir"
     return 0
   fi
 
@@ -383,7 +472,10 @@ if [[ ! -d "$project_dir" ]]; then
 fi
 
 project_dir="$(cd "$project_dir" && pwd -P)"
-trap release_opener_lock EXIT INT TERM HUP
+trap cleanup_coordination EXIT
+trap 'cleanup_coordination; exit 130' INT
+trap 'cleanup_coordination; exit 143' TERM
+trap 'cleanup_coordination; exit 129' HUP
 
 if [[ "$require_github" == true ]] && ! has_github_remote "$project_dir"; then
   print "open-codex-project-in-intellij: skipped, no GitHub remote found for $project_dir"
@@ -400,32 +492,112 @@ fi
 if is_ready_in_intellij "$project_dir"; then
   print "open-codex-project-in-intellij: already open in IntelliJ: $project_dir"
   update_reaper_registry touch "$project_dir" || exit 1
+  emit_result ready ready
   exit 0
 fi
 
-acquire_opener_lock || exit 2
+if [[ ! -f "$coordinator_command" ]]; then
+  print -u2 "open-codex-project-in-intellij: opener coordinator is unavailable: $coordinator_command"
+  emit_result failed state-invalid
+  exit 2
+fi
+
+zmodload zsh/datetime
+request_id="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+owner_started="$(ps -p $$ -o lstart= | sed 's/^ *//;s/ *$//')"
+overall_deadline=$(( EPOCHREALTIME + operation_allowance + queue_allowance + ready_timeout ))
+
+while true; do
+  if migration_packet="$(run_coordinator migrate-legacy "$opener_lock_dir")"; then
+    migration_status="$(json_field "$migration_packet" status)"
+  else
+    migration_exit=$?
+    fail_from_packet "$migration_packet" "$migration_exit"
+    exit $?
+  fi
+  [[ "$migration_status" == live ]] || break
+  if (( EPOCHREALTIME >= overall_deadline )); then
+    print -u2 "open-codex-project-in-intellij: operation-deadline waiting for legacy opener owner"
+    emit_result failed operation-deadline
+    exit 1
+  fi
+  sleep 0.1
+done
+
+if operation_packet="$(run_coordinator operation-acquire "$project_dir" \
+    --request-id "$request_id" --owner-pid "$$" --owner-start "$owner_started" \
+    --deadline "$overall_deadline")"; then
+  coordinator_active=true
+else
+  operation_exit=$?
+  fail_from_packet "$operation_packet" "$operation_exit"
+  exit $?
+fi
+
+if [[ "$(json_field "$operation_packet" joined)" == true ]]; then
+  print "open-codex-project-in-intellij: joined existing worktree open; wait=$(json_field "$operation_packet" wait_seconds)s"
+fi
 
 if is_ready_in_intellij "$project_dir"; then
   print "open-codex-project-in-intellij: already open in IntelliJ: $project_dir"
   update_reaper_registry touch "$project_dir" || exit 1
+  emit_result ready ready
+  exit 0
+fi
+
+if launch_packet="$(run_coordinator launch-acquire "$project_dir" \
+    --request-id "$request_id" --owner-pid "$$" --owner-start "$owner_started" \
+    --deadline "$overall_deadline")"; then
+  launch_claimed=true
+else
+  launch_exit=$?
+  fail_from_packet "$launch_packet" "$launch_exit"
+  exit $?
+fi
+queue_wait="$(json_field "$launch_packet" wait_seconds)"
+maximum_position="$(json_field "$launch_packet" maximum_position)"
+launch_started="$EPOCHREALTIME"
+
+if is_ready_in_intellij "$project_dir"; then
+  release_launch_claim
+  print "open-codex-project-in-intellij: already open in IntelliJ: $project_dir"
+  update_reaper_registry touch "$project_dir" || exit 1
+  emit_result ready ready "$maximum_position" "$queue_wait" 0
   exit 0
 fi
 
 if ! ensure_project_trusted "$project_dir"; then
+  release_launch_claim
   print -u2 "open-codex-project-in-intellij: failed to trust project before opening: $project_dir"
+  emit_result failed trust-failed "$maximum_position" "$queue_wait" 0
   exit 1
 fi
 
+if is_ready_in_intellij "$project_dir"; then
+  release_launch_claim
+  print "open-codex-project-in-intellij: already open in IntelliJ after trust: $project_dir"
+  update_reaper_registry touch "$project_dir" || exit 1
+  emit_result ready ready "$maximum_position" "$queue_wait" 0
+  exit 0
+fi
+
 if open_new_intellij_window "$project_dir"; then
+  launch_seconds=$(( EPOCHREALTIME - launch_started ))
+  release_launch_claim
+  print "open-codex-project-in-intellij: queued launch completed; max-position=${maximum_position}; queue-wait=${queue_wait}s; launch=${launch_seconds}s"
   print "open-codex-project-in-intellij: opened in a new IntelliJ window: $project_dir"
   if wait_for_serena_service "$project_dir"; then
     update_reaper_registry register "$project_dir" || exit 1
+    emit_result ready ready "$maximum_position" "$queue_wait" "$launch_seconds"
     exit 0
   else
     ready_status=$?
+    emit_result failed readiness-deadline "$maximum_position" "$queue_wait" "$launch_seconds"
     exit "$ready_status"
   fi
 fi
 
+release_launch_claim
 print -u2 "open-codex-project-in-intellij: IntelliJ launcher or app bundle not found"
+emit_result failed launch-failed "$maximum_position" "$queue_wait" 0
 exit 1

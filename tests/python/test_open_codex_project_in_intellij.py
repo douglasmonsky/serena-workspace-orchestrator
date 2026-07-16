@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -24,6 +25,10 @@ DEFAULT_BOOTSTRAP_COMMAND = Path(tempfile.gettempdir()) / "open-codex-project-in
 DEFAULT_BOOTSTRAP_COMMAND.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
 DEFAULT_BOOTSTRAP_COMMAND.chmod(0o755)
 os.environ.setdefault("WORKSPACE_HARBOR_BOOTSTRAP_COMMAND", str(DEFAULT_BOOTSTRAP_COMMAND))
+os.environ.setdefault(
+    "WORKSPACE_HARBOR_OPENER_QUEUE_COMMAND",
+    str(ROOT / "bin/workspace_harbor_opener_queue.py"),
+)
 
 
 class OpenCodexProjectInIntellijTests(unittest.TestCase):
@@ -94,6 +99,7 @@ class OpenCodexProjectInIntellijTests(unittest.TestCase):
             bin_dir.mkdir(parents=True)
             state_file = root / "status-count"
             open_log = root / "open-args"
+            service_ready = project / "service-ready"
 
             serena_codex = bin_dir / "serena-codex"
             serena_codex.write_text(
@@ -101,7 +107,7 @@ class OpenCodexProjectInIntellijTests(unittest.TestCase):
                 f"count=$(cat '{state_file}' 2>/dev/null || echo 0)\n"
                 "count=$((count + 1))\n"
                 f"printf '%s' \"$count\" > '{state_file}'\n"
-                "[ \"$count\" -ge 3 ]\n",
+                f"[ -f '{service_ready}' ]\n",
                 encoding="utf-8",
             )
             serena_codex.chmod(0o755)
@@ -109,7 +115,8 @@ class OpenCodexProjectInIntellijTests(unittest.TestCase):
             fake_open = root / "open"
             fake_open.write_text(
                 "#!/bin/sh\n"
-                f"printf '%s\\n' \"$@\" > '{open_log}'\n",
+                f"printf '%s\\n' \"$@\" > '{open_log}'\n"
+                f"touch '{service_ready}'\n",
                 encoding="utf-8",
             )
             fake_open.chmod(0o755)
@@ -197,7 +204,7 @@ class OpenCodexProjectInIntellijTests(unittest.TestCase):
             )
 
             self.assertEqual(1, result.returncode)
-            self.assertIn("timed out waiting for Serena service", result.stderr)
+            self.assertIn("readiness-deadline", result.stderr)
 
     def test_reclaims_lock_owned_by_a_dead_helper(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -212,6 +219,8 @@ class OpenCodexProjectInIntellijTests(unittest.TestCase):
             state_dir = root / "state"
             lock_dir = state_dir / "opener.lock"
             lock_dir.mkdir(parents=True)
+            state_dir.chmod(0o700)
+            lock_dir.chmod(0o700)
             owner = lock_dir / "owner"
             dead_helper = subprocess.Popen(["/bin/sh", "-c", "exit 0"])
             dead_helper.wait(timeout=5)
@@ -223,6 +232,7 @@ class OpenCodexProjectInIntellijTests(unittest.TestCase):
                 f"project_root={project.resolve()}\n",
                 encoding="utf-8",
             )
+            owner.chmod(0o600)
             open_log = root / "open-log"
             service_ready = project / "service-ready"
 
@@ -269,8 +279,11 @@ class OpenCodexProjectInIntellijTests(unittest.TestCase):
             project.mkdir()
             lock_dir = root / "state/opener.lock"
             lock_dir.mkdir(parents=True)
+            (root / "state").chmod(0o700)
+            lock_dir.chmod(0o700)
             owner = lock_dir / "owner"
             owner.write_text("not a valid owner record\n", encoding="utf-8")
+            owner.chmod(0o600)
             environment = os.environ.copy()
             environment.update(
                 {
@@ -285,7 +298,7 @@ class OpenCodexProjectInIntellijTests(unittest.TestCase):
             )
 
             self.assertEqual(2, result.returncode)
-            self.assertIn("timed out waiting for opener lock", result.stderr)
+            self.assertIn("legacy-state", result.stderr)
             self.assertTrue(owner.exists())
             self.assertEqual("not a valid owner record\n", owner.read_text())
 
@@ -294,75 +307,63 @@ class OpenCodexProjectInIntellijTests(unittest.TestCase):
             root = Path(temporary_directory)
             project = root / "project"
             project.mkdir()
-            fake_app = root / "IntelliJ IDEA.app"
-            fake_app.mkdir()
             fake_home = root / "home"
             bin_dir = fake_home / ".codex/bin"
             bin_dir.mkdir(parents=True)
-            probe_count = root / "probe-count"
-            probe_blocked = root / "probe-blocked"
-            open_log = root / "open-log"
-
             serena_codex = bin_dir / "serena-codex"
-            serena_codex.write_text(
-                "#!/bin/sh\n"
-                f"count=$(cat '{probe_count}' 2>/dev/null || echo 0)\n"
-                "count=$((count + 1))\n"
-                f"printf '%s' \"$count\" > '{probe_count}'\n"
-                "if [ \"$count\" -eq 2 ]; then\n"
-                f"  touch '{probe_blocked}'\n"
-                "  sleep 1\n"
-                "fi\n"
-                "exit 1\n",
-                encoding="utf-8",
-            )
+            serena_codex.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
             serena_codex.chmod(0o755)
-            fake_open = root / "open"
-            fake_open.write_text(
-                "#!/bin/sh\n"
-                f"printf 'open\\n' >> '{open_log}'\n",
+            state_dir = root / "state"
+            lock_dir = state_dir / "opener.lock"
+            lock_dir.mkdir(parents=True)
+            state_dir.chmod(0o700)
+            lock_dir.chmod(0o700)
+            live_owner = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    "import time; time.sleep(2)",
+                    "open-codex-project-in-intellij",
+                ]
+            )
+            started = subprocess.run(
+                ["ps", "-p", str(live_owner.pid), "-o", "lstart="],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            owner = lock_dir / "owner"
+            owner.write_text(
+                f"pid={live_owner.pid}\n"
+                f"process_started={started}\n"
+                f"project_root={project.resolve()}\n",
                 encoding="utf-8",
             )
-            fake_open.chmod(0o755)
-            state_dir = root / "state"
+            owner.chmod(0o600)
+            owner_before = owner.read_text(encoding="utf-8")
             environment = os.environ.copy()
             environment.update(
                 {
                     "HOME": str(fake_home),
-                    "INTELLIJ_APP_PATH": str(fake_app),
-                    "INTELLIJ_OPEN_COMMAND": str(fake_open),
                     "INTELLIJ_OPENER_STATE_DIR": str(state_dir),
-                    "INTELLIJ_OPENER_LOCK_TIMEOUT": "0.2",
+                    "INTELLIJ_OPENER_OPERATION_TIMEOUT": "0.05",
+                    "INTELLIJ_OPENER_QUEUE_TIMEOUT": "0.05",
                     "INTELLIJ_SERENA_READY_INTERVAL": "0.01",
-                    "INTELLIJ_SERENA_READY_TIMEOUT": "0.2",
+                    "INTELLIJ_SERENA_READY_TIMEOUT": "0.05",
                 }
             )
+            try:
+                result = subprocess.run(
+                    [str(HELPER), str(project)], capture_output=True, text=True,
+                    timeout=5, env=environment, check=False,
+                )
 
-            first = subprocess.Popen(
-                [str(HELPER), str(project)], stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, text=True, env=environment,
-            )
-            for _ in range(50):
-                if probe_blocked.exists():
-                    break
-                subprocess.run(["sleep", "0.01"], check=True)
-            self.assertTrue(probe_blocked.exists(), "first helper did not reach readiness probe")
-            owner = state_dir / "opener.lock/owner"
-            owner_before = owner.read_text(encoding="utf-8")
-
-            result = subprocess.run(
-                [str(HELPER), str(project)], capture_output=True, text=True,
-                timeout=5, env=environment, check=False,
-            )
-
-            self.assertEqual(2, result.returncode)
-            self.assertIn("timed out waiting for opener lock", result.stderr)
-            self.assertEqual(owner_before, owner.read_text(encoding="utf-8"))
-            first_stdout, first_stderr = first.communicate(timeout=5)
-            self.assertEqual(1, first.returncode, first_stdout + first_stderr)
-            self.assertEqual(1, len(open_log.read_text().splitlines()))
-            lock_dir = state_dir / "opener.lock"
-            self.assertFalse(lock_dir.exists())
+                self.assertEqual(1, result.returncode)
+                self.assertIn("operation-deadline", result.stderr)
+                self.assertEqual(owner_before, owner.read_text(encoding="utf-8"))
+            finally:
+                live_owner.terminate()
+                live_owner.wait(timeout=2)
 
     def test_concurrent_requests_for_the_same_project_open_once(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -375,6 +376,7 @@ class OpenCodexProjectInIntellijTests(unittest.TestCase):
             bin_dir = fake_home / ".codex/bin"
             bin_dir.mkdir(parents=True)
             open_log = root / "open-log"
+            reaper_log = root / "reaper-log"
             service_ready = project / "service-ready"
 
             serena_codex = bin_dir / "serena-codex"
@@ -384,6 +386,14 @@ class OpenCodexProjectInIntellijTests(unittest.TestCase):
                 encoding="utf-8",
             )
             serena_codex.chmod(0o755)
+            reaper = bin_dir / "intellij-project-reaper"
+            reaper.write_text(
+                "#!/bin/sh\n"
+                "[ \"$1\" = is-open ] && exit 0\n"
+                f"printf '%s\\n' \"$1\" >> '{reaper_log}'\n",
+                encoding="utf-8",
+            )
+            reaper.chmod(0o755)
             fake_open = root / "open"
             fake_open.write_text(
                 "#!/bin/sh\n"
@@ -419,9 +429,9 @@ class OpenCodexProjectInIntellijTests(unittest.TestCase):
             self.assertEqual([0, 0], sorted([first.returncode, second.returncode]))
             self.assertEqual([str(project.resolve())], open_log.read_text().splitlines())
             self.assertTrue(
-                "already open in IntelliJ" in first_stdout + second_stdout
-                or "Serena service ready" in first_stdout + second_stdout
+                "joined existing worktree open" in first_stdout + second_stdout
             )
+            self.assertEqual(1, reaper_log.read_text().splitlines().count("register"))
             self.assertEqual("", first_stderr + second_stderr)
 
     def test_concurrent_requests_for_different_projects_do_not_overlap(self) -> None:
@@ -439,11 +449,13 @@ class OpenCodexProjectInIntellijTests(unittest.TestCase):
             open_log = root / "open-log"
             overlap_log = root / "overlap-log"
             active_dir = root / "open-active"
+            first_ready = first_project / "allow-ready"
+            second_ready = second_project / "allow-ready"
 
             serena_codex = bin_dir / "serena-codex"
             serena_codex.write_text(
                 "#!/bin/sh\n"
-                "[ -f \"$2/service-ready\" ]\n",
+                "[ -f \"$2/allow-ready\" ]\n",
                 encoding="utf-8",
             )
             serena_codex.chmod(0o755)
@@ -453,8 +465,8 @@ class OpenCodexProjectInIntellijTests(unittest.TestCase):
                 f"if ! mkdir '{active_dir}' 2>/dev/null; then printf 'overlap\\n' >> '{overlap_log}'; fi\n"
                 "for project; do :; done\n"
                 f"printf '%s\\n' \"$project\" >> '{open_log}'\n"
+                "touch \"$project/launched\"\n"
                 "sleep 0.1\n"
-                "touch \"$project/service-ready\"\n"
                 f"rmdir '{active_dir}' 2>/dev/null || true\n",
                 encoding="utf-8",
             )
@@ -467,7 +479,7 @@ class OpenCodexProjectInIntellijTests(unittest.TestCase):
                     "INTELLIJ_OPEN_COMMAND": str(fake_open),
                     "INTELLIJ_OPENER_STATE_DIR": str(root / "state"),
                     "INTELLIJ_SERENA_READY_INTERVAL": "0.01",
-                    "INTELLIJ_SERENA_READY_TIMEOUT": "2",
+                    "INTELLIJ_SERENA_READY_TIMEOUT": "3",
                 }
             )
 
@@ -475,16 +487,188 @@ class OpenCodexProjectInIntellijTests(unittest.TestCase):
                 [str(HELPER), str(first_project)], stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, text=True, env=environment,
             )
+            deadline = time.time() + 2
+            while time.time() < deadline and not (first_project / "launched").exists():
+                time.sleep(0.01)
+            self.assertTrue((first_project / "launched").exists())
             second = subprocess.Popen(
                 [str(HELPER), str(second_project)], stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, text=True, env=environment,
             )
+            deadline = time.time() + 1
+            while time.time() < deadline and not (second_project / "launched").exists():
+                time.sleep(0.01)
+            second_launched_while_first_waited = (second_project / "launched").exists()
+            first_ready.touch()
+            second_ready.touch()
             first_stdout, first_stderr = first.communicate(timeout=5)
             second_stdout, second_stderr = second.communicate(timeout=5)
 
             self.assertEqual([0, 0], sorted([first.returncode, second.returncode]), first_stderr + second_stderr)
+            self.assertTrue(
+                second_launched_while_first_waited,
+                "second launch was blocked by first root readiness",
+            )
             self.assertFalse(overlap_log.exists())
             self.assertEqual(2, len(open_log.read_text().splitlines()))
+
+    def test_three_different_projects_launch_in_fifo_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            projects = [root / f"project-{index}" for index in range(3)]
+            for project in projects:
+                project.mkdir()
+            app = root / "IntelliJ IDEA.app"
+            app.mkdir()
+            home = root / "home"
+            bin_dir = home / ".codex/bin"
+            bin_dir.mkdir(parents=True)
+            state_dir = root / "state"
+            trust_started = root / "trust-started"
+            release_first = root / "release-first"
+            trust_log = root / "trust-log"
+            open_log = root / "open-log"
+
+            (bin_dir / "serena-codex").write_text(
+                "#!/bin/sh\n[ -f \"$2/ready\" ]\n", encoding="utf-8"
+            )
+            (bin_dir / "serena-codex").chmod(0o755)
+            (bin_dir / "intellij-project-reaper").write_text(
+                "#!/bin/sh\nexit 0\n", encoding="utf-8"
+            )
+            (bin_dir / "intellij-project-reaper").chmod(0o755)
+            trust = root / "trust"
+            trust.write_text(
+                "#!/bin/sh\n"
+                f"if [ \"$2\" = '{projects[0].resolve()}' ]; then\n"
+                f"  touch '{trust_started}'\n"
+                f"  while [ ! -f '{release_first}' ]; do sleep 0.01; done\n"
+                "fi\n"
+                f"printf '%s\\n' \"$2\" >> '{trust_log}'\n",
+                encoding="utf-8",
+            )
+            trust.chmod(0o755)
+            opener = root / "open"
+            opener.write_text(
+                "#!/bin/sh\n"
+                "for project; do :; done\n"
+                f"printf '%s\\n' \"$project\" >> '{open_log}'\n"
+                "touch \"$project/ready\"\n",
+                encoding="utf-8",
+            )
+            opener.chmod(0o755)
+            environment = os.environ | {
+                "HOME": str(home),
+                "INTELLIJ_APP_PATH": str(app),
+                "INTELLIJ_OPEN_COMMAND": str(opener),
+                "INTELLIJ_PROJECT_TRUST_COMMAND": str(trust),
+                "INTELLIJ_OPENER_STATE_DIR": str(state_dir),
+                "INTELLIJ_OPENER_LOCK_TIMEOUT": "0.01",
+                "INTELLIJ_SERENA_READY_INTERVAL": "0.01",
+                "INTELLIJ_SERENA_READY_TIMEOUT": "2",
+            }
+
+            processes = [
+                subprocess.Popen(
+                    [str(HELPER), str(project)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    env=environment,
+                )
+                for project in projects[:1]
+            ]
+            deadline = time.time() + 2
+            while time.time() < deadline and not trust_started.exists():
+                time.sleep(0.01)
+            self.assertTrue(trust_started.exists())
+
+            for project in projects[1:]:
+                processes.append(
+                    subprocess.Popen(
+                        [str(HELPER), str(project)],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        env=environment,
+                    )
+                )
+                deadline = time.time() + 2
+                while time.time() < deadline:
+                    queue_path = state_dir / "launch-queue.json"
+                    if queue_path.exists() and str(project.resolve()) in queue_path.read_text():
+                        break
+                    time.sleep(0.01)
+                self.assertIn(str(project.resolve()), queue_path.read_text())
+
+            release_first.touch()
+            outputs = [process.communicate(timeout=5) for process in processes]
+
+            self.assertEqual([0, 0, 0], [process.returncode for process in processes])
+            self.assertEqual(
+                [str(project.resolve()) for project in projects],
+                trust_log.read_text().splitlines(),
+            )
+            self.assertEqual(
+                [str(project.resolve()) for project in projects],
+                open_log.read_text().splitlines(),
+            )
+            self.assertEqual("", "".join(stderr for _, stderr in outputs))
+
+    def test_signal_cleanup_removes_only_the_callers_coordination_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            project = root / "project"
+            project.mkdir()
+            app = root / "IntelliJ IDEA.app"
+            app.mkdir()
+            home = root / "home"
+            bin_dir = home / ".codex/bin"
+            bin_dir.mkdir(parents=True)
+            state_dir = root / "state"
+            launched = project / "launched"
+            (bin_dir / "serena-codex").write_text(
+                "#!/bin/sh\nexit 1\n", encoding="utf-8"
+            )
+            (bin_dir / "serena-codex").chmod(0o755)
+            (bin_dir / "intellij-project-reaper").write_text(
+                "#!/bin/sh\nexit 0\n", encoding="utf-8"
+            )
+            (bin_dir / "intellij-project-reaper").chmod(0o755)
+            opener = root / "open"
+            opener.write_text(
+                f"#!/bin/sh\ntouch '{launched}'\n", encoding="utf-8"
+            )
+            opener.chmod(0o755)
+            environment = os.environ | {
+                "HOME": str(home),
+                "INTELLIJ_APP_PATH": str(app),
+                "INTELLIJ_OPEN_COMMAND": str(opener),
+                "INTELLIJ_OPENER_STATE_DIR": str(state_dir),
+                "INTELLIJ_SERENA_READY_INTERVAL": "0.01",
+                "INTELLIJ_SERENA_READY_TIMEOUT": "5",
+            }
+            process = subprocess.Popen(
+                [str(HELPER), str(project)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=environment,
+            )
+            deadline = time.time() + 2
+            while time.time() < deadline and not launched.exists():
+                time.sleep(0.01)
+            self.assertTrue(launched.exists())
+
+            process.terminate()
+            process.communicate(timeout=3)
+
+            queue_state = json.loads(
+                (state_dir / "launch-queue.json").read_text(encoding="utf-8")
+            )
+            self.assertIsNone(queue_state["owner"])
+            self.assertEqual([], queue_state["waiting"])
+            self.assertEqual([], list((state_dir / "operations").glob("*.json")))
 
     def test_new_open_trusts_exact_root_before_open(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -515,6 +699,62 @@ class OpenCodexProjectInIntellijTests(unittest.TestCase):
             result = subprocess.run([str(HELPER), str(project)], capture_output=True, text=True, env=env, check=False)
             self.assertEqual(1, result.returncode)
             self.assertEqual([f"trust allow {project.resolve()}"], log.read_text().splitlines())
+
+    def test_hung_trust_is_bounded_and_releases_launch_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            project = root / "project"
+            project.mkdir()
+            home = root / "home"
+            bin_dir = home / ".codex/bin"
+            bin_dir.mkdir(parents=True)
+            app = root / "IntelliJ IDEA.app"
+            app.mkdir()
+            leaked = root / "trust-leaked"
+            open_log = root / "open-log"
+            state_dir = root / "state"
+            (bin_dir / "serena-codex").write_text("#!/bin/sh\nexit 1\n")
+            (bin_dir / "serena-codex").chmod(0o755)
+            trust = root / "trust"
+            trust.write_text(
+                f"#!/bin/sh\nsleep 0.5\ntouch '{leaked}'\n", encoding="utf-8"
+            )
+            trust.chmod(0o755)
+            opener = root / "open"
+            opener.write_text(
+                f"#!/bin/sh\nprintf 'open\n' > '{open_log}'\n", encoding="utf-8"
+            )
+            opener.chmod(0o755)
+
+            result = subprocess.run(
+                [str(HELPER), str(project)],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+                env=os.environ
+                | {
+                    "HOME": str(home),
+                    "INTELLIJ_APP_PATH": str(app),
+                    "INTELLIJ_OPEN_COMMAND": str(opener),
+                    "INTELLIJ_PROJECT_TRUST_COMMAND": str(trust),
+                    "INTELLIJ_OPENER_STATE_DIR": str(state_dir),
+                    "INTELLIJ_OPENER_LAUNCH_COMMAND_TIMEOUT": "0.1",
+                    "INTELLIJ_SERENA_READY_INTERVAL": "0.01",
+                    "INTELLIJ_SERENA_READY_TIMEOUT": "1",
+                },
+            )
+
+            self.assertEqual(1, result.returncode)
+            self.assertIn("trust-failed", result.stdout)
+            self.assertFalse(open_log.exists())
+            time.sleep(0.6)
+            self.assertFalse(leaked.exists())
+            queue_state = json.loads(
+                (state_dir / "launch-queue.json").read_text(encoding="utf-8")
+            )
+            self.assertIsNone(queue_state["owner"])
+            self.assertEqual([], queue_state["waiting"])
 
     def test_already_open_root_does_not_require_trust_write(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -663,7 +903,7 @@ class OpenCodexProjectInIntellijTests(unittest.TestCase):
                     [str(HELPER), str(project)],
                     capture_output=True,
                     text=True,
-                    timeout=1.5,
+                    timeout=4,
                     check=False,
                     env=os.environ
                     | {
