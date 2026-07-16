@@ -165,6 +165,36 @@ resolved owner, the resolution source, and any concise fail-closed reason. The
 command never reads beyond the first bounded session metadata record and never
 prints prompts or session content.
 
+## Queued IntelliJ opener
+
+The canonical worktree is the single-flight boundary. Requests for one root
+join one open operation. Different roots enter a durable FIFO launch queue for
+the brief exact-root trust and IntelliJ open request, then wait for indexing
+and Serena readiness concurrently. Queueing is normal recovery state; only a
+validated deadline or unsafe owner/state condition is a failure.
+
+The default allowances are:
+
+```text
+INTELLIJ_OPENER_OPERATION_TIMEOUT=300
+INTELLIJ_OPENER_QUEUE_TIMEOUT=300
+INTELLIJ_OPENER_LAUNCH_COMMAND_TIMEOUT=30
+INTELLIJ_SERENA_READY_TIMEOUT=120
+```
+
+The operation, queue, and readiness allowances form one overall opener
+deadline. The launch-command timeout separately bounds trust and the IntelliJ
+open subprocess within the remaining overall budget. Normal diagnostics say
+`joined existing worktree open` or `queued launch completed`. Terminal
+classifications distinguish `operation-deadline`, `queue-deadline`, and
+`readiness-deadline`; doctor history stores only the phase and bounded timing
+metrics.
+
+Queue presence is not a reaper lease. A queued root is not registered as
+managed until its exact-root Serena service and native IntelliJ model are
+ready. The queue never closes a project or starts another IntelliJ application
+process.
+
 ## Persistent dependency bootstrap
 
 The IntelliJ opener runs one idempotent preparation check before its
@@ -191,9 +221,10 @@ group, reports a bounded diagnostic, and continues opening IntelliJ. Tests and
 operators can shorten the outer guard with
 `WORKSPACE_HARBOR_BOOTSTRAP_OPENER_TIMEOUT_SECONDS`. The broker and doctor
 derive and enforce a minimum opener timeout from that guard, its ten-second
-termination grace, the opener-lock window, the IntelliJ readiness window, and
-a 30-second margin. A shorter parent override is clamped to that safe minimum,
-so a parent recovery request cannot expire before its bounded child phases.
+termination grace, the worktree-operation allowance, FIFO queue allowance,
+IntelliJ readiness allowance, and a ten-second caller grace. A shorter parent
+override is clamped to that safe minimum, so a parent recovery request cannot
+expire before its bounded child phases.
 Bootstrap output is drained continuously into a rolling 64 KiB tail rather
 than an unbounded memory or temporary-disk buffer.
 

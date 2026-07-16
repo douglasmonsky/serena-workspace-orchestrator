@@ -29,6 +29,7 @@ MODULES = (
     "workspace_harbor_bootstrap.py",
     "workspace_harbor_bridge.py",
     "workspace_harbor_codex.py",
+    "workspace_harbor_opener_queue.py",
 )
 
 
@@ -72,6 +73,7 @@ class DeployWorkspaceHarborTests(unittest.TestCase):
         self.assertFalse((self.codex_home / "bin").exists())
         for name in (*EXECUTABLES, *MODULES):
             self.assertIn(name, result.stdout)
+        self.assertIn("workspace_harbor_opener_queue.py", result.stdout)
 
     def test_real_deploy_backs_up_and_installs_modes_and_interpreters(self) -> None:
         destination = self.codex_home / "bin"
@@ -91,6 +93,10 @@ class DeployWorkspaceHarborTests(unittest.TestCase):
             self.assertEqual(0o755, (destination / name).stat().st_mode & 0o777)
         for name in MODULES:
             self.assertEqual(0o644, (destination / name).stat().st_mode & 0o777)
+        self.assertEqual(
+            0o644,
+            (destination / "workspace_harbor_opener_queue.py").stat().st_mode & 0o777,
+        )
         expected_shebang = "#!/usr/bin/env python3"
         self.assertEqual(expected_shebang, (destination / "serena-project-doctor").read_text().splitlines()[0])
         self.assertEqual(expected_shebang, (destination / "workspace-harbor-bootstrap").read_text().splitlines()[0])

@@ -29,6 +29,7 @@ MODULES = (
     "workspace_harbor_bootstrap.py",
     "workspace_harbor_bridge.py",
     "workspace_harbor_codex.py",
+    "workspace_harbor_opener_queue.py",
 )
 SERENA_RUNTIME_COMMANDS = {"serena-codex"}
 

@@ -76,6 +76,12 @@ state fails closed.
 
 ## Managed opener
 
+> Superseded concurrency model: steps 3–7 below describe the original
+> long-held global opener lock. The approved replacement is
+> [Queued IntelliJ Opener Design](2026-07-16-queued-intellij-opener-design.md),
+> which uses canonical-worktree single flight plus a short durable FIFO launch
+> queue and waits for different roots concurrently.
+
 `open-codex-project-in-intellij` serializes opens in a new
 `~/.codex/state/intellij-projects` namespace. For an exact canonical Git root
 it performs this sequence:
