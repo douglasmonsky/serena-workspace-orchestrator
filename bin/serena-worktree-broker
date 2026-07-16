@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import pwd
 import re
 import shlex
 import shutil
@@ -788,17 +789,45 @@ def _resolve_project(explicit_project: str | None) -> Path | None:
     raise RuntimeError(result.stderr.strip() or "could not resolve Serena project")
 
 
-def _direct_stdio_fallback(backend: str, context: str, added_modes: Sequence[str] = ()) -> int:
+def _project_is_brokerable(project_root: Path) -> bool:
+    """Return whether the root is eligible for managed IntelliJ lifecycle."""
+    account_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    allowed_parents = (
+        account_home / "Documents/Codex",
+        account_home / "Developer/Codex",
+        account_home / ".codex/src",
+    )
+    try:
+        canonical = project_root.resolve(strict=True)
+    except OSError:
+        return False
+    for parent in allowed_parents:
+        try:
+            canonical.relative_to(parent.resolve(strict=True))
+        except (OSError, ValueError):
+            continue
+        return True
+    return False
+
+
+def _direct_stdio_fallback(
+    backend: str,
+    context: str,
+    added_modes: Sequence[str] = (),
+    *,
+    project_from_cwd: bool = True,
+) -> int:
     command = [
         str(SERENA_CODEX),
         "start-mcp-server",
         f"--context={context}",
-        "--project-from-cwd",
         f"--language-backend={backend}",
         "--enable-web-dashboard=false",
         "--enable-gui-log-window=false",
         "--open-web-dashboard=false",
     ]
+    if project_from_cwd:
+        command.insert(3, "--project-from-cwd")
     command.extend(f"--add-mode={mode}" for mode in added_modes)
     os.execv(str(SERENA_CODEX), command)
     return 127
@@ -846,7 +875,34 @@ def _connect(args: argparse.Namespace) -> int:
         raise
     _bridge_event(attempt_id, started, "project-resolution", "ok", root=project_root)
     if project_root is None:
-        return _direct_stdio_fallback(args.backend, args.context, args.add_mode)
+        _bridge_event(
+            attempt_id,
+            started,
+            "projectless-fallback",
+            "ok",
+            reason="project-not-found",
+        )
+        return _direct_stdio_fallback(
+            args.backend,
+            args.context,
+            args.add_mode,
+            project_from_cwd=False,
+        )
+    if args.project is None and not _project_is_brokerable(project_root):
+        _bridge_event(
+            attempt_id,
+            started,
+            "projectless-fallback",
+            "ok",
+            root=project_root,
+            reason="project-outside-managed-roots",
+        )
+        return _direct_stdio_fallback(
+            args.backend,
+            args.context,
+            args.add_mode,
+            project_from_cwd=False,
+        )
     _auto_repair_project_languages(project_root)
     _bootstrap_status(project_root)
     if not MCP_PROXY.is_file():

@@ -122,6 +122,13 @@ running, it also calls Workspace Harbor's authenticated loopback endpoint so
 the in-memory trust state changes before the project is opened; this prevents
 a stale live registry from producing a GUI trust prompt.
 
+When Codex resumes a task whose stored startup directory resolves to a Serena
+project outside those managed roots, the broker starts a projectless MCP
+surface instead of exiting. This preserves `initial_instructions` and
+`activate_project`, allowing the task to select its actual managed worktree.
+The fallback does not open or trust the stale project, bypass worktree
+ownership, or weaken validation for an explicitly requested project.
+
 `intellij-project-trust audit` reports broad and out-of-scope entries but never
 removes them automatically.
 

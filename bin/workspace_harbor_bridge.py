@@ -36,6 +36,7 @@ ALLOWED_OWNER_SOURCES = frozenset(
 ALLOWED_STAGES = frozenset(
     {
         "project-resolution",
+        "projectless-fallback",
         "ownership",
         "service-reused",
         "service-started",

@@ -597,6 +597,61 @@ class SerenaWorktreeBrokerTests(unittest.TestCase):
         event = append.call_args.args[0]
         self.assertEqual(("project-resolution", "failed", "project-resolution-failed"), (event.stage, event.outcome, event.reason))
 
+    def test_unmanaged_startup_project_keeps_projectless_mcp_tools_available(self) -> None:
+        stale_root = Path(self.temporary_directory.name) / "stale-task-root"
+        stale_root.mkdir()
+        args = SimpleNamespace(
+            project=None,
+            backend="JetBrains",
+            context="codex",
+            add_mode=("query-projects",),
+        )
+
+        with mock.patch.object(
+            broker, "_resolve_project", return_value=stale_root
+        ), mock.patch.object(
+            broker,
+            "_project_is_brokerable",
+            return_value=False,
+            create=True,
+        ), mock.patch.object(
+            broker, "_direct_stdio_fallback", return_value=0
+        ) as fallback, mock.patch.object(
+            broker,
+            "_auto_repair_project_languages",
+            side_effect=AssertionError("unmanaged project must not enter broker setup"),
+        ), mock.patch.object(
+            broker.BRIDGE_JOURNAL, "append", return_value=True
+        ) as append:
+            result = broker._connect(args)
+
+        self.assertEqual(0, result)
+        fallback.assert_called_once_with(
+            "JetBrains",
+            "codex",
+            ("query-projects",),
+            project_from_cwd=False,
+        )
+        event = append.call_args_list[-1].args[0]
+        self.assertEqual("projectless-fallback", event.stage)
+        self.assertEqual("project-outside-managed-roots", event.reason)
+
+    def test_brokerable_project_requires_authenticated_home_managed_root(self) -> None:
+        home = Path(self.temporary_directory.name) / "account-home"
+        managed = home / "Developer/Codex/project"
+        unmanaged = home / "Documents/other-project"
+        managed.mkdir(parents=True)
+        unmanaged.mkdir(parents=True)
+        predicate = getattr(broker, "_project_is_brokerable", lambda _root: None)
+
+        with mock.patch.object(
+            broker.pwd,
+            "getpwuid",
+            return_value=SimpleNamespace(pw_dir=str(home)),
+        ):
+            self.assertTrue(predicate(managed))
+            self.assertFalse(predicate(unmanaged))
+
     def test_locked_state_round_trips_with_private_permissions(self) -> None:
         with broker._locked_state() as state:
             state["services"]["example"] = {"pid": 123}
