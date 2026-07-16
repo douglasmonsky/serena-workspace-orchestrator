@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""Detached, signal-free relauncher for one guarded Workspace Harbor incident."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import subprocess
+import sys
+import time
+from typing import Any, Sequence
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+import workspace_harbor_bridge as bridge  # noqa: E402
+import workspace_harbor_codex as codex  # noqa: E402
+
+
+QUIT_COMMAND = [
+    "/usr/bin/osascript",
+    "-e",
+    'tell application id "com.openai.codex" to quit',
+]
+LAUNCH_COMMAND = ["/usr/bin/open", "-b", "com.openai.codex"]
+
+
+def _run(command: list[str], *, timeout: float) -> subprocess.CompletedProcess[str] | None:
+    try:
+        return subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def _close_blocked(
+    store: bridge.IncidentStore,
+    checkpoint: codex.RelaunchCheckpoint,
+    reason: str,
+) -> dict[str, Any]:
+    try:
+        store.transition(
+            checkpoint.incident_id,
+            "restart-prepared",
+            "closed-blocked",
+            reason=reason,
+        )
+    except ValueError:
+        pass
+    return {"status": "closed-blocked", "reason": reason}
+
+
+def perform_relaunch(
+    checkpoint: codex.RelaunchCheckpoint,
+    store: bridge.IncidentStore,
+    *,
+    wait_iterations: int = 30,
+) -> dict[str, Any]:
+    for _ in range(wait_iterations):
+        if not codex.process_exists(checkpoint.doctor_pid):
+            break
+        time.sleep(1)
+    else:
+        return _close_blocked(store, checkpoint, "doctor-exit-timeout")
+
+    old_running = codex.identity_matches(checkpoint.app_identity)
+    if not old_running:
+        current = codex.find_codex_app_identity()
+        if current is not None:
+            return _close_blocked(store, checkpoint, "codex-identity-changed")
+    if old_running:
+        quit_result = _run(QUIT_COMMAND, timeout=10)
+        if quit_result is None or quit_result.returncode != 0:
+            return _close_blocked(store, checkpoint, "codex-quit-failed")
+        for _ in range(min(wait_iterations, 15)):
+            if not codex.identity_matches(checkpoint.app_identity):
+                break
+            time.sleep(1)
+        else:
+            return _close_blocked(store, checkpoint, "codex-restart-incomplete")
+
+    launch_result = _run(LAUNCH_COMMAND, timeout=10)
+    if launch_result is None or launch_result.returncode != 0:
+        return _close_blocked(store, checkpoint, "codex-relaunch-failed")
+    new_identity = None
+    for _ in range(min(wait_iterations, 30)):
+        candidate = codex.find_codex_app_identity()
+        if candidate is not None and candidate != checkpoint.app_identity:
+            new_identity = candidate
+            break
+        time.sleep(1)
+    if new_identity is None:
+        return _close_blocked(store, checkpoint, "codex-readiness-timeout")
+    thread_command = [
+        "/usr/bin/open",
+        f"codex://threads/{checkpoint.thread_id}",
+    ]
+    thread_result = _run(thread_command, timeout=10)
+    if thread_result is None or thread_result.returncode != 0:
+        return _close_blocked(store, checkpoint, "thread-open-failed")
+    store.transition(
+        checkpoint.incident_id,
+        "restart-prepared",
+        "resume-pending",
+        reason="codex-relaunched",
+    )
+    return {
+        "status": "resume-pending",
+        "reason": "codex-relaunched",
+        "incident": checkpoint.incident_id,
+    }
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    arguments = list(argv if argv is not None else sys.argv[1:])
+    if len(arguments) != 1:
+        print("usage: workspace-harbor-codex-relauncher CHECKPOINT", file=sys.stderr)
+        return 2
+    try:
+        checkpoint = codex.load_checkpoint(Path(arguments[0]))
+        store = bridge.IncidentStore(Path(checkpoint.incident_store))
+        result = perform_relaunch(checkpoint, store)
+    except (OSError, ValueError, json.JSONDecodeError):
+        result = {"status": "closed-blocked", "reason": "checkpoint-invalid"}
+    print(json.dumps(result, sort_keys=True))
+    return 0 if result["status"] == "resume-pending" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

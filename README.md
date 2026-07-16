@@ -62,6 +62,54 @@ python3 -m unittest discover -s tests/python -p 'test_*.py' -v
   consent.
 - `serena-worktree-broker status|cleanup` reports ownership and reclaims only
   broker-owned idle services.
+- `serena-bridge-doctor status|recover` diagnoses the boundary between a
+  healthy IntelliJ/Serena backend, a working MCP handshake, and Serena tools
+  actually exposed to the current Codex task. Its guarded restart commands are
+  disabled by default and require a sole-active-task attestation plus a
+  one-shot task heartbeat.
+
+## Codex task bridge recovery
+
+Serena bridge health has three independent boundaries:
+
+1. IntelliJ and the exact-root Serena service are semantically healthy.
+2. A bounded synthetic MCP client can complete `initialize` and `tools/list`
+   through the configured broker.
+3. The current Codex task actually exposes Serena MCP tools.
+
+Do not infer the third boundary from the first two. Report the current task's
+tool inventory as `present`, `missing`, or `unknown`, then run:
+
+```sh
+serena-bridge-doctor status "$(git rev-parse --show-toplevel)" \
+  --reported-tools unknown --probe
+serena-bridge-doctor recover "$(git rev-parse --show-toplevel)" \
+  --reported-tools missing
+serena-bridge-doctor resume "$(git rev-parse --show-toplevel)" \
+  --incident INCIDENT --thread-id THREAD --reported-tools present
+```
+
+Recovery performs one bounded lower-layer repair cycle. It removes only stale
+broker-owned state for the exact root, or delegates an unhealthy semantic
+backend to `serena-project-doctor --recover`; it never loops against unchanged
+state. A bridge-only failure never authorizes an IntelliJ restart.
+
+The bridge journal stores only digests, stable stage/outcome/reason codes, and
+timings. It never stores prompts, source, MCP arguments, environment values,
+response bodies, or stderr. Restart incidents, attestations, checkpoints, and
+policy are private `0600` files beneath
+`$CODEX_HOME/state/serena-bridge/`.
+
+Codex restart is a last bridge-only recovery step. It is disabled by default
+and is accepted only when the app-derived task inventory proves the current
+task is the sole active task, no child or host state is ambiguous, and an
+enabled one-shot heartbeat targets the same task and incident 30–180 seconds
+ahead. The detached relauncher revalidates the exact ChatGPT app PID, process
+start time, executable, and bundle ID; it requests a graceful app quit and
+never sends `TERM`, `KILL`, `pkill`, or `killall`. It then opens the exact
+`codex://threads/THREAD` deep link. The heartbeat resumes the incident once and
+must be disabled or deleted after `healthy` or `fresh-task-required`. A failed
+attempt cannot schedule a second restart.
 
 ## Trust model
 

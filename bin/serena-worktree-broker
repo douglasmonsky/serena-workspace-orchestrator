@@ -30,6 +30,12 @@ from typing import Any, Iterator, Sequence
 import uuid
 
 
+BIN_DIR = Path(__file__).resolve().parent
+if str(BIN_DIR) not in sys.path:
+    sys.path.insert(0, str(BIN_DIR))
+from workspace_harbor_bridge import BridgeEvent, BridgeJournal, root_digest
+
+
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
 SESSION_DIR = Path(
     os.environ.get("WORKSPACE_HARBOR_SESSION_DIR", CODEX_HOME / "sessions")
@@ -40,6 +46,9 @@ STATE_DIR = Path(
 STATE_FILE = STATE_DIR / "services.json"
 LOCK_FILE = STATE_DIR / "services.lock"
 LOG_DIR = STATE_DIR / "logs"
+BRIDGE_JOURNAL = BridgeJournal(
+    Path(os.environ.get("SERENA_BRIDGE_STATE_DIR", CODEX_HOME / "state" / "serena-bridge"))
+)
 SERENA_CODEX = Path(
     os.environ.get("SERENA_BROKER_SERENA_CODEX", CODEX_HOME / "bin" / "serena-codex")
 )
@@ -795,36 +804,129 @@ def _direct_stdio_fallback(backend: str, context: str, added_modes: Sequence[str
     return 127
 
 
+def _bridge_event(
+    attempt_id: str,
+    started: float,
+    stage: str,
+    outcome: str,
+    *,
+    root: Path | None = None,
+    service_key: str | None = None,
+    owner_source: str | None = None,
+    reason: str | None = None,
+) -> None:
+    BRIDGE_JOURNAL.append(
+        BridgeEvent(
+            attempt_id=attempt_id,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            root_digest=root_digest(root) if root is not None else None,
+            service_key=service_key,
+            owner_source=owner_source,
+            stage=stage,
+            outcome=outcome,
+            reason=reason,
+            duration_ms=max(0, round((time.monotonic() - started) * 1000)),
+        )
+    )
+
+
 def _connect(args: argparse.Namespace) -> int:
-    project_root = _resolve_project(args.project)
+    attempt_id = uuid.uuid4().hex
+    started = time.monotonic()
+    try:
+        project_root = _resolve_project(args.project)
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        _bridge_event(
+            attempt_id,
+            started,
+            "project-resolution",
+            "failed",
+            reason="project-resolution-failed",
+        )
+        raise
+    _bridge_event(attempt_id, started, "project-resolution", "ok", root=project_root)
     if project_root is None:
         return _direct_stdio_fallback(args.backend, args.context, args.add_mode)
     _auto_repair_project_languages(project_root)
     _bootstrap_status(project_root)
     if not MCP_PROXY.is_file():
+        _bridge_event(
+            attempt_id,
+            started,
+            "proxy-started",
+            "failed",
+            root=project_root,
+            reason="proxy-missing",
+        )
         raise RuntimeError(f"mcp-proxy not found: {MCP_PROXY}")
 
     lease_id = uuid.uuid4().hex
-    resolution = _owner_resolution()
-    owner_id = resolution.owner_id
-    broker_details = _process_details(os.getpid())
-    if broker_details is None:
-        raise RuntimeError("could not identify broker process")
-    with _locked_state() as state:
-        _cleanup_state(state, DEFAULT_IDLE_SECONDS, stop_idle=False)
-        _migrate_legacy_host_leases(state, project_root, resolution)
-        _assert_root_owner(state, project_root, owner_id)
-        key, record = _start_service(
-            state, project_root, args.backend, args.context, args.add_mode
+    key: str | None = None
+    resolution: OwnerResolution | None = None
+    try:
+        resolution = _owner_resolution()
+        owner_id = resolution.owner_id
+        broker_details = _process_details(os.getpid())
+        if broker_details is None:
+            raise RuntimeError("could not identify broker process")
+        with _locked_state() as state:
+            _cleanup_state(state, DEFAULT_IDLE_SECONDS, stop_idle=False)
+            _migrate_legacy_host_leases(state, project_root, resolution)
+            _assert_root_owner(state, project_root, owner_id)
+            _bridge_event(
+                attempt_id,
+                started,
+                "ownership",
+                "ok",
+                root=project_root,
+                owner_source=resolution.source,
+            )
+            expected_key = _service_key(
+                project_root, args.backend, args.context, args.add_mode
+            )
+            previous = state["services"].get(expected_key)
+            key, record = _start_service(
+                state, project_root, args.backend, args.context, args.add_mode
+            )
+            service_stage = "service-reused" if previous is record else "service-started"
+            _bridge_event(
+                attempt_id,
+                started,
+                service_stage,
+                "ok",
+                root=project_root,
+                service_key=key,
+                owner_source=resolution.source,
+            )
+            record["leases"][lease_id] = {
+                "created_at": _now(),
+                "owner_id": owner_id,
+                "pid": os.getpid(),
+                "process_started": broker_details[0],
+            }
+            record["idle_since"] = None
+            port = int(record["port"])
+            _bridge_event(
+                attempt_id,
+                started,
+                "lease-inserted",
+                "ok",
+                root=project_root,
+                service_key=key,
+                owner_source=resolution.source,
+            )
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        _bridge_event(
+            attempt_id,
+            started,
+            "ownership",
+            "failed",
+            root=project_root,
+            service_key=key,
+            owner_source=resolution.source if resolution is not None else None,
+            reason="ownership-or-service-failed",
         )
-        record["leases"][lease_id] = {
-            "created_at": _now(),
-            "owner_id": owner_id,
-            "pid": os.getpid(),
-            "process_started": broker_details[0],
-        }
-        record["idle_since"] = None
-        port = int(record["port"])
+        raise
 
     proxy_command = [
         str(MCP_PROXY),
@@ -832,16 +934,58 @@ def _connect(args: argparse.Namespace) -> int:
         "--transport=streamablehttp",
         "--log-level=WARNING",
     ]
+    _bridge_event(
+        attempt_id,
+        started,
+        "proxy-started",
+        "ok",
+        root=project_root,
+        service_key=key,
+        owner_source=resolution.source,
+    )
     try:
-        return subprocess.run(proxy_command, check=False).returncode
+        returncode = subprocess.run(proxy_command, check=False).returncode
+        _bridge_event(
+            attempt_id,
+            started,
+            "proxy-exit",
+            "ok" if returncode == 0 else "failed",
+            root=project_root,
+            service_key=key,
+            owner_source=resolution.source,
+            reason=None if returncode == 0 else f"proxy-exit-{returncode}",
+        )
+        return returncode
     finally:
-        with _locked_state() as state:
-            current = state["services"].get(key)
-            if isinstance(current, dict):
-                leases = current.setdefault("leases", {})
-                leases.pop(lease_id, None)
-                _prune_dead_leases(current)
-                current["last_used_at"] = _now()
+        try:
+            with _locked_state() as state:
+                current = state["services"].get(key)
+                if isinstance(current, dict):
+                    leases = current.setdefault("leases", {})
+                    leases.pop(lease_id, None)
+                    _prune_dead_leases(current)
+                    current["last_used_at"] = _now()
+            _bridge_event(
+                attempt_id,
+                started,
+                "lease-cleanup",
+                "ok",
+                root=project_root,
+                service_key=key,
+                owner_source=resolution.source,
+            )
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            _bridge_event(
+                attempt_id,
+                started,
+                "lease-cleanup",
+                "failed",
+                root=project_root,
+                service_key=key,
+                owner_source=resolution.source,
+                reason="lease-cleanup-failed",
+            )
+            raise
 
 
 def _cleanup_state(state: dict[str, Any], idle_seconds: int, stop_idle: bool = True) -> list[str]:
@@ -866,6 +1010,53 @@ def _cleanup_state(state: dict[str, Any], idle_seconds: int, stop_idle: bool = T
             state["services"].pop(key, None)
             actions.append(f"stopped idle service {key}")
     return actions
+
+
+def _repair_root_state(state: dict[str, Any], project_root: Path) -> dict[str, str]:
+    canonical_root = str(project_root.resolve())
+    services = state.get("services")
+    if not isinstance(services, dict):
+        return {"status": "protected", "reason": "invalid-state"}
+    matches = [
+        (key, record)
+        for key, record in services.items()
+        if isinstance(record, dict)
+        and isinstance(record.get("project_root"), str)
+        and str(Path(record["project_root"]).expanduser().resolve(strict=False))
+        == canonical_root
+    ]
+    if not matches:
+        return {"status": "unchanged", "reason": "no-record"}
+    if len(matches) != 1:
+        return {"status": "protected", "reason": "ambiguous-services"}
+    key, record = matches[0]
+    _prune_dead_leases(record)
+    if record.get("leases"):
+        return {"status": "protected", "reason": "live-lease"}
+    owned = _process_is_owned(record)
+    if owned and _tcp_ready(int(record.get("port", 0))):
+        return {"status": "unchanged", "reason": "healthy-service"}
+    if owned:
+        if not _stop_owned_service(record):
+            return {"status": "protected", "reason": "stop-failed"}
+        services.pop(key, None)
+        return {"status": "repaired", "reason": "stopped-unhealthy-service"}
+    services.pop(key, None)
+    return {"status": "repaired", "reason": "removed-stale-record"}
+
+
+def _repair_root(args: argparse.Namespace) -> int:
+    root = Path(args.root).expanduser().resolve()
+    if not root.is_dir():
+        raise RuntimeError(f"project is not a directory: {root}")
+    with _locked_state() as state:
+        result = _repair_root_state(state, root)
+    payload = {"root": str(root), **result}
+    if args.json:
+        print(json.dumps(payload, sort_keys=True))
+    else:
+        print(f"{result['status']} {result['reason']} root={root}")
+    return 0 if result["status"] != "protected" else 2
 
 
 def _cleanup(args: argparse.Namespace) -> int:
@@ -986,6 +1177,13 @@ def _parser() -> argparse.ArgumentParser:
     status = subparsers.add_parser("status", help="show broker-owned services")
     status.add_argument("--json", action="store_true")
     status.set_defaults(handler=_status)
+
+    repair = subparsers.add_parser(
+        "repair-root", help="repair stale broker-owned state for one exact root"
+    )
+    repair.add_argument("root")
+    repair.add_argument("--json", action="store_true")
+    repair.set_defaults(handler=_repair_root)
 
     leases = subparsers.add_parser("leases", help="show pruned broker lease snapshot")
     leases.add_argument("--json", action="store_true", required=True)

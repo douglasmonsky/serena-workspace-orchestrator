@@ -17,12 +17,19 @@ EXECUTABLES = (
     "open-codex-project-in-intellij",
     "intellij-project-trust",
     "intellij-project-reaper",
+    "serena-bridge-doctor",
     "serena-codex",
     "serena-project-doctor",
     "serena-worktree-broker",
     "workspace-harbor-bootstrap",
+    "workspace-harbor-codex-relauncher",
 )
-MODULES = ("workspace_harbor_ide.py", "workspace_harbor_bootstrap.py")
+MODULES = (
+    "workspace_harbor_ide.py",
+    "workspace_harbor_bootstrap.py",
+    "workspace_harbor_bridge.py",
+    "workspace_harbor_codex.py",
+)
 SERENA_RUNTIME_COMMANDS = {"serena-codex"}
 
 

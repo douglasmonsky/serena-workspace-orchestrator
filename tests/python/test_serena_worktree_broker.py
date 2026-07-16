@@ -536,6 +536,67 @@ class SerenaWorktreeBrokerTests(unittest.TestCase):
 
         self.assertEqual(["migrate", "assert"], events)
 
+    def test_connect_records_ordered_bridge_stages(self) -> None:
+        root = Path(self.temporary_directory.name) / "project"; root.mkdir()
+        proxy = Path(self.temporary_directory.name) / "mcp-proxy"; proxy.write_text("fixture")
+        args = SimpleNamespace(
+            project=str(root), backend="JetBrains", context="codex", add_mode=()
+        )
+        resolution = broker.OwnerResolution(None, "codex-host-shared", "codex-host")
+        record = {
+            "leases": {}, "port": 24320, "project_root": str(root),
+            "pid": 201, "process_started": "service-start",
+        }
+        service_key = broker._service_key(root, "JetBrains", "codex", ())
+        state = {"version": 1, "services": {service_key: record}}
+        locked = mock.MagicMock()
+        locked.return_value.__enter__.return_value = state
+        locked.return_value.__exit__.return_value = False
+        completed = mock.Mock(returncode=0)
+
+        with mock.patch.object(broker, "_resolve_project", return_value=root), mock.patch.object(
+            broker, "_auto_repair_project_languages"
+        ), mock.patch.object(broker, "_bootstrap_status"), mock.patch.object(
+            broker, "MCP_PROXY", proxy
+        ), mock.patch.object(broker, "_owner_resolution", return_value=resolution), mock.patch.object(
+            broker, "_process_details", return_value=("broker-start", "broker")
+        ), mock.patch.object(broker, "_locked_state", locked), mock.patch.object(
+            broker, "_cleanup_state"
+        ), mock.patch.object(broker, "_migrate_legacy_host_leases"), mock.patch.object(
+            broker, "_assert_root_owner"
+        ), mock.patch.object(broker, "_start_service", return_value=(service_key, record)), mock.patch.object(
+            broker.subprocess, "run", return_value=completed
+        ), mock.patch.object(broker, "_prune_dead_leases"), mock.patch.object(
+            broker.BRIDGE_JOURNAL, "append", return_value=True
+        ) as append:
+            result = broker._connect(args)
+
+        self.assertEqual(0, result)
+        self.assertEqual(
+            [
+                "project-resolution", "ownership", "service-reused", "lease-inserted",
+                "proxy-started", "proxy-exit", "lease-cleanup",
+            ],
+            [call.args[0].stage for call in append.call_args_list],
+        )
+
+    def test_connect_records_project_resolution_failure(self) -> None:
+        args = SimpleNamespace(
+            project="/missing", backend="JetBrains", context="codex", add_mode=()
+        )
+
+        with mock.patch.object(
+            broker, "_resolve_project", side_effect=RuntimeError("missing")
+        ), mock.patch.object(
+            broker.BRIDGE_JOURNAL, "append", return_value=True
+        ) as append:
+            with self.assertRaisesRegex(RuntimeError, "missing"):
+                broker._connect(args)
+
+        self.assertTrue(append.called, "project-resolution failure was not journaled")
+        event = append.call_args.args[0]
+        self.assertEqual(("project-resolution", "failed", "project-resolution-failed"), (event.stage, event.outcome, event.reason))
+
     def test_locked_state_round_trips_with_private_permissions(self) -> None:
         with broker._locked_state() as state:
             state["services"]["example"] = {"pid": 123}
@@ -604,6 +665,61 @@ class SerenaWorktreeBrokerTests(unittest.TestCase):
         self.assertEqual(state["services"], {})
         self.assertEqual(actions, ["stopped idle service owned"])
         stop.assert_called_once_with(record)
+
+    def test_repair_root_removes_only_dead_exact_root_record(self) -> None:
+        root = Path(self.temporary_directory.name) / "target"; root.mkdir()
+        other = Path(self.temporary_directory.name) / "other"; other.mkdir()
+        state = {"services": {
+            "target": {"project_root": str(root), "leases": {}, "pid": 101, "port": 24320},
+            "other": {"project_root": str(other), "leases": {}, "pid": 202, "port": 24321},
+        }}
+
+        with mock.patch.object(broker, "_process_is_owned", return_value=False):
+            result = broker._repair_root_state(state, root)
+
+        self.assertEqual("repaired", result["status"])
+        self.assertNotIn("target", state["services"])
+        self.assertIn("other", state["services"])
+
+    def test_repair_root_protects_live_lease(self) -> None:
+        root = Path(self.temporary_directory.name) / "target"; root.mkdir()
+        state = {"services": {"target": {
+            "project_root": str(root),
+            "leases": {"live": {"pid": os.getpid(), "process_started": "fixture"}},
+            "pid": 101,
+            "port": 24320,
+        }}}
+
+        with mock.patch.object(broker, "_prune_dead_leases"):
+            result = broker._repair_root_state(state, root)
+
+        self.assertEqual({"status": "protected", "reason": "live-lease"}, result)
+
+    def test_repair_root_keeps_healthy_empty_service(self) -> None:
+        root = Path(self.temporary_directory.name) / "target"; root.mkdir()
+        record = {"project_root": str(root), "leases": {}, "pid": 101, "port": 24320}
+        state = {"services": {"target": record}}
+
+        with mock.patch.object(broker, "_process_is_owned", return_value=True), mock.patch.object(
+            broker, "_tcp_ready", return_value=True
+        ):
+            result = broker._repair_root_state(state, root)
+
+        self.assertEqual({"status": "unchanged", "reason": "healthy-service"}, result)
+        self.assertIs(record, state["services"]["target"])
+
+    def test_repair_root_protects_unstoppable_owned_service(self) -> None:
+        root = Path(self.temporary_directory.name) / "target"; root.mkdir()
+        record = {"project_root": str(root), "leases": {}, "pid": 101, "port": 24320}
+        state = {"services": {"target": record}}
+
+        with mock.patch.object(broker, "_process_is_owned", return_value=True), mock.patch.object(
+            broker, "_tcp_ready", return_value=False
+        ), mock.patch.object(broker, "_stop_owned_service", return_value=False):
+            result = broker._repair_root_state(state, root)
+
+        self.assertEqual({"status": "protected", "reason": "stop-failed"}, result)
+        self.assertIs(record, state["services"]["target"])
 
     def test_port_allocator_skips_listening_port(self) -> None:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
