@@ -4,9 +4,15 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime, timezone
+import json
+import os
 from pathlib import Path
 import re
 import shlex
+import shutil
+import tempfile
+import tomllib
 
 
 BLOCK_REASON = "documents-project-write-blocked"
@@ -79,6 +85,14 @@ class Decision:
 
     allowed: bool
     reason: str = ""
+
+
+@dataclass(frozen=True)
+class InstallResult:
+    """Summary of an idempotent global guard installation."""
+
+    hook_changed: bool
+    project_records_removed: int = 0
 
 
 def _is_within(path: Path, root: Path) -> bool:
@@ -314,3 +328,155 @@ def decision_payload(decision: Decision) -> dict[str, object]:
             "permissionDecisionReason": reason,
         }
     }
+
+
+def _guard_hook_entry(codex_home: Path) -> dict[str, object]:
+    return {
+        "hooks": [
+            {
+                "type": "command",
+                "command": str(codex_home / "bin/codex-developer-workspace-guard"),
+            }
+        ]
+    }
+
+
+def _is_guard_hook_entry(entry: object) -> bool:
+    if not isinstance(entry, Mapping):
+        return False
+    hooks = entry.get("hooks")
+    if not isinstance(hooks, list):
+        return False
+    for hook in hooks:
+        if not isinstance(hook, Mapping):
+            continue
+        command = hook.get("command")
+        if isinstance(command, str) and Path(command).name == "codex-developer-workspace-guard":
+            return True
+    return False
+
+
+def _timestamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+
+
+def _atomic_write(path: Path, data: bytes, mode: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _backup_file(path: Path, backup: Path) -> None:
+    backup.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(backup.parent, 0o700)
+    shutil.copy2(path, backup)
+
+
+def install_hook(codex_home: Path) -> bool:
+    """Install the global hook once while preserving unrelated hook entries."""
+
+    home = codex_home.expanduser().resolve()
+    hooks_path = home / "hooks.json"
+    if hooks_path.exists():
+        try:
+            document = json.loads(hooks_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise ValueError("hooks.json is not valid JSON") from error
+    else:
+        document = {"hooks": {}}
+    if not isinstance(document, dict):
+        raise ValueError("hooks.json root must be an object")
+    hooks = document.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        raise ValueError("hooks.json hooks must be an object")
+    entries = hooks.setdefault("PreToolUse", [])
+    if not isinstance(entries, list):
+        raise ValueError("hooks.json PreToolUse must be a list")
+    desired = _guard_hook_entry(home)
+    retained = [entry for entry in entries if not _is_guard_hook_entry(entry)]
+    updated = [*retained, desired]
+    if updated == entries:
+        os.chmod(hooks_path, 0o600)
+        return False
+    if hooks_path.is_file():
+        backup = home / "backups/developer-workspace-guard" / _timestamp() / "hooks.json"
+        _backup_file(hooks_path, backup)
+    hooks["PreToolUse"] = updated
+    serialized = (json.dumps(document, indent=2) + "\n").encode("utf-8")
+    _atomic_write(hooks_path, serialized, 0o600)
+    return True
+
+
+_PROJECT_TABLE_HEADER = re.compile(
+    r'^\s*\[projects\.(?P<key>"(?:\\.|[^"\\])*")\]\s*(?:#.*)?$'
+)
+_ANY_TABLE_HEADER = re.compile(r"^\s*\[\[?.+\]\]?\s*(?:#.*)?$")
+
+
+def _decode_toml_string(literal: str) -> str:
+    parsed = tomllib.loads(f"value = {literal}\n")
+    value = parsed["value"]
+    if not isinstance(value, str):
+        raise ValueError("project table key is not a string")
+    return value
+
+
+def remove_documents_project_tables(text: str, protected_root: Path) -> tuple[str, int]:
+    """Remove only project tables whose decoded path is below Documents."""
+
+    tomllib.loads(text)
+    protected = protected_root.expanduser().resolve(strict=False)
+    output: list[str] = []
+    skipping = False
+    removed = 0
+    for line in text.splitlines(keepends=True):
+        if _ANY_TABLE_HEADER.match(line):
+            skipping = False
+            match = _PROJECT_TABLE_HEADER.match(line)
+            if match is not None:
+                project_path = Path(_decode_toml_string(match.group("key"))).expanduser().resolve(strict=False)
+                if _is_within(project_path, protected):
+                    skipping = True
+                    removed += 1
+        if not skipping:
+            output.append(line)
+    candidate = "".join(output)
+    tomllib.loads(candidate)
+    return candidate, removed
+
+
+def clean_project_records(codex_home: Path, account_home: Path | None = None) -> int:
+    """Remove stale Documents project trust tables with a recoverable backup."""
+
+    home = codex_home.expanduser().resolve()
+    config_path = home / "config.toml"
+    if not config_path.is_file():
+        return 0
+    original = config_path.read_text(encoding="utf-8")
+    protected = ((account_home or Path.home()) / "Documents").resolve(strict=False)
+    cleaned, removed = remove_documents_project_tables(original, protected)
+    if removed == 0:
+        return 0
+    backup = home / "config.toml.backup-before-workspace-guard-20260718"
+    if not backup.exists():
+        _backup_file(config_path, backup)
+    mode = config_path.stat().st_mode & 0o777
+    _atomic_write(config_path, cleaned.encode("utf-8"), mode)
+    return removed
+
+
+def install_guard(codex_home: Path, clean_records: bool = False) -> InstallResult:
+    """Install the hook and optionally clean public project trust records."""
+
+    hook_changed = install_hook(codex_home)
+    removed = clean_project_records(codex_home) if clean_records else 0
+    return InstallResult(hook_changed=hook_changed, project_records_removed=removed)

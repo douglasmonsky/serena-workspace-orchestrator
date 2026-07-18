@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import os
 from pathlib import Path
+import subprocess
 import sys
+import tempfile
+import tomllib
 import unittest
 
 
 ROOT = Path(__file__).resolve().parents[2]
 MODULE_PATH = ROOT / "bin/codex_developer_workspace_guard.py"
+GUARD_EXECUTABLE = ROOT / "bin/codex-developer-workspace-guard"
 SPEC = importlib.util.spec_from_file_location("codex_developer_workspace_guard", MODULE_PATH)
 assert SPEC and SPEC.loader
 GUARD = importlib.util.module_from_spec(SPEC)
@@ -178,6 +184,151 @@ class WorkspaceGuardPolicyTests(unittest.TestCase):
         )
         self.assertTrue(decision.allowed)
 
+
+class WorkspaceGuardCliTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.base = Path(self.temporary_directory.name)
+        self.codex_home = self.base / "codex"
+        self.codex_home.mkdir()
+        self.environment = os.environ | {"HOME": "/Users/Monsky"}
+
+    def tearDown(self) -> None:
+        self.temporary_directory.cleanup()
+
+    def run_guard(
+        self,
+        *arguments: str,
+        input_text: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, str(GUARD_EXECUTABLE), *arguments],
+            input=input_text,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=self.environment,
+        )
+
+    def test_cli_emits_supported_allow_and_deny_payloads(self) -> None:
+        allow_event = {
+            "session_id": "test",
+            "tool_name": "Bash",
+            "tool_input": {
+                "cmd": "git status --short --branch",
+                "workdir": "/Users/Monsky/Documents/old-app",
+            },
+        }
+        deny_event = {
+            "session_id": "test",
+            "tool_name": "Bash",
+            "tool_input": {
+                "cmd": "git init",
+                "workdir": "/Users/Monsky/Documents/new-app",
+            },
+        }
+
+        allowed = self.run_guard(input_text=json.dumps(allow_event))
+        denied = self.run_guard(input_text=json.dumps(deny_event))
+
+        self.assertEqual(0, allowed.returncode, allowed.stderr)
+        self.assertEqual(0, denied.returncode, denied.stderr)
+        self.assertEqual(
+            "allow",
+            json.loads(allowed.stdout)["hookSpecificOutput"]["permissionDecision"],
+        )
+        deny_payload = json.loads(denied.stdout)["hookSpecificOutput"]
+        self.assertEqual("deny", deny_payload["permissionDecision"])
+        self.assertIn("documents-project-write-blocked", deny_payload["permissionDecisionReason"])
+
+    def test_cli_rejects_malformed_or_oversized_input_boundedly(self) -> None:
+        malformed = self.run_guard(input_text="{")
+        oversized = self.run_guard(input_text="x" * (1024 * 1024 + 1))
+
+        for result in (malformed, oversized):
+            self.assertEqual(2, result.returncode)
+            self.assertEqual("", result.stdout)
+            self.assertLess(len(result.stderr), 300)
+
+    def test_install_preserves_serena_hook_and_is_idempotent(self) -> None:
+        hooks_path = self.codex_home / "hooks.json"
+        serena_entry = {
+            "matcher": "Bash",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": "serena-hooks remind --client=codex",
+                }
+            ],
+        }
+        hooks_path.write_text(
+            json.dumps({"hooks": {"PreToolUse": [serena_entry], "Stop": []}}),
+            encoding="utf-8",
+        )
+
+        first = self.run_guard("install", "--codex-home", str(self.codex_home))
+        second = self.run_guard("install", "--codex-home", str(self.codex_home))
+
+        self.assertEqual(0, first.returncode, first.stderr)
+        self.assertEqual(0, second.returncode, second.stderr)
+        installed = json.loads(hooks_path.read_text(encoding="utf-8"))
+        pre_tool_entries = installed["hooks"]["PreToolUse"]
+        self.assertEqual(2, len(pre_tool_entries))
+        self.assertEqual(serena_entry, pre_tool_entries[0])
+        commands = [entry["hooks"][0]["command"] for entry in pre_tool_entries]
+        self.assertEqual(1, sum(command.endswith("codex-developer-workspace-guard") for command in commands))
+        self.assertEqual(0o600, hooks_path.stat().st_mode & 0o777)
+        backups = list((self.codex_home / "backups/developer-workspace-guard").glob("*/hooks.json"))
+        self.assertEqual(1, len(backups))
+
+    def test_install_refuses_malformed_hooks_without_mutation(self) -> None:
+        hooks_path = self.codex_home / "hooks.json"
+        original = "not-json\n"
+        hooks_path.write_text(original, encoding="utf-8")
+
+        result = self.run_guard("install", "--codex-home", str(self.codex_home))
+
+        self.assertEqual(2, result.returncode)
+        self.assertEqual(original, hooks_path.read_text(encoding="utf-8"))
+        self.assertFalse((self.codex_home / "backups").exists())
+
+    def test_install_cleans_only_documents_project_tables_with_backup(self) -> None:
+        hooks_path = self.codex_home / "hooks.json"
+        hooks_path.write_text(json.dumps({"hooks": {}}), encoding="utf-8")
+        config_path = self.codex_home / "config.toml"
+        original = (
+            'model = "gpt-test"\n'
+            "# preserve this comment\n"
+            '[projects."/Users/Monsky/Documents/Misc"]\n'
+            'trust_level = "trusted"\n'
+            '\n[projects."/Users/Monsky/Documents/Codex UI Lab"]\n'
+            'trust_level = "trusted"\n'
+            '\n[projects."/Users/Monsky/Developer/Codex/repo"]\n'
+            'trust_level = "trusted"\n'
+            "\n[desktop]\n"
+            'git-worktree-root = "/Users/Monsky/Developer/Codex"\n'
+        )
+        config_path.write_text(original, encoding="utf-8")
+
+        result = self.run_guard(
+            "install",
+            "--codex-home",
+            str(self.codex_home),
+            "--clean-project-records",
+        )
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        cleaned = config_path.read_text(encoding="utf-8")
+        parsed = tomllib.loads(cleaned)
+        self.assertNotIn("/Users/Monsky/Documents/Misc", parsed["projects"])
+        self.assertNotIn("/Users/Monsky/Documents/Codex UI Lab", parsed["projects"])
+        self.assertEqual(
+            "trusted",
+            parsed["projects"]["/Users/Monsky/Developer/Codex/repo"]["trust_level"],
+        )
+        self.assertIn("# preserve this comment", cleaned)
+        backup = self.codex_home / "config.toml.backup-before-workspace-guard-20260718"
+        self.assertEqual(original, backup.read_text(encoding="utf-8"))
 
 if __name__ == "__main__":
     unittest.main()
