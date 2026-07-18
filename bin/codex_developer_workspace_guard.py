@@ -183,6 +183,22 @@ def _git_operation(tokens: list[str]) -> tuple[str, list[str]] | None:
     return None
 
 
+def _git_workdir(tokens: list[str], workdir: Path, home: Path) -> Path:
+    effective = workdir
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "-C" and index + 1 < len(tokens):
+            effective = _resolve_literal(tokens[index + 1], effective, home) or effective
+            index += 2
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        break
+    return effective
+
+
 def _explicit_project_targets(
     operation: str,
     arguments: list[str],
@@ -273,8 +289,11 @@ def _is_project_mutation(
         operation, arguments = git_operation
         if operation not in _MUTATING_GIT_COMMANDS:
             return False
-        targets = _explicit_project_targets(operation, arguments, workdir, home)
-        return _is_within(workdir, protected) or any(_is_within(path, protected) for path in targets)
+        git_workdir = _git_workdir(tokens, workdir, home)
+        targets = _explicit_project_targets(operation, arguments, git_workdir, home)
+        return _is_within(git_workdir, protected) or any(
+            _is_within(path, protected) for path in targets
+        )
     if _has_project_command(tokens):
         if _is_within(workdir, protected):
             return True

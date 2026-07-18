@@ -160,6 +160,20 @@ class WorkspaceGuardPolicyTests(unittest.TestCase):
                     self.classify("Bash", {"cmd": "git init", "workdir": workdir}).allowed
                 )
 
+    def test_git_dash_c_approved_root_overrides_legacy_event_cwd(self) -> None:
+        decision = self.classify(
+            "exec_command",
+            {
+                "cmd": (
+                    "git -C /Users/Monsky/Developer/Codex/workspace-harbor-developer-guard "
+                    "push -u origin codex/developer-workspace-guard"
+                ),
+            },
+            cwd="/Users/Monsky/Documents/Misc",
+        )
+
+        self.assertTrue(decision.allowed)
+
     def test_allows_ordinary_office_document_tools(self) -> None:
         decision = self.classify(
             "documents:documents",
