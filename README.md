@@ -114,13 +114,21 @@ attempt cannot schedule a second restart.
 ## Trust model
 
 Managed roots must be exact canonical Git top levels beneath
-`$HOME/Documents/Codex`, `$HOME/Developer/Codex`, or `$HOME/.codex/src`. The
+`$HOME/Developer/Codex` or `$HOME/.codex/src`. The
 trust helper rejects nested paths, non-Git directories, symlink escapes,
 malformed state, and roots outside those parents. It writes IntelliJ's native
 registry with locking, backup, and atomic replacement. When IntelliJ is
 running, it also calls Workspace Harbor's authenticated loopback endpoint so
 the in-memory trust state changes before the project is opened; this prevents
 a stale live registry from producing a GUI trust prompt.
+
+`codex-developer-workspace-guard install --clean-project-records` adds the
+global `PreToolUse` enforcement hook, persists Codex's canonical trust
+fingerprint for that hook, and removes only public project records below
+`$HOME/Documents`. It preserves unrelated hooks and hook trust state. The guard
+blocks project creation and mutation below Documents while allowing ordinary
+document work, read-only inspection, and deliberate migrations into
+`$HOME/Developer/Codex`.
 
 When Codex resumes a task whose stored startup directory resolves to a Serena
 project outside those managed roots, the broker starts a projectless MCP

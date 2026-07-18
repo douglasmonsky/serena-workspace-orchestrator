@@ -13,6 +13,7 @@ import tempfile
 
 
 EXECUTABLES = (
+    "codex-developer-workspace-guard",
     "deploy-workspace-harbor",
     "open-codex-project-in-intellij",
     "intellij-project-trust",
@@ -25,6 +26,7 @@ EXECUTABLES = (
     "workspace-harbor-codex-relauncher",
 )
 MODULES = (
+    "codex_developer_workspace_guard.py",
     "workspace_harbor_ide.py",
     "workspace_harbor_bootstrap.py",
     "workspace_harbor_bridge.py",

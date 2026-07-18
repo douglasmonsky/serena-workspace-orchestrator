@@ -13,6 +13,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 DEPLOY = ROOT / "bin/deploy-workspace-harbor"
 EXECUTABLES = (
+    "codex-developer-workspace-guard",
     "deploy-workspace-harbor",
     "open-codex-project-in-intellij",
     "intellij-project-trust",
@@ -25,6 +26,7 @@ EXECUTABLES = (
     "workspace-harbor-codex-relauncher",
 )
 MODULES = (
+    "codex_developer_workspace_guard.py",
     "workspace_harbor_ide.py",
     "workspace_harbor_bootstrap.py",
     "workspace_harbor_bridge.py",
@@ -124,6 +126,19 @@ class DeployWorkspaceHarborTests(unittest.TestCase):
         existing = destination / "serena-codex"
         existing.write_text("keep me\n", encoding="utf-8")
         (self.bin_source / "workspace_harbor_codex.py").unlink()
+
+        result = self.run_deploy()
+
+        self.assertEqual(2, result.returncode)
+        self.assertEqual("keep me\n", existing.read_text(encoding="utf-8"))
+        self.assertFalse((self.codex_home / "backups").exists())
+
+    def test_missing_workspace_guard_fails_before_destination_mutation(self) -> None:
+        destination = self.codex_home / "bin"
+        destination.mkdir(parents=True)
+        existing = destination / "serena-codex"
+        existing.write_text("keep me\n", encoding="utf-8")
+        (self.bin_source / "codex_developer_workspace_guard.py").unlink()
 
         result = self.run_deploy()
 

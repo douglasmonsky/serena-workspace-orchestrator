@@ -29,7 +29,6 @@ def _account_home() -> Path:
 def _default_allowed_roots() -> tuple[Path, ...]:
     home = _account_home()
     return (
-        home / "Documents/Codex",
         home / "Developer/Codex",
         home / ".codex/src",
     )

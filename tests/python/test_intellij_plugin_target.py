@@ -33,9 +33,9 @@ class IntelliJPluginTargetTests(unittest.TestCase):
         self.assertIn('"intellij-projects"', service)
         self.assertNotIn('"pycharm-projects"', service)
 
-    def test_plugin_trusts_both_codex_workspace_parents(self):
+    def test_plugin_trusts_only_local_codex_workspace_parents(self):
         service = (ROOT / "src/main/java/com/monsky/workspaceharbor/lifecycle/LifecycleService.java").read_text()
-        self.assertIn('home.resolve("Documents/Codex")', service)
+        self.assertNotIn('home.resolve("Documents/Codex")', service)
         self.assertIn('home.resolve("Developer/Codex")', service)
 
     def test_gradle_projects_use_intellij_bundled_runtime_before_import(self):
