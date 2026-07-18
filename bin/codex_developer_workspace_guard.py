@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -416,10 +417,66 @@ def install_hook(codex_home: Path) -> bool:
     return True
 
 
+def command_hook_hash(
+    *,
+    event_name: str,
+    matcher: str | None,
+    command: str,
+    timeout: int = 600,
+    asynchronous: bool = False,
+) -> str:
+    """Return Codex's canonical trust fingerprint for a command hook."""
+
+    identity: dict[str, object] = {
+        "event_name": event_name,
+        "hooks": [
+            {
+                "async": asynchronous,
+                "command": command,
+                "timeout": max(1, timeout),
+                "type": "command",
+            }
+        ],
+    }
+    if matcher is not None:
+        identity["matcher"] = matcher
+    serialized = json.dumps(
+        identity,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(serialized).hexdigest()}"
+
+
+def _guard_hook_identity(codex_home: Path) -> tuple[str, str, str | None, str]:
+    hooks_path = codex_home / "hooks.json"
+    document = json.loads(hooks_path.read_text(encoding="utf-8"))
+    entries = document["hooks"]["PreToolUse"]
+    for group_index, entry in enumerate(entries):
+        if not _is_guard_hook_entry(entry):
+            continue
+        matcher = entry.get("matcher")
+        for handler_index, handler in enumerate(entry["hooks"]):
+            command = handler.get("command")
+            if isinstance(command, str) and Path(command).name == "codex-developer-workspace-guard":
+                key = f"{hooks_path}:pre_tool_use:{group_index}:{handler_index}"
+                return key, command_hook_hash(
+                    event_name="pre_tool_use",
+                    matcher=matcher if isinstance(matcher, str) else None,
+                    command=command,
+                ), matcher, command
+    raise ValueError("installed workspace guard hook could not be located")
+
+
 _PROJECT_TABLE_HEADER = re.compile(
     r'^\s*\[projects\.(?P<key>"(?:\\.|[^"\\])*")\]\s*(?:#.*)?$'
 )
 _ANY_TABLE_HEADER = re.compile(r"^\s*\[\[?.+\]\]?\s*(?:#.*)?$")
+_HOOK_STATE_TABLE_HEADER = re.compile(
+    r'^\s*\[hooks\.state\.(?P<key>"(?:\\.|[^"\\])*")\]\s*(?:#.*)?$'
+)
+_TRUSTED_HASH_LINE = re.compile(r"^\s*trusted_hash\s*=")
 
 
 def _decode_toml_string(literal: str) -> str:
@@ -474,9 +531,80 @@ def clean_project_records(codex_home: Path, account_home: Path | None = None) ->
     return removed
 
 
+def upsert_hook_trust(text: str, key: str, trusted_hash: str) -> str:
+    """Update one hook-state trust entry without reformatting unrelated config."""
+
+    tomllib.loads(text)
+    lines = text.splitlines(keepends=True)
+    target_start: int | None = None
+    target_end = len(lines)
+    for index, line in enumerate(lines):
+        if target_start is not None and _ANY_TABLE_HEADER.match(line):
+            target_end = index
+            break
+        match = _HOOK_STATE_TABLE_HEADER.match(line)
+        if match is not None and _decode_toml_string(match.group("key")) == key:
+            target_start = index
+
+    trusted_line = f'trusted_hash = "{trusted_hash}"\n'
+    if target_start is None:
+        if lines and not lines[-1].endswith(("\n", "\r")):
+            lines[-1] += "\n"
+        if lines and lines[-1].strip():
+            lines.append("\n")
+        lines.extend(
+            [
+                f"[hooks.state.{json.dumps(key)}]\n",
+                trusted_line,
+            ]
+        )
+    else:
+        trusted_index = next(
+            (
+                index
+                for index in range(target_start + 1, target_end)
+                if _TRUSTED_HASH_LINE.match(lines[index])
+            ),
+            None,
+        )
+        if trusted_index is None:
+            lines.insert(target_start + 1, trusted_line)
+        else:
+            lines[trusted_index] = trusted_line
+    candidate = "".join(lines)
+    tomllib.loads(candidate)
+    return candidate
+
+
+def persist_guard_trust(codex_home: Path) -> bool:
+    """Persist the installed guard's supported Codex trust fingerprint."""
+
+    home = codex_home.expanduser().resolve()
+    config_path = home / "config.toml"
+    original = config_path.read_text(encoding="utf-8") if config_path.is_file() else ""
+    key, trusted_hash, _, _ = _guard_hook_identity(home)
+    updated = upsert_hook_trust(original, key, trusted_hash)
+    if updated == original:
+        return False
+    backup = home / "config.toml.backup-before-workspace-guard-20260718"
+    if config_path.is_file() and not backup.exists():
+        _backup_file(config_path, backup)
+    mode = config_path.stat().st_mode & 0o777 if config_path.is_file() else 0o600
+    _atomic_write(config_path, updated.encode("utf-8"), mode)
+    return True
+
+
 def install_guard(codex_home: Path, clean_records: bool = False) -> InstallResult:
     """Install the hook and optionally clean public project trust records."""
 
+    home = codex_home.expanduser().resolve()
+    config_path = home / "config.toml"
+    if config_path.is_file():
+        try:
+            tomllib.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
+            raise ValueError("config.toml is not valid TOML") from error
     hook_changed = install_hook(codex_home)
+    persist_guard_trust(codex_home)
     removed = clean_project_records(codex_home) if clean_records else 0
     return InstallResult(hook_changed=hook_changed, project_records_removed=removed)

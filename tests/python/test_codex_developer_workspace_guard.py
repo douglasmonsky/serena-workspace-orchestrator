@@ -252,6 +252,7 @@ class WorkspaceGuardCliTests(unittest.TestCase):
 
     def test_install_preserves_serena_hook_and_is_idempotent(self) -> None:
         hooks_path = self.codex_home / "hooks.json"
+        config_path = self.codex_home / "config.toml"
         serena_entry = {
             "matcher": "Bash",
             "hooks": [
@@ -263,6 +264,11 @@ class WorkspaceGuardCliTests(unittest.TestCase):
         }
         hooks_path.write_text(
             json.dumps({"hooks": {"PreToolUse": [serena_entry], "Stop": []}}),
+            encoding="utf-8",
+        )
+        config_path.write_text(
+            '[hooks.state."existing:stop:0:0"]\n'
+            'trusted_hash = "sha256:preserve-me"\n',
             encoding="utf-8",
         )
 
@@ -280,6 +286,40 @@ class WorkspaceGuardCliTests(unittest.TestCase):
         self.assertEqual(0o600, hooks_path.stat().st_mode & 0o777)
         backups = list((self.codex_home / "backups/developer-workspace-guard").glob("*/hooks.json"))
         self.assertEqual(1, len(backups))
+        state = tomllib.loads(config_path.read_text(encoding="utf-8"))["hooks"]["state"]
+        self.assertEqual("sha256:preserve-me", state["existing:stop:0:0"]["trusted_hash"])
+        guard_key = f"{hooks_path.resolve()}:pre_tool_use:1:0"
+        self.assertEqual(
+            GUARD.command_hook_hash(
+                event_name="pre_tool_use",
+                matcher=None,
+                command=str(self.codex_home.resolve() / "bin/codex-developer-workspace-guard"),
+            ),
+            state[guard_key]["trusted_hash"],
+        )
+
+    def test_command_hook_hash_matches_codex_fingerprint(self) -> None:
+        self.assertEqual(
+            "sha256:94c9b8e6da2b93341e76bbf67b99b10bfa28a3cc4da97e3c7754132b22226aa2",
+            GUARD.command_hook_hash(
+                event_name="pre_tool_use",
+                matcher="Bash",
+                command="serena-hooks remind --client=codex",
+            ),
+        )
+
+    def test_install_refuses_malformed_config_without_mutation(self) -> None:
+        hooks_path = self.codex_home / "hooks.json"
+        original_hooks = json.dumps({"hooks": {"PreToolUse": []}})
+        hooks_path.write_text(original_hooks, encoding="utf-8")
+        config_path = self.codex_home / "config.toml"
+        config_path.write_text("not = [valid\n", encoding="utf-8")
+
+        result = self.run_guard("install", "--codex-home", str(self.codex_home))
+
+        self.assertEqual(2, result.returncode)
+        self.assertEqual(original_hooks, hooks_path.read_text(encoding="utf-8"))
+        self.assertEqual("not = [valid\n", config_path.read_text(encoding="utf-8"))
 
     def test_install_refuses_malformed_hooks_without_mutation(self) -> None:
         hooks_path = self.codex_home / "hooks.json"
