@@ -858,7 +858,6 @@ def _project_is_brokerable(project_root: Path) -> bool:
     """Return whether the root is eligible for managed IntelliJ lifecycle."""
     account_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
     allowed_parents = (
-        account_home / "Documents/Codex",
         account_home / "Developer/Codex",
         account_home / ".codex/src",
     )

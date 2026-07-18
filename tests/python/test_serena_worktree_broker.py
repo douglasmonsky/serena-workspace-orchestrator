@@ -639,8 +639,10 @@ class SerenaWorktreeBrokerTests(unittest.TestCase):
     def test_brokerable_project_requires_authenticated_home_managed_root(self) -> None:
         home = Path(self.temporary_directory.name) / "account-home"
         managed = home / "Developer/Codex/project"
+        legacy = home / "Documents/Codex/project"
         unmanaged = home / "Documents/other-project"
         managed.mkdir(parents=True)
+        legacy.mkdir(parents=True)
         unmanaged.mkdir(parents=True)
         predicate = getattr(broker, "_project_is_brokerable", lambda _root: None)
 
@@ -650,6 +652,7 @@ class SerenaWorktreeBrokerTests(unittest.TestCase):
             return_value=SimpleNamespace(pw_dir=str(home)),
         ):
             self.assertTrue(predicate(managed))
+            self.assertFalse(predicate(legacy))
             self.assertFalse(predicate(unmanaged))
 
     def test_locked_state_round_trips_with_private_permissions(self) -> None:
