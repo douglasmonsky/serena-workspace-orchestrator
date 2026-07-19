@@ -580,6 +580,147 @@ class SerenaWorktreeBrokerTests(unittest.TestCase):
             [call.args[0].stage for call in append.call_args_list],
         )
 
+    def test_connect_hybrid_starts_both_services_and_cleans_both_leases(self) -> None:
+        root = Path(self.temporary_directory.name) / "project"; root.mkdir()
+        proxy = Path(self.temporary_directory.name) / "mcp-proxy"; proxy.write_text("fixture")
+        gateway = Path(self.temporary_directory.name) / "serena-hybrid-mcp"; gateway.write_text("fixture"); gateway.chmod(0o755)
+        args = SimpleNamespace(project=str(root), backend="JetBrains", context="codex", add_mode=())
+        resolution = broker.OwnerResolution(None, "codex-host-shared", "codex-host")
+        state = {"version": 1, "services": {}}
+        records = {
+            "JetBrains": {"leases": {}, "port": 24320, "project_root": str(root), "pid": 201, "process_started": "primary-start"},
+            "LSP": {"leases": {}, "port": 24321, "project_root": str(root), "pid": 202, "process_started": "secondary-start"},
+        }
+        locked = mock.MagicMock()
+        locked.return_value.__enter__.return_value = state
+        locked.return_value.__exit__.return_value = False
+
+        def start_service(current_state, project_root, backend, context, added_modes):
+            key = broker._service_key(project_root, backend, context, added_modes)
+            current_state["services"][key] = records[backend]
+            return key, records[backend]
+
+        def run_gateway(command, check=False):
+            self.assertEqual(str(gateway), command[0])
+            self.assertIn("--primary-url", command)
+            self.assertIn("http://127.0.0.1:24320/mcp", command)
+            self.assertIn("--secondary-url", command)
+            self.assertIn("http://127.0.0.1:24321/mcp", command)
+            self.assertEqual(1, len(records["JetBrains"]["leases"]))
+            self.assertEqual(1, len(records["LSP"]["leases"]))
+            return mock.Mock(returncode=0)
+
+        with mock.patch.object(broker, "_resolve_project", return_value=root), mock.patch.object(
+            broker, "_auto_repair_project_languages", return_value={"configured_languages": ["cpp"]}
+        ), mock.patch.object(broker, "_bootstrap_status"), mock.patch.object(
+            broker, "_hybrid_cpp_activation", return_value=broker.HybridCppActivation(True, "/usr/bin/clangd", "enabled")
+        ), mock.patch.object(broker, "MCP_PROXY", proxy), mock.patch.object(
+            broker, "HYBRID_GATEWAY", gateway, create=True
+        ), mock.patch.object(broker, "_owner_resolution", return_value=resolution), mock.patch.object(
+            broker, "_process_details", return_value=("broker-start", "broker")
+        ), mock.patch.object(broker, "_locked_state", locked), mock.patch.object(
+            broker, "_cleanup_state"
+        ), mock.patch.object(broker, "_migrate_legacy_host_leases"), mock.patch.object(
+            broker, "_assert_root_owner"
+        ), mock.patch.object(broker, "_start_service", side_effect=start_service) as start, mock.patch.object(
+            broker.subprocess, "run", side_effect=run_gateway
+        ), mock.patch.object(broker, "_prune_dead_leases"), mock.patch.object(
+            broker.BRIDGE_JOURNAL, "append", return_value=True
+        ) as append:
+            result = broker._connect(args)
+            reused_result = broker._connect(args)
+
+        self.assertEqual(0, result)
+        self.assertEqual(0, reused_result)
+        self.assertEqual(
+            ["JetBrains", "LSP", "JetBrains", "LSP"],
+            [call.args[2] for call in start.call_args_list],
+        )
+        self.assertEqual({}, records["JetBrains"]["leases"])
+        self.assertEqual({}, records["LSP"]["leases"])
+        stages = [call.args[0].stage for call in append.call_args_list]
+        self.assertIn("secondary-service-started", stages)
+        self.assertIn("secondary-service-reused", stages)
+        self.assertIn("hybrid-proxy-started", stages)
+
+    def test_connect_hybrid_degrades_explicitly_when_secondary_start_fails(self) -> None:
+        root = Path(self.temporary_directory.name) / "project"; root.mkdir()
+        proxy = Path(self.temporary_directory.name) / "mcp-proxy"; proxy.write_text("fixture")
+        gateway = Path(self.temporary_directory.name) / "serena-hybrid-mcp"; gateway.write_text("fixture"); gateway.chmod(0o755)
+        args = SimpleNamespace(project=str(root), backend="JetBrains", context="codex", add_mode=())
+        resolution = broker.OwnerResolution(None, "codex-host-shared", "codex-host")
+        primary = {"leases": {}, "port": 24320, "project_root": str(root), "pid": 201, "process_started": "primary-start"}
+        primary_key = broker._service_key(root, "JetBrains", "codex", ())
+        state = {"version": 1, "services": {}}
+        locked = mock.MagicMock()
+        locked.return_value.__enter__.return_value = state
+        locked.return_value.__exit__.return_value = False
+
+        def start_service(current_state, project_root, backend, context, added_modes):
+            if backend == "LSP":
+                raise RuntimeError("secondary startup detail must stay private")
+            current_state["services"][primary_key] = primary
+            return primary_key, primary
+
+        def run_gateway(command, check=False):
+            self.assertEqual(str(gateway), command[0])
+            self.assertIn("--secondary-error", command)
+            self.assertIn("clangd-unavailable", command)
+            self.assertEqual(1, len(primary["leases"]))
+            return mock.Mock(returncode=0)
+
+        with mock.patch.object(broker, "_resolve_project", return_value=root), mock.patch.object(
+            broker, "_auto_repair_project_languages", return_value={"detected_languages": ["cpp"]}
+        ), mock.patch.object(broker, "_bootstrap_status"), mock.patch.object(
+            broker, "_hybrid_cpp_activation", return_value=broker.HybridCppActivation(True, "/usr/bin/clangd", "enabled")
+        ), mock.patch.object(broker, "MCP_PROXY", proxy), mock.patch.object(
+            broker, "HYBRID_GATEWAY", gateway, create=True
+        ), mock.patch.object(broker, "_owner_resolution", return_value=resolution), mock.patch.object(
+            broker, "_process_details", return_value=("broker-start", "broker")
+        ), mock.patch.object(broker, "_locked_state", locked), mock.patch.object(
+            broker, "_cleanup_state"
+        ), mock.patch.object(broker, "_migrate_legacy_host_leases"), mock.patch.object(
+            broker, "_assert_root_owner"
+        ), mock.patch.object(broker, "_start_service", side_effect=start_service), mock.patch.object(
+            broker.subprocess, "run", side_effect=run_gateway
+        ), mock.patch.object(broker, "_prune_dead_leases"), mock.patch.object(
+            broker.BRIDGE_JOURNAL, "append", return_value=True
+        ) as append:
+            result = broker._connect(args)
+
+        self.assertEqual(0, result)
+        self.assertEqual({}, primary["leases"])
+        unavailable = [
+            call.args[0] for call in append.call_args_list
+            if call.args[0].stage == "secondary-service-unavailable"
+        ]
+        self.assertEqual(1, len(unavailable))
+        self.assertEqual(("unavailable", "clangd-unavailable"), (unavailable[0].outcome, unavailable[0].reason))
+
+    def test_connect_missing_hybrid_gateway_falls_back_to_primary_proxy(self) -> None:
+        root = Path(self.temporary_directory.name) / "project"; root.mkdir()
+        proxy = Path(self.temporary_directory.name) / "mcp-proxy"; proxy.write_text("fixture")
+        missing_gateway = Path(self.temporary_directory.name) / "missing-hybrid-gateway"
+        args = SimpleNamespace(project=str(root), backend="JetBrains", context="codex", add_mode=())
+        activation = broker.HybridCppActivation(True, "/usr/bin/clangd", "enabled")
+
+        with mock.patch.object(broker, "_resolve_project", return_value=root), mock.patch.object(
+            broker, "_auto_repair_project_languages", return_value={"detected_languages": ["cpp"]}
+        ), mock.patch.object(broker, "_bootstrap_status"), mock.patch.object(
+            broker, "_hybrid_cpp_activation", return_value=activation
+        ), mock.patch.object(broker, "MCP_PROXY", proxy), mock.patch.object(
+            broker, "HYBRID_GATEWAY", missing_gateway, create=True
+        ), mock.patch.object(
+            broker, "_owner_resolution", side_effect=RuntimeError("stop after fallback classification")
+        ), mock.patch.object(broker.BRIDGE_JOURNAL, "append", return_value=True) as append:
+            with self.assertRaisesRegex(RuntimeError, "stop after fallback classification"):
+                broker._connect(args)
+
+        events = [call.args[0] for call in append.call_args_list]
+        fallback = [event for event in events if event.stage == "secondary-service-unavailable"]
+        self.assertEqual(1, len(fallback))
+        self.assertEqual("hybrid-gateway-missing", fallback[0].reason)
+
     def test_connect_records_project_resolution_failure(self) -> None:
         args = SimpleNamespace(
             project="/missing", backend="JetBrains", context="codex", add_mode=()
@@ -843,17 +984,76 @@ class SerenaWorktreeBrokerTests(unittest.TestCase):
         self.assertEqual({}, state["services"])
 
     def test_language_auto_repair_invokes_project_doctor(self) -> None:
-        completed = mock.Mock(returncode=0, stdout="{}", stderr="")
+        completed = mock.Mock(
+            returncode=0,
+            stdout=json.dumps(
+                {"configured_languages": ["python", "cpp"], "detected_languages": ["cpp"]}
+            ),
+            stderr="",
+        )
         doctor_path = Path(self.temporary_directory.name) / "doctor"
         doctor_path.write_text("fixture", encoding="utf-8")
         with mock.patch.object(broker, "PROJECT_DOCTOR", doctor_path), mock.patch.object(
             broker.subprocess, "run", return_value=completed
         ) as run:
-            broker._auto_repair_project_languages(Path("/tmp/example"))
+            payload = broker._auto_repair_project_languages(Path("/tmp/example"))
 
         command = run.call_args.args[0]
         self.assertIn("--repair-languages", command)
         self.assertIn("--json", command)
+        self.assertEqual(["python", "cpp"], payload["configured_languages"])
+
+    def test_language_auto_repair_normalizes_non_object_json(self) -> None:
+        completed = mock.Mock(returncode=0, stdout="[]", stderr="")
+        doctor_path = Path(self.temporary_directory.name) / "doctor"
+        doctor_path.write_text("fixture", encoding="utf-8")
+        with mock.patch.object(broker, "PROJECT_DOCTOR", doctor_path), mock.patch.object(
+            broker.subprocess, "run", return_value=completed
+        ):
+            self.assertEqual({}, broker._auto_repair_project_languages(Path("/tmp/example")))
+
+    def test_hybrid_cpp_activation_requires_cpp_and_clangd(self) -> None:
+        payloads = (
+            {"configured_languages": ["python", "cpp"]},
+            {"detected_languages": ["typescript", "cpp"]},
+            {"language_repair": {"configured_languages": ["cpp"]}},
+        )
+        with mock.patch.object(broker.shutil, "which", return_value="/usr/bin/clangd"):
+            for payload in payloads:
+                with self.subTest(payload=payload):
+                    activation = broker._hybrid_cpp_activation(Path("/tmp/example"), payload)
+                    self.assertTrue(activation.enabled)
+                    self.assertEqual("/usr/bin/clangd", activation.clangd_path)
+                    self.assertEqual("enabled", activation.reason)
+
+        with mock.patch.object(broker.shutil, "which", return_value=None):
+            activation = broker._hybrid_cpp_activation(
+                Path("/tmp/example"), {"detected_languages": ["cpp"]}
+            )
+        self.assertFalse(activation.enabled)
+        self.assertEqual("clangd-unavailable", activation.reason)
+
+    def test_hybrid_cpp_activation_honors_false_like_kill_switch(self) -> None:
+        for value in ("0", "false", "FALSE", "no", "off", " Off "):
+            with self.subTest(value=value), mock.patch.dict(
+                os.environ, {"SERENA_HYBRID_CPP_ENABLED": value}
+            ), mock.patch.object(
+                broker.shutil, "which", return_value="/usr/bin/clangd"
+            ):
+                activation = broker._hybrid_cpp_activation(
+                    Path("/tmp/example"), {"configured_languages": ["cpp"]}
+                )
+                self.assertFalse(activation.enabled)
+                self.assertEqual("disabled", activation.reason)
+
+    def test_hybrid_cpp_activation_rejects_non_native_or_malformed_payloads(self) -> None:
+        for payload in ({}, [], {"configured_languages": "cpp"}, {"detected_languages": [1]}):
+            with self.subTest(payload=payload), mock.patch.object(
+                broker.shutil, "which", return_value="/usr/bin/clangd"
+            ):
+                activation = broker._hybrid_cpp_activation(Path("/tmp/example"), payload)
+                self.assertFalse(activation.enabled)
+                self.assertIn(activation.reason, {"language-missing", "invalid-doctor-payload"})
 
     def test_intellij_launcher_timeout_exceeds_bootstrap_and_ready_timeouts(self) -> None:
         completed = mock.Mock(returncode=0, stdout="", stderr="")

@@ -62,6 +62,11 @@ REAL_SERENA = Path(
 MCP_PROXY = Path(
     os.environ.get("SERENA_BROKER_MCP_PROXY", Path.home() / ".local" / "bin" / "mcp-proxy")
 )
+HYBRID_GATEWAY = Path(
+    os.environ.get(
+        "SERENA_BROKER_HYBRID_GATEWAY", CODEX_HOME / "bin" / "serena-hybrid-mcp"
+    )
+)
 INTELLIJ_LAUNCHER = Path(
     os.environ.get(
         "SERENA_BROKER_INTELLIJ_LAUNCHER",
@@ -130,6 +135,14 @@ THREAD_ID_PATTERN = re.compile(
 LEGACY_PROCESS_OWNER_PATTERN = re.compile(r"^manual-pid-([1-9][0-9]*)$")
 MAX_SESSION_META_BYTES = 65_536
 MAX_LINEAGE_DEPTH = 8
+HYBRID_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
+
+
+@dataclass(frozen=True)
+class HybridCppActivation:
+    enabled: bool
+    clangd_path: str | None
+    reason: str
 
 
 def _opener_result(completed: subprocess.CompletedProcess[str]) -> dict[str, Any]:
@@ -688,7 +701,7 @@ def _open_intellij(project_root: Path) -> None:
         raise RuntimeError(f"failed to open IntelliJ project: {message}")
 
 
-def _auto_repair_project_languages(project_root: Path) -> None:
+def _auto_repair_project_languages(project_root: Path) -> dict[str, Any]:
     if not PROJECT_DOCTOR.is_file():
         raise RuntimeError(f"Serena project doctor not found: {PROJECT_DOCTOR}")
     result = subprocess.run(
@@ -701,6 +714,53 @@ def _auto_repair_project_languages(project_root: Path) -> None:
     if result.returncode != 0:
         message = result.stderr.strip() or result.stdout.strip()
         raise RuntimeError(f"Serena language auto-repair failed: {message}")
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("Serena language auto-repair returned malformed JSON") from error
+    return payload if isinstance(payload, dict) else {}
+
+
+def _hybrid_cpp_activation(
+    project_root: Path, doctor_payload: object
+) -> HybridCppActivation:
+    enabled_value = os.environ.get("SERENA_HYBRID_CPP_ENABLED", "1")
+    if enabled_value.strip().casefold() in HYBRID_FALSE_VALUES:
+        return HybridCppActivation(False, None, "disabled")
+    if not isinstance(doctor_payload, dict):
+        return HybridCppActivation(False, None, "invalid-doctor-payload")
+
+    language_sources: list[object] = [
+        doctor_payload.get("configured_languages"),
+        doctor_payload.get("detected_languages"),
+    ]
+    language_repair = doctor_payload.get("language_repair")
+    if language_repair is not None:
+        if not isinstance(language_repair, dict):
+            return HybridCppActivation(False, None, "invalid-doctor-payload")
+        language_sources.extend(
+            (
+                language_repair.get("configured_languages"),
+                language_repair.get("detected_languages"),
+            )
+        )
+
+    languages: set[str] = set()
+    for source in language_sources:
+        if source is None:
+            continue
+        if not isinstance(source, list) or not all(
+            isinstance(language, str) for language in source
+        ):
+            return HybridCppActivation(False, None, "invalid-doctor-payload")
+        languages.update(language.casefold() for language in source)
+    if "cpp" not in languages:
+        return HybridCppActivation(False, None, "language-missing")
+
+    clangd_path = shutil.which("clangd")
+    if not clangd_path:
+        return HybridCppActivation(False, None, "clangd-unavailable")
+    return HybridCppActivation(True, clangd_path, "enabled")
 
 
 def _bootstrap_status(project_root: Path) -> dict[str, Any]:
@@ -967,9 +1027,24 @@ def _connect(args: argparse.Namespace) -> int:
             args.add_mode,
             project_from_cwd=False,
         )
-    _auto_repair_project_languages(project_root)
+    doctor_payload = _auto_repair_project_languages(project_root)
     _bootstrap_status(project_root)
-    if not MCP_PROXY.is_file():
+    activation = _hybrid_cpp_activation(project_root, doctor_payload)
+    hybrid_requested = activation.enabled and args.backend.casefold() == "jetbrains"
+    gateway_available = HYBRID_GATEWAY.is_file() and os.access(
+        HYBRID_GATEWAY, os.X_OK
+    )
+    hybrid_enabled = hybrid_requested and gateway_available
+    if hybrid_requested and not gateway_available:
+        _bridge_event(
+            attempt_id,
+            started,
+            "secondary-service-unavailable",
+            "unavailable",
+            root=project_root,
+            reason="hybrid-gateway-missing",
+        )
+    if not hybrid_enabled and not MCP_PROXY.is_file():
         _bridge_event(
             attempt_id,
             started,
@@ -982,6 +1057,9 @@ def _connect(args: argparse.Namespace) -> int:
 
     lease_id = uuid.uuid4().hex
     key: str | None = None
+    secondary_key: str | None = None
+    leased_keys: list[str] = []
+    secondary_port: int | None = None
     resolution: OwnerResolution | None = None
     try:
         resolution = _owner_resolution()
@@ -1025,6 +1103,7 @@ def _connect(args: argparse.Namespace) -> int:
                 "process_started": broker_details[0],
             }
             record["idle_since"] = None
+            leased_keys.append(key)
             port = int(record["port"])
             _bridge_event(
                 attempt_id,
@@ -1035,6 +1114,50 @@ def _connect(args: argparse.Namespace) -> int:
                 service_key=key,
                 owner_source=resolution.source,
             )
+            if hybrid_enabled:
+                expected_secondary_key = _service_key(
+                    project_root, "LSP", args.context, args.add_mode
+                )
+                previous_secondary = state["services"].get(expected_secondary_key)
+                try:
+                    secondary_key, secondary_record = _start_service(
+                        state, project_root, "LSP", args.context, args.add_mode
+                    )
+                except (OSError, RuntimeError, subprocess.SubprocessError):
+                    _bridge_event(
+                        attempt_id,
+                        started,
+                        "secondary-service-unavailable",
+                        "unavailable",
+                        root=project_root,
+                        service_key=expected_secondary_key,
+                        owner_source=resolution.source,
+                        reason="clangd-unavailable",
+                    )
+                else:
+                    secondary_stage = (
+                        "secondary-service-reused"
+                        if previous_secondary is secondary_record
+                        else "secondary-service-started"
+                    )
+                    _bridge_event(
+                        attempt_id,
+                        started,
+                        secondary_stage,
+                        "ok",
+                        root=project_root,
+                        service_key=secondary_key,
+                        owner_source=resolution.source,
+                    )
+                    secondary_record["leases"][lease_id] = {
+                        "created_at": _now(),
+                        "owner_id": owner_id,
+                        "pid": os.getpid(),
+                        "process_started": broker_details[0],
+                    }
+                    secondary_record["idle_since"] = None
+                    leased_keys.append(secondary_key)
+                    secondary_port = int(secondary_record["port"])
     except (OSError, RuntimeError, subprocess.SubprocessError):
         _bridge_event(
             attempt_id,
@@ -1048,16 +1171,33 @@ def _connect(args: argparse.Namespace) -> int:
         )
         raise
 
-    proxy_command = [
-        str(MCP_PROXY),
-        f"http://127.0.0.1:{port}/mcp",
-        "--transport=streamablehttp",
-        "--log-level=WARNING",
-    ]
+    if hybrid_enabled:
+        proxy_command = [
+            str(HYBRID_GATEWAY),
+            "--project-root",
+            str(project_root),
+            "--primary-url",
+            f"http://127.0.0.1:{port}/mcp",
+        ]
+        if secondary_port is None:
+            proxy_command.extend(("--secondary-error", "clangd-unavailable"))
+        else:
+            proxy_command.extend(
+                ("--secondary-url", f"http://127.0.0.1:{secondary_port}/mcp")
+            )
+        proxy_stage = "hybrid-proxy-started"
+    else:
+        proxy_command = [
+            str(MCP_PROXY),
+            f"http://127.0.0.1:{port}/mcp",
+            "--transport=streamablehttp",
+            "--log-level=WARNING",
+        ]
+        proxy_stage = "proxy-started"
     _bridge_event(
         attempt_id,
         started,
-        "proxy-started",
+        proxy_stage,
         "ok",
         root=project_root,
         service_key=key,
@@ -1079,12 +1219,13 @@ def _connect(args: argparse.Namespace) -> int:
     finally:
         try:
             with _locked_state() as state:
-                current = state["services"].get(key)
-                if isinstance(current, dict):
-                    leases = current.setdefault("leases", {})
-                    leases.pop(lease_id, None)
-                    _prune_dead_leases(current)
-                    current["last_used_at"] = _now()
+                for leased_key in leased_keys:
+                    current = state["services"].get(leased_key)
+                    if isinstance(current, dict):
+                        leases = current.setdefault("leases", {})
+                        leases.pop(lease_id, None)
+                        _prune_dead_leases(current)
+                        current["last_used_at"] = _now()
             _bridge_event(
                 attempt_id,
                 started,
