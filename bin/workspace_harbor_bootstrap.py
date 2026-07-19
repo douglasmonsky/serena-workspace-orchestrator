@@ -25,7 +25,7 @@ CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
 CODEX_TASK = Path(os.environ.get("WORKSPACE_HARBOR_CODEX_TASK", CODEX_HOME / "bin/codex-task"))
 PRUNED_DIRECTORIES = {".git", ".idea", ".serena", ".venv", "venv", "node_modules", "target", "build", "dist", "vendor", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
 STATE_VERSION = 1
-SUPPORTED_LANGUAGES = {"python", "rust", "go", "java", "kotlin", "typescript", "svelte", "vue", "angular", "csharp", "php", "ruby", "swift"}
+SUPPORTED_LANGUAGES = {"python", "rust", "go", "java", "kotlin", "typescript", "svelte", "vue", "angular", "csharp", "php", "ruby", "swift", "cpp"}
 ANSI_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 SECRET_ASSIGNMENT_RE = re.compile(
     r"(?im)\b([A-Za-z0-9_-]*(?:token|password|secret|api[_-]?key|authorization)[A-Za-z0-9_-]*)"
@@ -631,6 +631,7 @@ def language_evidence(root: Path, language: str) -> str:
         "angular": ({".ts"}, "angular.json" in files and "package.json" in files),
         "csharp": ({".cs"}, any(root.glob("*.csproj"))), "php": ({".php"}, "composer.lock" in files),
         "ruby": ({".rb"}, "Gemfile.lock" in files), "swift": ({".swift"}, "Package.resolved" in files),
+        "cpp": ({".c", ".cc", ".cpp", ".h", ".hpp"}, bool({"CMakeLists.txt", "meson.build", "Makefile"} & files)),
     }
     suffixes, confirmed = rules.get(language, (set(), False))
     source = _contains_source(root, suffixes)

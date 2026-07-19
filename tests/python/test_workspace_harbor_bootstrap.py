@@ -165,6 +165,14 @@ class BootstrapPlansTests(unittest.TestCase):
         self.assertEqual(0o600, record.stat().st_mode & 0o777)
         self.assertEqual(0o700, (state / "repositories").stat().st_mode & 0o777)
 
+    def test_cpp_language_decision_is_supported_and_evidence_bound(self):
+        state = Path(self.tmp.name) / "state"
+        self.write("native/main.c", "int main(void) { return 0; }\n")
+        with patch.dict(os.environ, {"WORKSPACE_HARBOR_BOOTSTRAP_STATE_DIR": str(state)}, clear=False):
+            self.assertEqual("source-only", bootstrap.language_evidence(self.root, "cpp"))
+            bootstrap.record_decision(self.root, "language", "cpp", "enable")
+            self.assertEqual("enable", bootstrap.language_decision(self.root, "cpp"))
+
     def test_tracking_and_exact_command_decisions_and_corrupt_state(self):
         state = Path(self.tmp.name) / "state"; self.write("setup.lock", "v1")
         self.write(".serena/codex-integration.yml", "bootstrap:\n  command: {argv: [tool, setup], inputs: [setup.lock]}\n")
