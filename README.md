@@ -68,6 +68,54 @@ python3 -m unittest discover -s tests/python -p 'test_*.py' -v
   disabled by default and require a sole-active-task attestation plus a
   one-shot task heartbeat.
 
+## Hybrid C/C++ semantics
+
+For a repository whose Serena project doctor reports the `cpp` language and
+whose `PATH` contains an executable `clangd`, the broker keeps JetBrains as the
+primary Serena backend and starts one additional broker-owned LSP service.
+The exposed tool catalog does not change. Calls to these JetBrains-named tools
+are transparently served by clangd when `relative_path` names an existing C or
+C++ source or header inside the repository:
+
+- `jet_brains_get_symbols_overview`
+- `jet_brains_find_symbol`
+- `jet_brains_find_referencing_symbols`
+- `jet_brains_find_declaration`
+- `jet_brains_find_implementations`
+- `jet_brains_run_inspections`
+
+Java, JavaScript, TypeScript, TSX, and Python continue through JetBrains.
+Pathless and directory-scoped searches also remain JetBrains-backed, as do
+semantic edits, refactors, type hierarchy, and debugger calls. Native routing
+is deliberately limited to safe file-scoped reads whose result contract can
+be preserved.
+
+A repository-owned `compile_commands.json` gives clangd the most accurate
+include paths, defines, and compiler flags. Its absence does not block startup,
+but results may have lower confidence because clangd uses fallback flags.
+Workspace Harbor never runs a build or package-manager command to generate the
+compile database.
+
+Set `SERENA_HYBRID_CPP_ENABLED=0` (also `false`, `no`, or `off`) on the broker
+environment to disable the secondary backend. If secondary startup fails after
+hybrid activation, the JetBrains connection remains available and eligible
+native calls return the explicit `clangd-unavailable` error; they do not fall
+through to an empty JetBrains C/C++ result. If the hybrid gateway itself is
+missing or its runtime preflight fails, the broker records
+`hybrid-gateway-missing` or `hybrid-gateway-unavailable` and uses the normal
+single-backend proxy.
+
+Verify activation without inspecting source or tool arguments:
+
+```sh
+serena-worktree-broker status --json
+```
+
+An active hybrid project appears as two records for the same root, one with
+`backend` set to `JetBrains` and one set to `LSP`. The LSP record reports
+`native_semantic_confidence` as `compile-database` when a root-level
+`compile_commands.json` exists and `fallback-flags` otherwise.
+
 ## Codex task bridge recovery
 
 Serena bridge health has three independent boundaries:

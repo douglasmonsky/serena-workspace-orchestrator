@@ -101,6 +101,32 @@ class BridgeJournalTests(unittest.TestCase):
         self.assertFalse(self.journal.append(free_form))
         self.assertFalse(self.journal.path.exists())
 
+    def test_hybrid_stages_accept_only_privacy_safe_reason_codes(self) -> None:
+        stages = (
+            "secondary-service-started",
+            "secondary-service-reused",
+            "secondary-service-unavailable",
+            "hybrid-proxy-started",
+        )
+        for index, stage in enumerate(stages):
+            event = dataclasses.replace(
+                self.event(stage, attempt=f"{index + 1:032x}"),
+                outcome="unavailable" if stage == "secondary-service-unavailable" else "ok",
+                reason="clangd-unavailable" if stage == "secondary-service-unavailable" else None,
+            )
+            with self.subTest(stage=stage):
+                self.assertTrue(self.journal.append(event))
+
+        rendered = self.journal.path.read_text(encoding="utf-8")
+        for forbidden in (
+            "relative_path",
+            "tool_name",
+            "arguments",
+            "source_text",
+            "/private/project",
+        ):
+            self.assertNotIn(forbidden, rendered)
+
 
 class ConfigCheckTests(unittest.TestCase):
     def setUp(self) -> None:

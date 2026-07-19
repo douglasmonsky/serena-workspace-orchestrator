@@ -20,11 +20,13 @@ EXECUTABLES = (
     "serena-codex",
     "serena-bridge-doctor",
     "serena-project-doctor",
+    "serena-hybrid-mcp",
     "serena-worktree-broker",
     "workspace-harbor-bootstrap",
     "workspace-harbor-codex-relauncher",
 )
 MODULES = (
+    "serena_hybrid_routing.py",
     "workspace_harbor_ide.py",
     "workspace_harbor_bootstrap.py",
     "workspace_harbor_bridge.py",
@@ -103,6 +105,10 @@ class DeployWorkspaceHarborTests(unittest.TestCase):
         self.assertEqual(
             f"#!{self.serena_python}",
             (destination / "serena-codex").read_text().splitlines()[0],
+        )
+        self.assertEqual(
+            f"#!{self.serena_python}",
+            (destination / "serena-hybrid-mcp").read_text().splitlines()[0],
         )
 
     def test_missing_source_fails_before_destination_mutation(self) -> None:

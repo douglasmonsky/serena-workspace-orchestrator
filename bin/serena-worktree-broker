@@ -62,6 +62,11 @@ REAL_SERENA = Path(
 MCP_PROXY = Path(
     os.environ.get("SERENA_BROKER_MCP_PROXY", Path.home() / ".local" / "bin" / "mcp-proxy")
 )
+HYBRID_GATEWAY = Path(
+    os.environ.get(
+        "SERENA_BROKER_HYBRID_GATEWAY", CODEX_HOME / "bin" / "serena-hybrid-mcp"
+    )
+)
 INTELLIJ_LAUNCHER = Path(
     os.environ.get(
         "SERENA_BROKER_INTELLIJ_LAUNCHER",
@@ -130,6 +135,14 @@ THREAD_ID_PATTERN = re.compile(
 LEGACY_PROCESS_OWNER_PATTERN = re.compile(r"^manual-pid-([1-9][0-9]*)$")
 MAX_SESSION_META_BYTES = 65_536
 MAX_LINEAGE_DEPTH = 8
+HYBRID_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
+
+
+@dataclass(frozen=True)
+class HybridCppActivation:
+    enabled: bool
+    clangd_path: str | None
+    reason: str
 
 
 def _opener_result(completed: subprocess.CompletedProcess[str]) -> dict[str, Any]:
@@ -688,7 +701,7 @@ def _open_intellij(project_root: Path) -> None:
         raise RuntimeError(f"failed to open IntelliJ project: {message}")
 
 
-def _auto_repair_project_languages(project_root: Path) -> None:
+def _auto_repair_project_languages(project_root: Path) -> dict[str, Any]:
     if not PROJECT_DOCTOR.is_file():
         raise RuntimeError(f"Serena project doctor not found: {PROJECT_DOCTOR}")
     result = subprocess.run(
@@ -701,6 +714,68 @@ def _auto_repair_project_languages(project_root: Path) -> None:
     if result.returncode != 0:
         message = result.stderr.strip() or result.stdout.strip()
         raise RuntimeError(f"Serena language auto-repair failed: {message}")
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("Serena language auto-repair returned malformed JSON") from error
+    return payload if isinstance(payload, dict) else {}
+
+
+def _hybrid_cpp_activation(
+    project_root: Path, doctor_payload: object
+) -> HybridCppActivation:
+    enabled_value = os.environ.get("SERENA_HYBRID_CPP_ENABLED", "1")
+    if enabled_value.strip().casefold() in HYBRID_FALSE_VALUES:
+        return HybridCppActivation(False, None, "disabled")
+    if not isinstance(doctor_payload, dict):
+        return HybridCppActivation(False, None, "invalid-doctor-payload")
+
+    language_sources: list[object] = [
+        doctor_payload.get("configured_languages"),
+        doctor_payload.get("detected_languages"),
+    ]
+    language_repair = doctor_payload.get("language_repair")
+    if language_repair is not None:
+        if not isinstance(language_repair, dict):
+            return HybridCppActivation(False, None, "invalid-doctor-payload")
+        language_sources.extend(
+            (
+                language_repair.get("configured_languages"),
+                language_repair.get("detected_languages"),
+            )
+        )
+
+    languages: set[str] = set()
+    for source in language_sources:
+        if source is None:
+            continue
+        if not isinstance(source, list) or not all(
+            isinstance(language, str) for language in source
+        ):
+            return HybridCppActivation(False, None, "invalid-doctor-payload")
+        languages.update(language.casefold() for language in source)
+    if "cpp" not in languages:
+        return HybridCppActivation(False, None, "language-missing")
+
+    clangd_path = shutil.which("clangd")
+    if not clangd_path:
+        return HybridCppActivation(False, None, "clangd-unavailable")
+    return HybridCppActivation(True, clangd_path, "enabled")
+
+
+def _hybrid_gateway_status(gateway: Path) -> str:
+    if not gateway.is_file() or not os.access(gateway, os.X_OK):
+        return "missing"
+    try:
+        result = subprocess.run(
+            [str(gateway), "--runtime-check"],
+            check=False,
+            capture_output=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "unavailable"
+    return "ready" if result.returncode == 0 else "unavailable"
 
 
 def _bootstrap_status(project_root: Path) -> dict[str, Any]:
@@ -858,7 +933,6 @@ def _project_is_brokerable(project_root: Path) -> bool:
     """Return whether the root is eligible for managed IntelliJ lifecycle."""
     account_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
     allowed_parents = (
-        account_home / "Documents/Codex",
         account_home / "Developer/Codex",
         account_home / ".codex/src",
     )
@@ -968,9 +1042,29 @@ def _connect(args: argparse.Namespace) -> int:
             args.add_mode,
             project_from_cwd=False,
         )
-    _auto_repair_project_languages(project_root)
+    doctor_payload = _auto_repair_project_languages(project_root)
     _bootstrap_status(project_root)
-    if not MCP_PROXY.is_file():
+    activation = _hybrid_cpp_activation(project_root, doctor_payload)
+    hybrid_requested = activation.enabled and args.backend.casefold() == "jetbrains"
+    gateway_status = (
+        _hybrid_gateway_status(HYBRID_GATEWAY) if hybrid_requested else "not-requested"
+    )
+    hybrid_enabled = hybrid_requested and gateway_status == "ready"
+    if hybrid_requested and not hybrid_enabled:
+        gateway_reason = (
+            "hybrid-gateway-missing"
+            if gateway_status == "missing"
+            else "hybrid-gateway-unavailable"
+        )
+        _bridge_event(
+            attempt_id,
+            started,
+            "secondary-service-unavailable",
+            "unavailable",
+            root=project_root,
+            reason=gateway_reason,
+        )
+    if not hybrid_enabled and not MCP_PROXY.is_file():
         _bridge_event(
             attempt_id,
             started,
@@ -983,6 +1077,9 @@ def _connect(args: argparse.Namespace) -> int:
 
     lease_id = uuid.uuid4().hex
     key: str | None = None
+    secondary_key: str | None = None
+    leased_keys: list[str] = []
+    secondary_port: int | None = None
     resolution: OwnerResolution | None = None
     try:
         resolution = _owner_resolution()
@@ -1026,6 +1123,7 @@ def _connect(args: argparse.Namespace) -> int:
                 "process_started": broker_details[0],
             }
             record["idle_since"] = None
+            leased_keys.append(key)
             port = int(record["port"])
             _bridge_event(
                 attempt_id,
@@ -1036,6 +1134,50 @@ def _connect(args: argparse.Namespace) -> int:
                 service_key=key,
                 owner_source=resolution.source,
             )
+            if hybrid_enabled:
+                expected_secondary_key = _service_key(
+                    project_root, "LSP", args.context, args.add_mode
+                )
+                previous_secondary = state["services"].get(expected_secondary_key)
+                try:
+                    secondary_key, secondary_record = _start_service(
+                        state, project_root, "LSP", args.context, args.add_mode
+                    )
+                except (OSError, RuntimeError, subprocess.SubprocessError):
+                    _bridge_event(
+                        attempt_id,
+                        started,
+                        "secondary-service-unavailable",
+                        "unavailable",
+                        root=project_root,
+                        service_key=expected_secondary_key,
+                        owner_source=resolution.source,
+                        reason="clangd-unavailable",
+                    )
+                else:
+                    secondary_stage = (
+                        "secondary-service-reused"
+                        if previous_secondary is secondary_record
+                        else "secondary-service-started"
+                    )
+                    _bridge_event(
+                        attempt_id,
+                        started,
+                        secondary_stage,
+                        "ok",
+                        root=project_root,
+                        service_key=secondary_key,
+                        owner_source=resolution.source,
+                    )
+                    secondary_record["leases"][lease_id] = {
+                        "created_at": _now(),
+                        "owner_id": owner_id,
+                        "pid": os.getpid(),
+                        "process_started": broker_details[0],
+                    }
+                    secondary_record["idle_since"] = None
+                    leased_keys.append(secondary_key)
+                    secondary_port = int(secondary_record["port"])
     except (OSError, RuntimeError, subprocess.SubprocessError):
         _bridge_event(
             attempt_id,
@@ -1049,16 +1191,33 @@ def _connect(args: argparse.Namespace) -> int:
         )
         raise
 
-    proxy_command = [
-        str(MCP_PROXY),
-        f"http://127.0.0.1:{port}/mcp",
-        "--transport=streamablehttp",
-        "--log-level=WARNING",
-    ]
+    if hybrid_enabled:
+        proxy_command = [
+            str(HYBRID_GATEWAY),
+            "--project-root",
+            str(project_root),
+            "--primary-url",
+            f"http://127.0.0.1:{port}/mcp",
+        ]
+        if secondary_port is None:
+            proxy_command.extend(("--secondary-error", "clangd-unavailable"))
+        else:
+            proxy_command.extend(
+                ("--secondary-url", f"http://127.0.0.1:{secondary_port}/mcp")
+            )
+        proxy_stage = "hybrid-proxy-started"
+    else:
+        proxy_command = [
+            str(MCP_PROXY),
+            f"http://127.0.0.1:{port}/mcp",
+            "--transport=streamablehttp",
+            "--log-level=WARNING",
+        ]
+        proxy_stage = "proxy-started"
     _bridge_event(
         attempt_id,
         started,
-        "proxy-started",
+        proxy_stage,
         "ok",
         root=project_root,
         service_key=key,
@@ -1080,12 +1239,13 @@ def _connect(args: argparse.Namespace) -> int:
     finally:
         try:
             with _locked_state() as state:
-                current = state["services"].get(key)
-                if isinstance(current, dict):
-                    leases = current.setdefault("leases", {})
-                    leases.pop(lease_id, None)
-                    _prune_dead_leases(current)
-                    current["last_used_at"] = _now()
+                for leased_key in leased_keys:
+                    current = state["services"].get(leased_key)
+                    if isinstance(current, dict):
+                        leases = current.setdefault("leases", {})
+                        leases.pop(lease_id, None)
+                        _prune_dead_leases(current)
+                        current["last_used_at"] = _now()
             _bridge_event(
                 attempt_id,
                 started,
@@ -1148,22 +1308,39 @@ def _repair_root_state(state: dict[str, Any], project_root: Path) -> dict[str, s
     ]
     if not matches:
         return {"status": "unchanged", "reason": "no-record"}
-    if len(matches) != 1:
-        return {"status": "protected", "reason": "ambiguous-services"}
-    key, record = matches[0]
-    _prune_dead_leases(record)
-    if record.get("leases"):
-        return {"status": "protected", "reason": "live-lease"}
-    owned = _process_is_owned(record)
-    if owned and _tcp_ready(int(record.get("port", 0))):
-        return {"status": "unchanged", "reason": "healthy-service"}
-    if owned:
-        if not _stop_owned_service(record):
-            return {"status": "protected", "reason": "stop-failed"}
+    if len(matches) > 1:
+        backends = {
+            str(record.get("backend", "")).casefold() for _, record in matches
+        }
+        if len(matches) != 2 or backends != {"jetbrains", "lsp"}:
+            return {"status": "protected", "reason": "ambiguous-services"}
+
+    for _, record in matches:
+        _prune_dead_leases(record)
+        if record.get("leases"):
+            return {"status": "protected", "reason": "live-lease"}
+
+    health = [
+        _process_is_owned(record) and _tcp_ready(int(record.get("port", 0)))
+        for _, record in matches
+    ]
+    if all(health):
+        reason = "healthy-services" if len(matches) > 1 else "healthy-service"
+        return {"status": "unchanged", "reason": reason}
+
+    repair_reasons: list[str] = []
+    for (key, record), healthy in zip(matches, health):
+        if healthy:
+            continue
+        if _process_is_owned(record):
+            if not _stop_owned_service(record):
+                return {"status": "protected", "reason": "stop-failed"}
+            repair_reasons.append("stopped-unhealthy-service")
+        else:
+            repair_reasons.append("removed-stale-record")
         services.pop(key, None)
-        return {"status": "repaired", "reason": "stopped-unhealthy-service"}
-    services.pop(key, None)
-    return {"status": "repaired", "reason": "removed-stale-record"}
+    reason = repair_reasons[0] if len(matches) == 1 else "repaired-services"
+    return {"status": "repaired", "reason": reason}
 
 
 def _repair_root(args: argparse.Namespace) -> int:
@@ -1188,6 +1365,19 @@ def _cleanup(args: argparse.Namespace) -> int:
     return 0
 
 
+def _native_semantic_confidence(record: dict[str, Any]) -> str | None:
+    if str(record.get("backend", "")).casefold() != "lsp":
+        return None
+    raw_root = record.get("project_root")
+    if not isinstance(raw_root, str):
+        return "fallback-flags"
+    try:
+        has_compile_database = (Path(raw_root) / "compile_commands.json").is_file()
+    except OSError:
+        has_compile_database = False
+    return "compile-database" if has_compile_database else "fallback-flags"
+
+
 def _status(args: argparse.Namespace) -> int:
     with _locked_state() as state:
         _cleanup_state(state, DEFAULT_IDLE_SECONDS, stop_idle=False)
@@ -1197,6 +1387,7 @@ def _status(args: argparse.Namespace) -> int:
                 "key": key,
                 "project_root": record.get("project_root"),
                 "backend": record.get("backend"),
+                "native_semantic_confidence": _native_semantic_confidence(record),
                 "pid": record.get("pid"),
                 "port": record.get("port"),
                 "leases": len(record.get("leases", {})),
@@ -1219,10 +1410,14 @@ def _status(args: argparse.Namespace) -> int:
         print("No broker-owned Serena services.")
     else:
         for item in payload:
+            confidence = item["native_semantic_confidence"]
+            confidence_text = (
+                f" native-confidence={confidence}" if confidence is not None else ""
+            )
             print(
                 f"{item['key']} {item['backend']} pid={item['pid']} port={item['port']} "
                 f"leases={item['leases']} owners={','.join(item['owners']) or '-'} "
-                f"healthy={str(item['healthy']).lower()} "
+                f"healthy={str(item['healthy']).lower()}{confidence_text} "
                 f"root={item['project_root']}"
             )
     return 0

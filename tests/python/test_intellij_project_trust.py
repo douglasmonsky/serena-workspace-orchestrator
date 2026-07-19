@@ -192,7 +192,6 @@ class IntelliJProjectTrustTests(unittest.TestCase):
         ):
             self.assertEqual(
                 (
-                    account_home / "Documents/Codex",
                     account_home / "Developer/Codex",
                     account_home / ".codex/src",
                 ),
