@@ -19,19 +19,21 @@ EXECUTABLES = (
     "intellij-project-reaper",
     "serena-bridge-doctor",
     "serena-codex",
+    "serena-hybrid-mcp",
     "serena-project-doctor",
     "serena-worktree-broker",
     "workspace-harbor-bootstrap",
     "workspace-harbor-codex-relauncher",
 )
 MODULES = (
+    "serena_hybrid_routing.py",
     "workspace_harbor_ide.py",
     "workspace_harbor_bootstrap.py",
     "workspace_harbor_bridge.py",
     "workspace_harbor_codex.py",
     "workspace_harbor_opener_queue.py",
 )
-SERENA_RUNTIME_COMMANDS = {"serena-codex"}
+SERENA_RUNTIME_COMMANDS = {"serena-codex", "serena-hybrid-mcp"}
 
 
 def _source_root() -> Path:

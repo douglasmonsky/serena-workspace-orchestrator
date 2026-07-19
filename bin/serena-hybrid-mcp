@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+"""Expose one Serena tool surface backed by JetBrains and optional clangd."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+from contextlib import AsyncExitStack
+from copy import copy
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, Mapping
+
+from serena_hybrid_routing import ROUTED_TOOLS, RoutingError, route_tool_call
+
+
+ROUTING_NOTE = (
+    " For an existing C/C++ file supplied as relative_path, this read-only call "
+    "is served by Serena's clangd backend; other calls remain on JetBrains."
+)
+
+
+class HybridGatewayError(RuntimeError):
+    def __init__(self, code: str, message: str | None = None) -> None:
+        super().__init__(message or code)
+        self.code = code
+
+
+class HybridGateway:
+    """Route compatible file-scoped native reads without changing tool names."""
+
+    def __init__(
+        self,
+        *,
+        project_root: Path | str,
+        primary: Any,
+        secondary: Any | None = None,
+        secondary_error: str | None = None,
+    ) -> None:
+        self.project_root = Path(project_root).resolve()
+        self.primary = primary
+        self.secondary = secondary
+        self.secondary_error = secondary_error or "clangd-unavailable"
+
+    async def list_tools(self) -> Any:
+        catalog = await self.primary.list_tools()
+        tools = [self._annotated_tool(tool) for tool in catalog.tools]
+        return _copy_with(catalog, tools=tools)
+
+    async def call_tool(
+        self, name: str, arguments: Mapping[str, Any] | None = None
+    ) -> Any:
+        try:
+            routed = route_tool_call(self.project_root, name, arguments)
+        except RoutingError as error:
+            raise HybridGatewayError(error.code, str(error)) from error
+
+        if routed.backend == "primary":
+            return await self.primary.call_tool(routed.tool_name, routed.arguments)
+        if self.secondary is None:
+            raise HybridGatewayError(self.secondary_error)
+        return await self.secondary.call_tool(routed.tool_name, routed.arguments)
+
+    @staticmethod
+    def _annotated_tool(tool: Any) -> Any:
+        if tool.name not in ROUTED_TOOLS:
+            return _copy_with(tool)
+        description = (getattr(tool, "description", None) or "") + ROUTING_NOTE
+        return _copy_with(tool, description=description)
+
+
+def _copy_with(value: Any, **changes: Any) -> Any:
+    model_copy = getattr(value, "model_copy", None)
+    if callable(model_copy):
+        return model_copy(update=changes)
+    cloned = copy(value)
+    for name, replacement in changes.items():
+        setattr(cloned, name, replacement)
+    return cloned
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--project-root", required=True)
+    parser.add_argument("--primary-url", required=True)
+    secondary = parser.add_mutually_exclusive_group()
+    secondary.add_argument("--secondary-url")
+    secondary.add_argument("--secondary-error")
+    return parser.parse_args()
+
+
+def _load_mcp_runtime() -> SimpleNamespace:
+    """Load MCP only in Serena's managed Python, not during system-Python tests."""
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+    from mcp.server.lowlevel import Server
+    from mcp.server.stdio import stdio_server
+
+    return SimpleNamespace(
+        ClientSession=ClientSession,
+        Server=Server,
+        stdio_server=stdio_server,
+        streamablehttp_client=streamablehttp_client,
+    )
+
+
+async def _connect_http_session(
+    stack: AsyncExitStack, url: str, runtime: SimpleNamespace
+) -> Any:
+    read_stream, write_stream, _ = await stack.enter_async_context(
+        runtime.streamablehttp_client(url)
+    )
+    session = await stack.enter_async_context(
+        runtime.ClientSession(read_stream, write_stream)
+    )
+    await session.initialize()
+    return session
+
+
+async def _run(args: argparse.Namespace) -> None:
+    runtime = _load_mcp_runtime()
+    async with AsyncExitStack() as stack:
+        primary = await _connect_http_session(stack, args.primary_url, runtime)
+        secondary = (
+            await _connect_http_session(stack, args.secondary_url, runtime)
+            if args.secondary_url
+            else None
+        )
+        gateway = HybridGateway(
+            project_root=args.project_root,
+            primary=primary,
+            secondary=secondary,
+            secondary_error=args.secondary_error,
+        )
+        server = runtime.Server("serena-hybrid-mcp")
+
+        @server.list_tools()
+        async def list_tools() -> Any:
+            return await gateway.list_tools()
+
+        @server.call_tool()
+        async def call_tool(name: str, arguments: dict[str, Any]) -> Any:
+            return await gateway.call_tool(name, arguments)
+
+        read_stream, write_stream = await stack.enter_async_context(
+            runtime.stdio_server()
+        )
+        await server.run(
+            read_stream,
+            write_stream,
+            server.create_initialization_options(),
+        )
+
+
+def main() -> int:
+    asyncio.run(_run(_parse_args()))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
