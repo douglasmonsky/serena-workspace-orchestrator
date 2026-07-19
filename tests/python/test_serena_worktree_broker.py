@@ -614,6 +614,8 @@ class SerenaWorktreeBrokerTests(unittest.TestCase):
             broker, "_auto_repair_project_languages", return_value={"configured_languages": ["cpp"]}
         ), mock.patch.object(broker, "_bootstrap_status"), mock.patch.object(
             broker, "_hybrid_cpp_activation", return_value=broker.HybridCppActivation(True, "/usr/bin/clangd", "enabled")
+        ), mock.patch.object(
+            broker, "_hybrid_gateway_status", return_value="ready"
         ), mock.patch.object(broker, "MCP_PROXY", proxy), mock.patch.object(
             broker, "HYBRID_GATEWAY", gateway, create=True
         ), mock.patch.object(broker, "_owner_resolution", return_value=resolution), mock.patch.object(
@@ -673,6 +675,8 @@ class SerenaWorktreeBrokerTests(unittest.TestCase):
             broker, "_auto_repair_project_languages", return_value={"detected_languages": ["cpp"]}
         ), mock.patch.object(broker, "_bootstrap_status"), mock.patch.object(
             broker, "_hybrid_cpp_activation", return_value=broker.HybridCppActivation(True, "/usr/bin/clangd", "enabled")
+        ), mock.patch.object(
+            broker, "_hybrid_gateway_status", return_value="ready"
         ), mock.patch.object(broker, "MCP_PROXY", proxy), mock.patch.object(
             broker, "HYBRID_GATEWAY", gateway, create=True
         ), mock.patch.object(broker, "_owner_resolution", return_value=resolution), mock.patch.object(
@@ -837,6 +841,15 @@ class SerenaWorktreeBrokerTests(unittest.TestCase):
         payload = json.loads(output.getvalue())
         self.assertEqual(["JetBrains", "LSP"], [record["backend"] for record in payload])
         self.assertTrue(all(record["healthy"] for record in payload))
+        self.assertEqual(
+            [None, "fallback-flags"],
+            [record["native_semantic_confidence"] for record in payload],
+        )
+        (root / "compile_commands.json").write_text("[]\n")
+        self.assertEqual(
+            "compile-database",
+            broker._native_semantic_confidence(state["services"]["b" * 20]),
+        )
 
     def test_dead_lease_is_removed_and_service_becomes_idle(self) -> None:
         record = {
@@ -1106,6 +1119,23 @@ class SerenaWorktreeBrokerTests(unittest.TestCase):
                 activation = broker._hybrid_cpp_activation(Path("/tmp/example"), payload)
                 self.assertFalse(activation.enabled)
                 self.assertIn(activation.reason, {"language-missing", "invalid-doctor-payload"})
+
+    def test_hybrid_gateway_status_distinguishes_missing_and_broken_runtime(self) -> None:
+        gateway = Path(self.temporary_directory.name) / "serena-hybrid-mcp"
+        self.assertEqual("missing", broker._hybrid_gateway_status(gateway))
+        gateway.write_text("fixture")
+        gateway.chmod(0o755)
+
+        with mock.patch.object(
+            broker.subprocess, "run", return_value=mock.Mock(returncode=0)
+        ) as run:
+            self.assertEqual("ready", broker._hybrid_gateway_status(gateway))
+        self.assertEqual([str(gateway), "--runtime-check"], run.call_args.args[0])
+
+        with mock.patch.object(
+            broker.subprocess, "run", return_value=mock.Mock(returncode=1)
+        ):
+            self.assertEqual("unavailable", broker._hybrid_gateway_status(gateway))
 
     def test_intellij_launcher_timeout_exceeds_bootstrap_and_ready_timeouts(self) -> None:
         completed = mock.Mock(returncode=0, stdout="", stderr="")

@@ -101,7 +101,8 @@ environment to disable the secondary backend. If secondary startup fails after
 hybrid activation, the JetBrains connection remains available and eligible
 native calls return the explicit `clangd-unavailable` error; they do not fall
 through to an empty JetBrains C/C++ result. If the hybrid gateway itself is
-missing, the broker records `hybrid-gateway-missing` and uses the normal
+missing or its runtime preflight fails, the broker records
+`hybrid-gateway-missing` or `hybrid-gateway-unavailable` and uses the normal
 single-backend proxy.
 
 Verify activation without inspecting source or tool arguments:
@@ -111,7 +112,9 @@ serena-worktree-broker status --json
 ```
 
 An active hybrid project appears as two records for the same root, one with
-`backend` set to `JetBrains` and one set to `LSP`.
+`backend` set to `JetBrains` and one set to `LSP`. The LSP record reports
+`native_semantic_confidence` as `compile-database` when a root-level
+`compile_commands.json` exists and `fallback-flags` otherwise.
 
 ## Codex task bridge recovery
 

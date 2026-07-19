@@ -763,6 +763,21 @@ def _hybrid_cpp_activation(
     return HybridCppActivation(True, clangd_path, "enabled")
 
 
+def _hybrid_gateway_status(gateway: Path) -> str:
+    if not gateway.is_file() or not os.access(gateway, os.X_OK):
+        return "missing"
+    try:
+        result = subprocess.run(
+            [str(gateway), "--runtime-check"],
+            check=False,
+            capture_output=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "unavailable"
+    return "ready" if result.returncode == 0 else "unavailable"
+
+
 def _bootstrap_status(project_root: Path) -> dict[str, Any]:
     if not BOOTSTRAP.is_file() or not os.access(BOOTSTRAP, os.X_OK):
         raise RuntimeError(f"Workspace Harbor bootstrap not found: {BOOTSTRAP}")
@@ -1031,18 +1046,23 @@ def _connect(args: argparse.Namespace) -> int:
     _bootstrap_status(project_root)
     activation = _hybrid_cpp_activation(project_root, doctor_payload)
     hybrid_requested = activation.enabled and args.backend.casefold() == "jetbrains"
-    gateway_available = HYBRID_GATEWAY.is_file() and os.access(
-        HYBRID_GATEWAY, os.X_OK
+    gateway_status = (
+        _hybrid_gateway_status(HYBRID_GATEWAY) if hybrid_requested else "not-requested"
     )
-    hybrid_enabled = hybrid_requested and gateway_available
-    if hybrid_requested and not gateway_available:
+    hybrid_enabled = hybrid_requested and gateway_status == "ready"
+    if hybrid_requested and not hybrid_enabled:
+        gateway_reason = (
+            "hybrid-gateway-missing"
+            if gateway_status == "missing"
+            else "hybrid-gateway-unavailable"
+        )
         _bridge_event(
             attempt_id,
             started,
             "secondary-service-unavailable",
             "unavailable",
             root=project_root,
-            reason="hybrid-gateway-missing",
+            reason=gateway_reason,
         )
     if not hybrid_enabled and not MCP_PROXY.is_file():
         _bridge_event(
@@ -1345,6 +1365,19 @@ def _cleanup(args: argparse.Namespace) -> int:
     return 0
 
 
+def _native_semantic_confidence(record: dict[str, Any]) -> str | None:
+    if str(record.get("backend", "")).casefold() != "lsp":
+        return None
+    raw_root = record.get("project_root")
+    if not isinstance(raw_root, str):
+        return "fallback-flags"
+    try:
+        has_compile_database = (Path(raw_root) / "compile_commands.json").is_file()
+    except OSError:
+        has_compile_database = False
+    return "compile-database" if has_compile_database else "fallback-flags"
+
+
 def _status(args: argparse.Namespace) -> int:
     with _locked_state() as state:
         _cleanup_state(state, DEFAULT_IDLE_SECONDS, stop_idle=False)
@@ -1354,6 +1387,7 @@ def _status(args: argparse.Namespace) -> int:
                 "key": key,
                 "project_root": record.get("project_root"),
                 "backend": record.get("backend"),
+                "native_semantic_confidence": _native_semantic_confidence(record),
                 "pid": record.get("pid"),
                 "port": record.get("port"),
                 "leases": len(record.get("leases", {})),
@@ -1376,10 +1410,14 @@ def _status(args: argparse.Namespace) -> int:
         print("No broker-owned Serena services.")
     else:
         for item in payload:
+            confidence = item["native_semantic_confidence"]
+            confidence_text = (
+                f" native-confidence={confidence}" if confidence is not None else ""
+            )
             print(
                 f"{item['key']} {item['backend']} pid={item['pid']} port={item['port']} "
                 f"leases={item['leases']} owners={','.join(item['owners']) or '-'} "
-                f"healthy={str(item['healthy']).lower()} "
+                f"healthy={str(item['healthy']).lower()}{confidence_text} "
                 f"root={item['project_root']}"
             )
     return 0
