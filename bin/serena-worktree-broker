@@ -1288,22 +1288,39 @@ def _repair_root_state(state: dict[str, Any], project_root: Path) -> dict[str, s
     ]
     if not matches:
         return {"status": "unchanged", "reason": "no-record"}
-    if len(matches) != 1:
-        return {"status": "protected", "reason": "ambiguous-services"}
-    key, record = matches[0]
-    _prune_dead_leases(record)
-    if record.get("leases"):
-        return {"status": "protected", "reason": "live-lease"}
-    owned = _process_is_owned(record)
-    if owned and _tcp_ready(int(record.get("port", 0))):
-        return {"status": "unchanged", "reason": "healthy-service"}
-    if owned:
-        if not _stop_owned_service(record):
-            return {"status": "protected", "reason": "stop-failed"}
+    if len(matches) > 1:
+        backends = {
+            str(record.get("backend", "")).casefold() for _, record in matches
+        }
+        if len(matches) != 2 or backends != {"jetbrains", "lsp"}:
+            return {"status": "protected", "reason": "ambiguous-services"}
+
+    for _, record in matches:
+        _prune_dead_leases(record)
+        if record.get("leases"):
+            return {"status": "protected", "reason": "live-lease"}
+
+    health = [
+        _process_is_owned(record) and _tcp_ready(int(record.get("port", 0)))
+        for _, record in matches
+    ]
+    if all(health):
+        reason = "healthy-services" if len(matches) > 1 else "healthy-service"
+        return {"status": "unchanged", "reason": reason}
+
+    repair_reasons: list[str] = []
+    for (key, record), healthy in zip(matches, health):
+        if healthy:
+            continue
+        if _process_is_owned(record):
+            if not _stop_owned_service(record):
+                return {"status": "protected", "reason": "stop-failed"}
+            repair_reasons.append("stopped-unhealthy-service")
+        else:
+            repair_reasons.append("removed-stale-record")
         services.pop(key, None)
-        return {"status": "repaired", "reason": "stopped-unhealthy-service"}
-    services.pop(key, None)
-    return {"status": "repaired", "reason": "removed-stale-record"}
+    reason = repair_reasons[0] if len(matches) == 1 else "repaired-services"
+    return {"status": "repaired", "reason": reason}
 
 
 def _repair_root(args: argparse.Namespace) -> int:

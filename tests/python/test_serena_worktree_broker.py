@@ -806,6 +806,38 @@ class SerenaWorktreeBrokerTests(unittest.TestCase):
         self.assertEqual(oct(broker.STATE_DIR.stat().st_mode & 0o777), "0o700")
         self.assertEqual(oct(broker.STATE_FILE.stat().st_mode & 0o777), "0o600")
 
+    def test_status_reports_primary_and_secondary_backend_records(self) -> None:
+        root = Path(self.temporary_directory.name) / "project"; root.mkdir()
+        state = {
+            "version": 1,
+            "services": {
+                "a" * 20: {
+                    "project_root": str(root), "backend": "JetBrains", "pid": 101,
+                    "port": 24320, "leases": {}, "idle_since": None,
+                },
+                "b" * 20: {
+                    "project_root": str(root), "backend": "LSP", "pid": 102,
+                    "port": 24321, "leases": {}, "idle_since": None,
+                },
+            },
+        }
+        locked = mock.MagicMock()
+        locked.return_value.__enter__.return_value = state
+        locked.return_value.__exit__.return_value = False
+        output = io.StringIO()
+
+        with mock.patch.object(broker, "_locked_state", locked), mock.patch.object(
+            broker, "_cleanup_state"
+        ), mock.patch.object(broker, "_process_is_owned", return_value=True), mock.patch.object(
+            broker, "_tcp_ready", return_value=True
+        ), mock.patch("sys.stdout", output):
+            result = broker._status(SimpleNamespace(json=True))
+
+        self.assertEqual(0, result)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(["JetBrains", "LSP"], [record["backend"] for record in payload])
+        self.assertTrue(all(record["healthy"] for record in payload))
+
     def test_dead_lease_is_removed_and_service_becomes_idle(self) -> None:
         record = {
             "leases": {
@@ -906,6 +938,26 @@ class SerenaWorktreeBrokerTests(unittest.TestCase):
 
         self.assertEqual({"status": "unchanged", "reason": "healthy-service"}, result)
         self.assertIs(record, state["services"]["target"])
+
+    def test_repair_root_accepts_healthy_hybrid_service_pair(self) -> None:
+        root = Path(self.temporary_directory.name) / "target"; root.mkdir()
+        primary = {
+            "project_root": str(root), "backend": "JetBrains", "leases": {},
+            "pid": 101, "port": 24320,
+        }
+        secondary = {
+            "project_root": str(root), "backend": "LSP", "leases": {},
+            "pid": 102, "port": 24321,
+        }
+        state = {"services": {"primary": primary, "secondary": secondary}}
+
+        with mock.patch.object(broker, "_process_is_owned", return_value=True), mock.patch.object(
+            broker, "_tcp_ready", return_value=True
+        ):
+            result = broker._repair_root_state(state, root)
+
+        self.assertEqual({"status": "unchanged", "reason": "healthy-services"}, result)
+        self.assertEqual({"primary", "secondary"}, set(state["services"]))
 
     def test_repair_root_protects_unstoppable_owned_service(self) -> None:
         root = Path(self.temporary_directory.name) / "target"; root.mkdir()
